@@ -81,8 +81,8 @@ private[spark] class SparkHadoopUtil extends Logging {
    * configuration.
    */
   def appendS3AndSparkHadoopHiveConfigurations(
-      conf: SparkConf,
-      hadoopConf: Configuration): Unit = {
+                                                conf: SparkConf,
+                                                hadoopConf: Configuration): Unit = {
     SparkHadoopUtil.appendS3AndSparkHadoopHiveConfigurations(conf, hadoopConf)
   }
 
@@ -98,8 +98,8 @@ private[spark] class SparkHadoopUtil extends Logging {
    * Appends spark.hadoop.* configurations from a Map to another without the spark.hadoop. prefix.
    */
   def appendSparkHadoopConfigs(
-      srcMap: Map[String, String],
-      destMap: HashMap[String, String]): Unit = {
+                                srcMap: Map[String, String],
+                                destMap: HashMap[String, String]): Unit = {
     // Copy any "spark.hadoop.foo=bar" system properties into destMap as "foo=bar"
     for ((key, value) <- srcMap if key.startsWith("spark.hadoop.")) {
       destMap.put(key.substring("spark.hadoop.".length), value)
@@ -107,8 +107,8 @@ private[spark] class SparkHadoopUtil extends Logging {
   }
 
   def appendSparkHiveConfigs(
-      srcMap: Map[String, String],
-      destMap: HashMap[String, String]): Unit = {
+                              srcMap: Map[String, String],
+                              destMap: HashMap[String, String]): Unit = {
     // Copy any "spark.hive.foo=bar" system properties into destMap as "hive.foo=bar"
     for ((key, value) <- srcMap if key.startsWith("spark.hive.")) {
       destMap.put(key.substring("spark.".length), value)
@@ -437,8 +437,8 @@ private[spark] object SparkHadoopUtil extends Logging {
   }
 
   private def appendS3AndSparkHadoopHiveConfigurations(
-      conf: SparkConf,
-      hadoopConf: Configuration): Unit = {
+                                                        conf: SparkConf,
+                                                        hadoopConf: Configuration): Unit = {
     // Note: this null check is around more than just access to the "conf" object to maintain
     // the behavior of the old implementation of this code, for backwards compatibility.
     if (conf != null) {
@@ -470,11 +470,11 @@ private[spark] object SparkHadoopUtil extends Logging {
    */
   // Exposed for testing
   private[deploy] def appendS3CredentialsFromEnvironment(
-      hadoopConf: Configuration,
-      endpointUrl: String,
-      keyId: String,
-      accessKey: String,
-      sessionToken: String): Unit = {
+                                                          hadoopConf: Configuration,
+                                                          endpointUrl: String,
+                                                          keyId: String,
+                                                          accessKey: String,
+                                                          sessionToken: String): Unit = {
     if (keyId != null && accessKey != null) {
       // source prefix string; will have environment variable added
       val source = SOURCE_SPARK + " on " + InetAddress.getLocalHost.toString + " from "
@@ -521,6 +521,19 @@ private[spark] object SparkHadoopUtil extends Logging {
         SOURCE_SPARK_HADOOP)
     }
     val setBySpark = SET_TO_DEFAULT_VALUES
+
+    // The GCS connector allows appending a custom suffix to the user-agent string.
+    // To prepend Spark's application information, we read the existing suffix,
+    // add our prefix, and set the result back as the new suffix.
+    val sparkGcsPrefix = s"apache_spark/${org.apache.spark.SPARK_VERSION} (GPN:apache_spark)"
+    val userGcsSuffix = hadoopConf.get("fs.gs.application.name.suffix")
+    val gcsUserAgent = if (userGcsSuffix != null && userGcsSuffix.nonEmpty) {
+      s"$sparkGcsPrefix $userGcsSuffix"
+    } else {
+      sparkGcsPrefix
+    }
+    hadoopConf.set("fs.gs.application.name.suffix", gcsUserAgent, SOURCE_SPARK)
+
     if (conf.getOption("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version").isEmpty) {
       hadoopConf.set("mapreduce.fileoutputcommitter.algorithm.version", "1", setBySpark)
     }
