@@ -40,8 +40,7 @@ import org.apache.spark.tags.DockerTest
  * }}}
  */
 @DockerTest
-class MsSqlServerIntegrationSuite extends DockerJDBCIntegrationSuite
-  with SharedJDBCIntegrationTests {
+class MsSqlServerIntegrationSuite extends SharedJDBCIntegrationSuite {
   override val db = new MsSQLServerDatabaseOnDocker
 
   override def dataPreparation(conn: Connection): Unit = {
@@ -227,7 +226,8 @@ class MsSqlServerIntegrationSuite extends DockerJDBCIntegrationSuite
       Seq(true, false).foreach { ntz =>
         Seq(true, false).foreach { legacy =>
           withSQLConf(
-            SQLConf.LEGACY_MSSQLSERVER_DATETIMEOFFSET_MAPPING_ENABLED.key -> legacy.toString) {
+            SQLConf.LEGACY_MSSQLSERVER_DATETIMEOFFSET_MAPPING_ENABLED.key -> legacy.toString,
+            SQLConf.TIME_TYPE_ENABLED.key -> "false") {
             val df = spark.read
               .option("preferTimestampNTZ", ntz)
               .jdbc(jdbcUrl, "dates", new Properties)

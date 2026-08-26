@@ -17,31 +17,31 @@
 
 import array
 import datetime
-import unittest
 import random
 import string
 
 from pyspark.errors import PySparkValueError
 from pyspark.sql.types import (
-    StructType,
-    StructField,
-    StringType,
+    ArrayType,
     IntegerType,
     LongType,
     MapType,
-    ArrayType,
     Row,
+    StringType,
+    StructField,
+    StructType,
 )
+from pyspark.testing.connectutils import ReusedMixedTestCase, should_test_connect
 from pyspark.testing.objects import MyObject, PythonOnlyUDT
-from pyspark.testing.connectutils import should_test_connect, ReusedMixedTestCase
 from pyspark.testing.pandasutils import PandasOnSparkTestUtils
 
 if should_test_connect:
-    import pandas as pd
     import numpy as np
+    import pandas as pd
+
+    from pyspark.errors.exceptions.connect import ParseException
     from pyspark.sql import functions as SF
     from pyspark.sql.connect import functions as CF
-    from pyspark.errors.exceptions.connect import ParseException
 
 
 class SparkConnectCreationTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
@@ -50,14 +50,38 @@ class SparkConnectCreationTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
         pdf = pd.DataFrame({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         df = self.connect.createDataFrame(pdf)
         rows = df.filter(df.a == CF.lit(3)).collect()
-        self.assertTrue(len(rows) == 1)
+        self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][0], 3)
         self.assertEqual(rows[0][1], "c")
 
-        # Check correct behavior for empty DataFrame
-        pdf = pd.DataFrame({"a": []})
-        with self.assertRaises(ValueError):
-            self.connect.createDataFrame(pdf)
+    def test_from_empty_pandas_dataframe(self):
+        dfs = [
+            pd.DataFrame(),
+            pd.DataFrame({"a": []}),
+            pd.DataFrame(index=range(5)),
+        ]
+
+        for df in dfs:
+            with self.assertRaises(PySparkValueError) as pe:
+                self.connect.createDataFrame(df)
+            self.check_error(
+                exception=pe.exception,
+                errorClass="CANNOT_INFER_EMPTY_SCHEMA",
+                messageParameters={},
+            )
+
+    def test_from_pandas_dataframe_with_zero_columns(self):
+        """SPARK-55350: Test that row count is preserved when creating DataFrame from
+        pandas with 0 columns but with explicit schema in Spark Connect."""
+        # Create a pandas DataFrame with 5 rows but 0 columns
+        pdf = pd.DataFrame(index=range(5))
+        schema = StructType([])
+
+        cdf = self.connect.createDataFrame(pdf, schema=schema)
+
+        self.assertEqual(cdf.schema, schema)
+        self.assertEqual(cdf.count(), 5)
+        self.assertEqual(len(cdf.collect()), 5)
 
     def test_with_local_ndarray(self):
         """SPARK-41446: Test creating a dataframe using local list"""
@@ -526,9 +550,10 @@ class SparkConnectCreationTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
     def test_create_dataframe_from_pandas_with_ns_timestamp(self):
         """Truncate the timestamps for nanoseconds."""
-        from datetime import datetime, timezone, timedelta
-        from pandas import Timestamp
+        from datetime import datetime, timedelta, timezone
+
         import pandas as pd
+        from pandas import Timestamp
 
         # Nanoseconds are truncated to microseconds in the serializer
         # Arrow will throw an error if precision is lost
@@ -710,13 +735,6 @@ class SparkConnectCreationTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_creation import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

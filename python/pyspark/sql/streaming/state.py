@@ -16,10 +16,10 @@
 #
 import datetime
 import json
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
+from pyspark.errors import PySparkRuntimeError, PySparkTypeError, PySparkValueError
 from pyspark.sql.types import Row, StructType, TimestampType
-from pyspark.errors import PySparkTypeError, PySparkValueError, PySparkRuntimeError
 
 __all__ = ["GroupState", "GroupStateTimeout"]
 
@@ -178,8 +178,9 @@ class GroupState:
         if isinstance(durationMs, str):
             # TODO(SPARK-40437): Support string representation of durationMs.
             raise PySparkTypeError(
-                errorClass="NOT_INT",
+                errorClass="NOT_EXPECTED_TYPE",
                 messageParameters={
+                    "expected_type": "int",
                     "arg_name": "durationMs",
                     "arg_type": type(durationMs).__name__,
                 },

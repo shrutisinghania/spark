@@ -32,6 +32,14 @@ class CountVectorizerSuite extends MLTest with DefaultReadWriteTest {
     ParamsSuite.checkParams(new CountVectorizerModel(Array("empty")))
   }
 
+  test("model estimated size") {
+    val df = Seq(Seq("a", "b"), Seq("a", "c")).toDF("words")
+    val model = new CountVectorizer().setInputCol("words").setOutputCol("features").fit(df)
+    val maxSize = 1024 * 4
+    assert(model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should be less than $maxSize")
+  }
+
   private def split(s: String): Seq[String] = s.split("\\s+").toImmutableArraySeq
 
   test("CountVectorizerModel common cases") {
@@ -150,6 +158,23 @@ class CountVectorizerSuite extends MLTest with DefaultReadWriteTest {
       case Row(features: Vector, expected: Vector) =>
         assert(features ~== expected absTol 1e-14)
     }
+  }
+
+  test("CountVectorizer document frequency ignores duplicate tokens") {
+    val df = Seq(
+      Array("a", "a", "a", "b"),
+      Array("a", "b", "b", "b"),
+      Array("b")
+    ).toDF("words")
+
+    val cvModel = new CountVectorizer()
+      .setInputCol("words")
+      .setOutputCol("features")
+      .setMinDF(2)
+      .setMaxDF(2)
+      .fit(df)
+
+    assert(cvModel.vocabulary === Array("a"))
   }
 
   test("CountVectorizer using both minDF and maxDF") {
@@ -349,5 +374,19 @@ class CountVectorizerSuite extends MLTest with DefaultReadWriteTest {
       case Row(features: Vector) =>
         assert(features === Vectors.sparse(0, Seq()))
     }
+  }
+
+  test("SPARK-55655: CountVectorizer vocabulary ordering is deterministic for tied counts") {
+    val df = Seq(
+      (0, split("a b c d e")),
+      (1, split("e d c b a"))
+    ).toDF("id", "words")
+
+    val cvModel = new CountVectorizer()
+      .setInputCol("words")
+      .setOutputCol("features")
+      .fit(df)
+
+    assert(cvModel.vocabulary === Array("a", "b", "c", "d", "e"))
   }
 }

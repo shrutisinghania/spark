@@ -48,7 +48,8 @@ with :meth:`DataFrame.toArrow`.
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 37-52
+    :start-after: $example on:dataframe_to_from_arrow_table$
+    :end-before: $example off:dataframe_to_from_arrow_table$
     :dedent: 4
 
 Note that :meth:`DataFrame.toArrow` results in the collection of all records in the DataFrame to
@@ -60,8 +61,8 @@ Enabling for Conversion to/from Pandas
 
 Arrow is available as an optimization when converting a Spark DataFrame to a Pandas DataFrame
 using the call :meth:`DataFrame.toPandas` and when creating a Spark DataFrame from a Pandas DataFrame with
-:meth:`SparkSession.createDataFrame`. To use Arrow when executing these calls, users need to first set
-the Spark configuration ``spark.sql.execution.arrow.pyspark.enabled`` to ``true``. This is disabled by default.
+:meth:`SparkSession.createDataFrame`. To use Arrow when executing these calls,
+the Spark configuration ``spark.sql.execution.arrow.pyspark.enabled`` must be set to ``true``. This is enabled by default.
 
 In addition, optimizations enabled by ``spark.sql.execution.arrow.pyspark.enabled`` could fallback automatically
 to non-Arrow optimization implementation if an error occurs before the actual computation within Spark.
@@ -69,7 +70,8 @@ This can be controlled by ``spark.sql.execution.arrow.pyspark.fallback.enabled``
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 56-71
+    :start-after: $example on:dataframe_with_arrow$
+    :end-before: $example off:dataframe_with_arrow$
     :dedent: 4
 
 Using the above optimizations with Arrow will produce the same results as when Arrow is not
@@ -106,7 +108,8 @@ specify the type hints of ``pandas.Series`` and ``pandas.DataFrame`` as below:
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 75-99
+    :start-after: $example on:ser_to_frame_pandas_udf$
+    :end-before: $example off:ser_to_frame_pandas_udf$
     :dedent: 4
 
 In the following sections, it describes the combinations of the supported type hints. For simplicity,
@@ -129,7 +132,8 @@ The following example shows how to create this Pandas UDF that computes the prod
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 103-133
+    :start-after: $example on:ser_to_ser_pandas_udf$
+    :end-before: $example off:ser_to_ser_pandas_udf$
     :dedent: 4
 
 For detailed usage, please see :func:`pandas_udf`.
@@ -168,7 +172,8 @@ The following example shows how to create this Pandas UDF:
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 137-159
+    :start-after: $example on:iter_ser_to_iter_ser_pandas_udf$
+    :end-before: $example off:iter_ser_to_iter_ser_pandas_udf$
     :dedent: 4
 
 For detailed usage, please see :func:`pandas_udf`.
@@ -190,7 +195,8 @@ The following example shows how to create this Pandas UDF:
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 163-186
+    :start-after: $example on:iter_sers_to_iter_ser_pandas_udf$
+    :end-before: $example off:iter_sers_to_iter_ser_pandas_udf$
     :dedent: 4
 
 For detailed usage, please see :func:`pandas_udf`.
@@ -221,7 +227,8 @@ and window operations:
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 190-231
+    :start-after: $example on:ser_to_scalar_pandas_udf$
+    :end-before: $example off:ser_to_scalar_pandas_udf$
     :dedent: 4
 
 .. currentmodule:: pyspark.sql.functions
@@ -286,7 +293,8 @@ in the group.
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 235-253
+    :start-after: $example on:grouped_apply_in_pandas$
+    :end-before: $example off:grouped_apply_in_pandas$
     :dedent: 4
 
 For detailed usage, please see  please see :meth:`GroupedData.applyInPandas`
@@ -304,7 +312,8 @@ The following example shows how to use :meth:`DataFrame.mapInPandas`:
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 257-268
+    :start-after: $example on:map_in_pandas$
+    :end-before: $example off:map_in_pandas$
     :dedent: 4
 
 For detailed usage, please see :meth:`DataFrame.mapInPandas`.
@@ -343,7 +352,8 @@ The following example shows how to use ``DataFrame.groupby().cogroup().applyInPa
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 272-294
+    :start-after: $example on:cogrouped_apply_in_pandas$
+    :end-before: $example off:cogrouped_apply_in_pandas$
     :dedent: 4
 
 
@@ -365,8 +375,12 @@ Here's an example that demonstrates the usage of both a default, pickled Python 
 
 .. literalinclude:: ../../../../../examples/src/main/python/sql/arrow.py
     :language: python
-    :lines: 298-316
+    :start-after: $example on:arrow_python_udf$
+    :end-before: $example off:arrow_python_udf$
     :dedent: 4
+
+Type coercion:
+~~~~~~~~~~~~~~
 
 Compared to the default, pickled Python UDFs, Arrow Python UDFs provide a more coherent type coercion mechanism. UDF
 type coercion poses challenges when the Python instances returned by UDFs do not align with the user-specified
@@ -374,6 +388,12 @@ return type. The default, pickled Python UDFs' type coercion has certain limitat
 fallback for type mismatches, leading to potential ambiguity and data loss. Additionally, converting date, datetime,
 and tuples to strings can yield ambiguous results. Arrow Python UDFs, on the other hand, leverage Arrow's
 capabilities to standardize type coercion and address these issues effectively.
+
+Type coercion differences are introduced by the following changes:
+
+* Since Spark 4.2, Arrow optimization is enabled by default for regular Python UDFs. The full type coercion difference is summarized in the tables `here <https://github.com/apache/spark/pull/41706>`__. To disable Arrow optimization, set ``spark.sql.execution.pythonUDF.arrow.enabled`` to false.
+
+* Since Spark 4.1, unnecessary conversion to pandas instances in Arrow-optimized Python UDF is removed in the serializer when ``spark.sql.legacy.execution.pythonUDF.pandas.conversion.enabled`` is disabled. The behavior difference is summarized in the tables `here <https://github.com/apache/spark/pull/51225>`__. To restore the legacy behavior, set ``spark.sql.legacy.execution.pythonUDF.pandas.conversion.enabled`` to true.
 
 Usage Notes
 -----------
@@ -434,7 +454,7 @@ working with timestamps in ``pandas_udf``\s to get the best performance, see
 Recommended Pandas and PyArrow Versions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For usage with pyspark.sql, the minimum supported versions of Pandas is 2.2.0 and PyArrow is 11.0.0.
+For usage with pyspark.sql, the minimum supported versions of Pandas is 2.2.0 and PyArrow is 18.0.0.
 Higher versions may be used, however, compatibility and data correctness can not be guaranteed and should
 be verified by the user.
 

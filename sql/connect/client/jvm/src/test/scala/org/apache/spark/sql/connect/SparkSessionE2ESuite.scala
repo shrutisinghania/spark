@@ -16,7 +16,7 @@
  */
 package org.apache.spark.sql.connect
 
-import java.util.concurrent.ForkJoinPool
+import java.util.concurrent.Executors
 
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutor, Future}
@@ -41,11 +41,20 @@ class SparkSessionE2ESuite extends ConnectFunSuite with RemoteSparkSession {
     val session = spark
     import session.implicits._
     implicit val ec: ExecutionContextExecutor = ExecutionContext.global
+    // Run the long-running query through a single call site, and warm it up once before any
+    // interrupt. Otherwise the very first execution has to ship/fetch the map closure and its
+    // TypeTag artifact classes to the executor on demand; if an interrupt lands during that
+    // first-time remote class fetch, it surfaces as a RemoteClassLoaderError instead of
+    // OPERATION_CANCELED, making this test flaky (see SparkSessionE2ESuite$$typecreatorNN).
+    def runMapQuery(sleepMs: Long): Unit = {
+      spark.range(10).map(n => { Thread.sleep(sleepMs); n }).collect()
+    }
+    runMapQuery(0)
     val q1 = Future {
-      spark.range(10).map(n => { Thread.sleep(30000); n }).collect()
+      runMapQuery(30000)
     }
     val q2 = Future {
-      spark.range(10).map(n => { Thread.sleep(30000); n }).collect()
+      runMapQuery(30000)
     }
     var q1Interrupted = false
     var q2Interrupted = false
@@ -88,6 +97,16 @@ class SparkSessionE2ESuite extends ConnectFunSuite with RemoteSparkSession {
     @volatile var finished = false
     val interrupted = mutable.ListBuffer[String]()
 
+    // Run the long-running query through a single call site, and warm it up once before the
+    // background interruptor starts. Otherwise the first execution has to ship/fetch the map
+    // closure and its TypeTag artifact classes to the executor on demand; if an interrupt lands
+    // during that first-time remote class fetch, it surfaces as a RemoteClassLoaderError instead
+    // of OPERATION_CANCELED, making this test flaky (see SparkSessionE2ESuite$$typecreatorNN).
+    def runMapQuery(sleepMs: Long): Unit = {
+      spark.range(10).map(n => { Thread.sleep(sleepMs); n }).collect()
+    }
+    runMapQuery(0)
+
     val interruptor = Future {
       eventually(timeout(20.seconds), interval(1.seconds)) {
         val ids = spark.interruptAll()
@@ -96,15 +115,22 @@ class SparkSessionE2ESuite extends ConnectFunSuite with RemoteSparkSession {
       }
       finished
     }
-    val e1 = intercept[SparkException] {
-      spark.range(10).map(n => { Thread.sleep(30.seconds.toMillis); n }).collect()
+    try {
+      val e1 = intercept[SparkException] {
+        runMapQuery(30.seconds.toMillis)
+      }
+      assert(e1.getMessage.contains("OPERATION_CANCELED"), s"Unexpected exception: $e1")
+      val e2 = intercept[SparkException] {
+        runMapQuery(30.seconds.toMillis)
+      }
+      assert(e2.getMessage.contains("OPERATION_CANCELED"), s"Unexpected exception: $e2")
+    } finally {
+      // Always release the background interruptor. If an assertion above fails, this prevents the
+      // interruptor Future from continuing to call interruptAll() and canceling operations of the
+      // subsequent tests in this suite (which previously caused cascading OPERATION_CANCELED
+      // failures across the whole suite).
+      finished = true
     }
-    assert(e1.getMessage.contains("OPERATION_CANCELED"), s"Unexpected exception: $e1")
-    val e2 = intercept[SparkException] {
-      spark.range(10).map(n => { Thread.sleep(30.seconds.toMillis); n }).collect()
-    }
-    assert(e2.getMessage.contains("OPERATION_CANCELED"), s"Unexpected exception: $e2")
-    finished = true
     assert(awaitResult(interruptor, 10.seconds))
     assert(interrupted.length == 2, s"Interrupted operations: $interrupted.")
   }
@@ -138,15 +164,14 @@ class SparkSessionE2ESuite extends ConnectFunSuite with RemoteSparkSession {
     assert(interrupted.length == 2, s"Interrupted operations: $interrupted.")
   }
 
-  // TODO(SPARK-48139): Re-enable `SparkSessionE2ESuite.interrupt tag`
-  ignore("interrupt tag") {
+  test("interrupt tag") {
     val session = spark
     import session.implicits._
 
     // global ExecutionContext has only 2 threads in Apache Spark CI
     // create own thread pool for four Futures used in this test
     val numThreads = 4
-    val fpool = new ForkJoinPool(numThreads)
+    val fpool = Executors.newFixedThreadPool(numThreads)
     val executionContext = ExecutionContext.fromExecutorService(fpool)
 
     val q1 = Future {
@@ -408,6 +433,7 @@ class SparkSessionE2ESuite extends ConnectFunSuite with RemoteSparkSession {
     }
 
     assert(e.getMessage.contains("[INVALID_HANDLE.SESSION_CHANGED]"))
+    assert(e.getSqlState == "08003")
     assert(!session1.client.isSessionValid)
     assert(SparkSession.getActiveSession.isEmpty)
     assert(SparkSession.getDefaultSession.isEmpty)
@@ -449,5 +475,55 @@ class SparkSessionE2ESuite extends ConnectFunSuite with RemoteSparkSession {
       "command",
       Map("one" -> "1", "two" -> "2"))
     assert(df.as(StringEncoder).collect().toSet == Set("one", "two"))
+  }
+
+  test("dataframes with cached local relations succeed - changing values") {
+    val rowSize = 1000
+    val rowCount = 64 * 1000
+    val suffix = "abcdef"
+    val str = scala.util.Random.alphanumeric.take(rowSize).mkString + suffix
+    val data = Seq.tabulate(rowCount)(i => (i, str))
+    for (_ <- 0 until 2) {
+      val df = spark.createDataFrame(data)
+      assert(df.count() === rowCount)
+      assert(!df.filter(df("_2").endsWith(suffix)).isEmpty)
+    }
+  }
+
+  test("dataframes with cached local relations succeed - same values") {
+    val rowSize = 1000
+    val rowCount = 64 * 1000
+    val suffix = "abcdef"
+    val str = scala.util.Random.alphanumeric.take(rowSize).mkString + suffix
+    val data = Seq.tabulate(rowCount)(_ => (0, str))
+    for (_ <- 0 until 2) {
+      val df = spark.createDataFrame(data)
+      assert(df.count() === rowCount)
+      assert(!df.filter(df("_2").endsWith(suffix)).isEmpty)
+    }
+  }
+
+  test("large local relation size limit exceeded") {
+    // Set a low limit so we don't need to create a huge dataset
+    val conf_key = "spark.sql.session.localRelationSizeLimit"
+    val originalLimit = spark.conf.get(conf_key)
+    try {
+      val newLimit = (50 * 1024 * 1024).toString
+      spark.conf.set(conf_key, newLimit)
+      val rowSize = 1000
+      val rowCount = 64 * 1000
+      val suffix = "abcdef"
+      val str = scala.util.Random.alphanumeric.take(rowSize).mkString + suffix
+      val data = Seq.tabulate(rowCount)(i => (i, str))
+
+      val e = intercept[Exception] {
+        val df = spark.createDataFrame(data)
+        df.count()
+      }
+      assert(e.getMessage.contains("LOCAL_RELATION_SIZE_LIMIT_EXCEEDED"))
+      assert(e.getMessage.contains(newLimit))
+    } finally {
+      spark.conf.set(conf_key, originalLimit)
+    }
   }
 }

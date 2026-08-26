@@ -21,11 +21,11 @@ import java.io.File
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.internal.config._
-import org.apache.spark.memory.{MemoryMode, TaskMemoryManager, TestMemoryManager}
+import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.security.{CryptoStreamUtils, EncryptionFunSuite}
 import org.apache.spark.serializer.{JavaSerializer, SerializerManager}
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
-import org.apache.spark.unsafe.memory.MemoryBlock
+import org.apache.spark.unsafe.memory.{MemoryAllocator, MemoryBlock}
 import org.apache.spark.util.Utils
 
 class RowQueueSuite extends SparkFunSuite with EncryptionFunSuite {
@@ -94,6 +94,32 @@ class RowQueueSuite extends SparkFunSuite with EncryptionFunSuite {
     queue.close()
   }
 
+  test("hybrid queue uses disk for an exact-fit partial page") {
+    val conf = new SparkConf(false)
+    val serManager = createSerializerManager(conf)
+    val mem = new TestMemoryManager(conf)
+    var pageFreed = false
+    val taskM = new TaskMemoryManager(mem, 0) {
+      override def allocatePage(size: Long, consumer: MemoryConsumer): MemoryBlock = {
+        MemoryAllocator.HEAP.allocate(20)
+      }
+
+      override def freePage(page: MemoryBlock, consumer: MemoryConsumer): Unit = {
+        pageFreed = true
+        MemoryAllocator.HEAP.free(page)
+      }
+    }
+    val queue = HybridRowQueue(taskM, Utils.createTempDir().getCanonicalFile, 1, serManager)
+    val row = new UnsafeRow(1)
+    row.pointTo(new Array[Byte](16), 16)
+
+    assert(queue.add(row) === QueueMode.DISK)
+    assert(pageFreed)
+    assert(queue.getUsed === 0)
+    assert(queue.remove().getSizeInBytes === 16)
+    queue.close()
+  }
+
   Seq(true, false).foreach { isOffHeap =>
     encryptionTest(s"hybrid queue (offHeap=$isOffHeap)") { conf =>
       conf.set(MEMORY_OFFHEAP_ENABLED, isOffHeap)
@@ -111,7 +137,7 @@ class RowQueueSuite extends SparkFunSuite with EncryptionFunSuite {
       var i = 0
       while (i < n) {
         row.setLong(0, i)
-        assert(queue.add(row), "fail to add")
+        queue.add(row)
         i += 1
       }
       assert(queue.numQueues() > 1, "should have more than one queue")
@@ -128,7 +154,7 @@ class RowQueueSuite extends SparkFunSuite with EncryptionFunSuite {
       i = 0
       while (i < n) {
         row.setLong(0, i)
-        assert(queue.add(row), "fail to add")
+        queue.add(row)
         i += 1
       }
       assert(queue.numQueues() > 1, "should have more than one queue")

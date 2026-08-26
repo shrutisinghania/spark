@@ -38,12 +38,18 @@ object ViewResolution {
       val maxNestedViewDepth = AnalysisContext.get.maxNestedViewDepth
       if (nestedViewDepth > maxNestedViewDepth) {
         throw QueryCompilationErrors.viewDepthExceedsMaxResolutionDepthError(
-          view.desc.identifier,
+          view.desc.fullIdent,
           maxNestedViewDepth,
           view
         )
       }
-      SQLConf.withExistingConf(View.effectiveSQLConf(view.desc.viewSQLConfigs, view.isTempView)) {
+      SQLConf.withExistingConf(
+        View.effectiveSQLConf(
+          configs = view.desc.viewSQLConfigs,
+          isTempView = view.isTempView,
+          createSparkVersion = view.desc.createVersion
+        )
+      ) {
         resolveChild(view.child)
       }
     }

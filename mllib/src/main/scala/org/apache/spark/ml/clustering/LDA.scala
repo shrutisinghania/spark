@@ -157,7 +157,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
 
   /** Supported values for Param [[optimizer]]. */
   @Since("1.6.0")
-  final val supportedOptimizers: Array[String] = Array("online", "em")
+  final val supportedOptimizers: Array[String] = LDA.supportedOptimizers
 
   /**
    * Optimizer or inference algorithm used to estimate the LDA model.
@@ -180,7 +180,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
   @Since("1.6.0")
   final val optimizer = new Param[String](this, "optimizer", "Optimizer or inference" +
     " algorithm used to estimate the LDA model. Supported: " + supportedOptimizers.mkString(", "),
-    (value: String) => supportedOptimizers.contains(value.toLowerCase(Locale.ROOT)))
+    (value: String) => LDA.supportedOptimizers.contains(value.toLowerCase(Locale.ROOT)))
 
   /** @group getParam */
   @Since("1.6.0")
@@ -355,7 +355,7 @@ private[clustering] trait LDAParams extends Params with HasFeaturesCol with HasM
       }
     }
     SchemaUtils.validateVectorCompatibleColumn(schema, getFeaturesCol)
-    SchemaUtils.appendColumn(schema, $(topicDistributionCol), new VectorUDT)
+    SchemaUtils.appendColumn(schema, $(topicDistributionCol), SQLDataTypes.VectorType)
   }
 
   private[clustering] def getOldOptimizer: OldLDAOptimizer =
@@ -640,6 +640,21 @@ class LocalLDAModel private[ml] (
   override def toString: String = {
     s"LocalLDAModel: uid=$uid, k=${$(k)}, numFeatures=$vocabSize"
   }
+
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    if (oldLocalModel != null) {
+      // topicsMatrix: Matrix
+      if (oldLocalModel.topicsMatrix != null) {
+        size += oldLocalModel.topicsMatrix.asML.getSizeInBytes
+      }
+      // docConcentration: Vector
+      if (oldLocalModel.docConcentration != null) {
+        size += oldLocalModel.docConcentration.asML.getSizeInBytes
+      }
+    }
+    size
+  }
 }
 
 @Since("1.6.0")
@@ -826,9 +841,16 @@ class DistributedLDAModel private[ml] (
     s"DistributedLDAModel: uid=$uid, k=${$(k)}, numFeatures=$vocabSize"
   }
 
-  override def estimatedSize: Long = {
-    // TODO: Implement this method.
-    throw new UnsupportedOperationException
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    // oldDistributedModel: metadata, global topic totals, graph vertices, and graph edges.
+    oldDistributedModel.toInternals.foreach {
+      case df: org.apache.spark.sql.classic.DataFrame =>
+        size += df.toArrowBatchRdd.map(_.length.toLong).reduce(_ + _)
+      case o => throw new UnsupportedOperationException(
+        s"Unsupported dataframe type: ${o.getClass.getName}")
+    }
+    size
   }
 }
 
@@ -840,14 +862,23 @@ object DistributedLDAModel extends MLReadable[DistributedLDAModel] {
   class DistributedWriter(instance: DistributedLDAModel) extends MLWriter {
 
     override protected def saveImpl(path: String): Unit = {
-      if (ReadWriteUtils.localSavingModeState.get()) {
-        throw new UnsupportedOperationException(
-          "DistributedLDAModel does not support saving to local filesystem path."
-        )
-      }
-      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
       val modelPath = new Path(path, "oldModel").toString
-      instance.oldDistributedModel.save(sc, modelPath)
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession)
+      if (ReadWriteUtils.localSavingModeState.get()) {
+        val Seq(metadataDF, globalTopicTotalsDF, verticesDF, edgesDF) =
+          instance.oldDistributedModel.toInternals
+
+        ReadWriteUtils.saveDataFrame(
+          new Path(modelPath, "old-metadata").toString, metadataDF)
+        ReadWriteUtils.saveDataFrame(
+          new Path(modelPath, "old-global-topic-totals").toString, globalTopicTotalsDF)
+        ReadWriteUtils.saveDataFrame(
+          new Path(modelPath, "old-vertices").toString, verticesDF)
+        ReadWriteUtils.saveDataFrame(
+          new Path(modelPath, "old-edges").toString, edgesDF)
+      } else {
+        instance.oldDistributedModel.save(sc, modelPath)
+      }
     }
   }
 
@@ -856,14 +887,23 @@ object DistributedLDAModel extends MLReadable[DistributedLDAModel] {
     private val className = classOf[DistributedLDAModel].getName
 
     override def load(path: String): DistributedLDAModel = {
-      if (ReadWriteUtils.localSavingModeState.get()) {
-        throw new UnsupportedOperationException(
-          "DistributedLDAModel does not support loading from local filesystem path."
-        )
-      }
       val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val modelPath = new Path(path, "oldModel").toString
-      val oldModel = OldDistributedLDAModel.load(sc, modelPath)
+      val oldModel = if (ReadWriteUtils.localSavingModeState.get()) {
+        val metadataDF = ReadWriteUtils.loadDataFrame(
+          new Path(modelPath, "old-metadata").toString, sparkSession)
+        val globalTopicTotalsDF = ReadWriteUtils.loadDataFrame(
+          new Path(modelPath, "old-global-topic-totals").toString, sparkSession)
+        val verticesDF = ReadWriteUtils.loadDataFrame(
+          new Path(modelPath, "old-vertices").toString, sparkSession)
+        val edgesDF = ReadWriteUtils.loadDataFrame(
+          new Path(modelPath, "old-edges").toString, sparkSession)
+
+        OldDistributedLDAModel.fromInternals(
+          Seq(metadataDF, globalTopicTotalsDF, verticesDF, edgesDF))
+      } else {
+        OldDistributedLDAModel.load(sc, modelPath)
+      }
       val model = new DistributedLDAModel(metadata.uid, oldModel.vocabSize,
         oldModel, sparkSession, None)
       LDAParams.getAndSetParams(model, metadata)
@@ -1033,6 +1073,8 @@ class LDA @Since("1.6.0") (
 
 @Since("2.0.0")
 object LDA extends MLReadable[LDA] {
+
+  private[clustering] val supportedOptimizers: Array[String] = Array("online", "em")
 
   /** Get dataset for spark.mllib LDA */
   private[clustering] def getOldDataset(

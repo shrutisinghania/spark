@@ -15,22 +15,24 @@
 # limitations under the License.
 #
 
-import copy
-import sys
-import os
-import operator
-import shlex
-import warnings
-import heapq
 import bisect
+import copy
+import heapq
+import operator
+import os
 import random
-from subprocess import Popen, PIPE
-from threading import Thread
+import shlex
+import sys
+import warnings
 from collections import defaultdict
-from itertools import chain
 from functools import reduce
-from math import sqrt, log, isinf, isnan, pow, ceil
+from itertools import chain
+from math import ceil, isinf, isnan, log, pow, sqrt
+from subprocess import PIPE, Popen
+from threading import Thread
 from typing import (
+    IO,
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -38,74 +40,71 @@ from typing import (
     Hashable,
     Iterable,
     Iterator,
-    IO,
     List,
     NoReturn,
     Optional,
     Sequence,
     Tuple,
-    Union,
     TypeVar,
+    Union,
     cast,
     overload,
-    TYPE_CHECKING,
 )
 
-from pyspark.serializers import (
-    AutoBatchedSerializer,
-    BatchedSerializer,
-    NoOpSerializer,
-    CartesianDeserializer,
-    CloudPickleSerializer,
-    PairDeserializer,
-    CPickleSerializer,
-    Serializer,
-    pack_long,
-)
+from pyspark.errors import PySparkRuntimeError
 from pyspark.join import (
+    python_cogroup,
+    python_full_outer_join,
     python_join,
     python_left_outer_join,
     python_right_outer_join,
-    python_full_outer_join,
-    python_cogroup,
 )
-from pyspark.statcounter import StatCounter
-from pyspark.rddsampler import RDDSampler, RDDRangeSampler, RDDStratifiedSampler
-from pyspark.storagelevel import StorageLevel
-from pyspark.resource.requests import ExecutorResourceRequests, TaskResourceRequests
+from pyspark.rddsampler import RDDRangeSampler, RDDSampler, RDDStratifiedSampler
 from pyspark.resource.profile import ResourceProfile
+from pyspark.resource.requests import ExecutorResourceRequests, TaskResourceRequests
 from pyspark.resultiterable import ResultIterable
+from pyspark.serializers import (
+    AutoBatchedSerializer,
+    BatchedSerializer,
+    CartesianDeserializer,
+    CloudPickleSerializer,
+    CPickleSerializer,
+    NoOpSerializer,
+    PairDeserializer,
+    Serializer,
+    pack_long,
+)
 from pyspark.shuffle import (
     Aggregator,
-    ExternalMerger,
-    get_used_memory,
-    ExternalSorter,
     ExternalGroupBy,
+    ExternalMerger,
+    ExternalSorter,
+    get_used_memory,
 )
+from pyspark.statcounter import StatCounter
+from pyspark.storagelevel import StorageLevel
 from pyspark.traceback_utils import SCCallSiteSync
-from pyspark.util import (
-    fail_on_stopiteration,
-    _parse_memory,
-    _load_from_socket,
-    _local_iterator_from_socket,
-)
-from pyspark.errors import PySparkRuntimeError
 
 # for backward compatibility references.
-from pyspark.util import PythonEvalType  # noqa: F401
-
+from pyspark.util import (
+    PythonEvalType,  # noqa: F401
+    _load_from_socket,
+    _local_iterator_from_socket,
+    _parse_memory,
+    fail_on_stopiteration,
+)
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
 
-    from pyspark._typing import S, NumberOrArray
+    from pyspark._typing import NumberOrArray, S, SizedIterable
     from pyspark.core.context import SparkContext
-    from pyspark.sql.dataframe import DataFrame
-    from pyspark.sql.types import AtomicType, StructType
     from pyspark.sql._typing import (
         AtomicValue,
         RowLike,
     )
+    from pyspark.sql.dataframe import DataFrame
+    from pyspark.sql.types import AtomicType, StructType
 
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
@@ -196,7 +195,6 @@ class Partitioner:
 
 
 class RDD(Generic[T_co]):
-
     """
     A Resilient Distributed Dataset (RDD), the basic abstraction in Spark.
     Represents an immutable, partitioned collection of elements that can be
@@ -1205,8 +1203,7 @@ class RDD(Generic[T_co]):
         numPartitions: Optional[int] = ...,
         partitionFunc: Callable[["S"], int] = ...,
         ascending: bool = ...,
-    ) -> "RDD[Tuple[S, V]]":
-        ...
+    ) -> "RDD[Tuple[S, V]]": ...
 
     @overload
     def repartitionAndSortWithinPartitions(
@@ -1215,8 +1212,7 @@ class RDD(Generic[T_co]):
         partitionFunc: Callable[[K], int],
         ascending: bool,
         keyfunc: Callable[[K], "S"],
-    ) -> "RDD[Tuple[K, V]]":
-        ...
+    ) -> "RDD[Tuple[K, V]]": ...
 
     @overload
     def repartitionAndSortWithinPartitions(
@@ -1226,8 +1222,7 @@ class RDD(Generic[T_co]):
         ascending: bool = ...,
         *,
         keyfunc: Callable[[K], "S"],
-    ) -> "RDD[Tuple[K, V]]":
-        ...
+    ) -> "RDD[Tuple[K, V]]": ...
 
     def repartitionAndSortWithinPartitions(
         self: "RDD[Tuple[Any, Any]]",
@@ -1279,7 +1274,7 @@ class RDD(Generic[T_co]):
         serializer = self._jrdd_deserializer
 
         def sortPartition(iterator: Iterable[Tuple[K, V]]) -> Iterable[Tuple[K, V]]:
-            sort = ExternalSorter(memory * 0.9, serializer).sorted
+            sort = ExternalSorter[tuple[K, V]](memory * 0.9, serializer).sorted
             return iter(sort(iterator, key=lambda k_v: keyfunc(k_v[0]), reverse=(not ascending)))
 
         return self.partitionBy(numPartitions, partitionFunc).mapPartitions(sortPartition, True)
@@ -1289,8 +1284,7 @@ class RDD(Generic[T_co]):
         self: "RDD[Tuple[S, V]]",
         ascending: bool = ...,
         numPartitions: Optional[int] = ...,
-    ) -> "RDD[Tuple[K, V]]":
-        ...
+    ) -> "RDD[Tuple[K, V]]": ...
 
     @overload
     def sortByKey(
@@ -1298,8 +1292,7 @@ class RDD(Generic[T_co]):
         ascending: bool,
         numPartitions: int,
         keyfunc: Callable[[K], "S"],
-    ) -> "RDD[Tuple[K, V]]":
-        ...
+    ) -> "RDD[Tuple[K, V]]": ...
 
     @overload
     def sortByKey(
@@ -1308,8 +1301,7 @@ class RDD(Generic[T_co]):
         numPartitions: Optional[int] = ...,
         *,
         keyfunc: Callable[[K], "S"],
-    ) -> "RDD[Tuple[K, V]]":
-        ...
+    ) -> "RDD[Tuple[K, V]]": ...
 
     def sortByKey(
         self: "RDD[Tuple[K, V]]",
@@ -1362,7 +1354,7 @@ class RDD(Generic[T_co]):
         serializer = self._jrdd_deserializer
 
         def sortPartition(iterator: Iterable[Tuple[K, V]]) -> Iterable[Tuple[K, V]]:
-            sort = ExternalSorter(memory * 0.9, serializer).sorted
+            sort = ExternalSorter[tuple[K, V]](memory * 0.9, serializer).sorted
             return iter(sort(iterator, key=lambda kv: keyfunc(kv[0]), reverse=(not ascending)))
 
         if numPartitions == 1:
@@ -1659,9 +1651,16 @@ class RDD(Generic[T_co]):
         """
 
         def func(it: Iterable[T]) -> Iterable[Any]:
-            r = f(it)
+            # Officially, our type hint suggests that f should be a function
+            # that returns None. However, historically, we supported f as
+            # a generator, so it could return an iterator that we need to
+            # go through. We check the common case first, then deal with
+            # the undocumented behavior.
+            r = f(it)  # type: ignore[func-returns-value]
+            if r is None:
+                return iter([])
             try:
-                return iter(r)  # type: ignore[call-overload]
+                return iter(r)
             except TypeError:
                 return iter([])
 
@@ -1698,7 +1697,8 @@ class RDD(Generic[T_co]):
         with SCCallSiteSync(self.context):
             assert self.ctx._jvm is not None
             sock_info = self.ctx._jvm.PythonRDD.collectAndServe(self._jrdd.rdd())
-        return list(_load_from_socket(sock_info, self._jrdd_deserializer))
+        with _load_from_socket(sock_info, self._jrdd_deserializer) as stream:
+            return list(stream)
 
     def collectWithJobGroup(
         self: "RDD[T]", groupId: str, description: str, interruptOnCancel: bool = False
@@ -1731,8 +1731,7 @@ class RDD(Generic[T_co]):
         :meth:`SparkContext.setJobGroup`
         """
         warnings.warn(
-            "Deprecated in 3.1, Use pyspark.InheritableThread with "
-            "the pinned thread mode enabled.",
+            "Deprecated in 3.1, Use pyspark.InheritableThread with the pinned thread mode enabled.",
             FutureWarning,
         )
 
@@ -1741,7 +1740,8 @@ class RDD(Generic[T_co]):
             sock_info = self.ctx._jvm.PythonRDD.collectAndServeWithJobGroup(
                 self._jrdd.rdd(), groupId, description, interruptOnCancel
             )
-        return list(_load_from_socket(sock_info, self._jrdd_deserializer))
+        with _load_from_socket(sock_info, self._jrdd_deserializer) as stream:
+            return list(stream)
 
     def reduce(self: "RDD[T]", f: Callable[[T, T], T]) -> T:
         """
@@ -2055,12 +2055,10 @@ class RDD(Generic[T_co]):
         return partiallyAggregated.reduce(combOp)
 
     @overload
-    def max(self: "RDD[S]") -> "S":
-        ...
+    def max(self: "RDD[S]") -> "S": ...
 
     @overload
-    def max(self: "RDD[T]", key: Callable[[T], "S"]) -> T:
-        ...
+    def max(self: "RDD[T]", key: Callable[[T], "S"]) -> T: ...
 
     def max(self: "RDD[T]", key: Optional[Callable[[T], "S"]] = None) -> T:
         """
@@ -2095,12 +2093,10 @@ class RDD(Generic[T_co]):
         return self.reduce(lambda a, b: max(a, b, key=key))
 
     @overload
-    def min(self: "RDD[S]") -> "S":
-        ...
+    def min(self: "RDD[S]") -> "S": ...
 
     @overload
-    def min(self: "RDD[T]", key: Callable[[T], "S"]) -> T:
-        ...
+    def min(self: "RDD[T]", key: Callable[[T], "S"]) -> T: ...
 
     def min(self: "RDD[T]", key: Optional[Callable[[T], "S"]] = None) -> T:
         """
@@ -2529,12 +2525,10 @@ class RDD(Generic[T_co]):
         return self.mapPartitions(countPartition).reduce(mergeMaps)
 
     @overload
-    def top(self: "RDD[S]", num: int) -> List["S"]:
-        ...
+    def top(self: "RDD[S]", num: int) -> List["S"]: ...
 
     @overload
-    def top(self: "RDD[T]", num: int, key: Callable[[T], "S"]) -> List[T]:
-        ...
+    def top(self: "RDD[T]", num: int, key: Callable[[T], "S"]) -> List[T]: ...
 
     def top(self: "RDD[T]", num: int, key: Optional[Callable[[T], "S"]] = None) -> List[T]:
         """
@@ -2586,12 +2580,10 @@ class RDD(Generic[T_co]):
         return self.mapPartitions(topIterator).reduce(merge)
 
     @overload
-    def takeOrdered(self: "RDD[S]", num: int) -> List["S"]:
-        ...
+    def takeOrdered(self: "RDD[S]", num: int) -> List["S"]: ...
 
     @overload
-    def takeOrdered(self: "RDD[T]", num: int, key: Callable[[T], "S"]) -> List[T]:
-        ...
+    def takeOrdered(self: "RDD[T]", num: int, key: Callable[[T], "S"]) -> List[T]: ...
 
     def takeOrdered(self: "RDD[T]", num: int, key: Optional[Callable[[T], "S"]] = None) -> List[T]:
         """
@@ -3849,7 +3841,7 @@ class RDD(Generic[T_co]):
         agg = Aggregator(createCombiner, mergeValue, mergeCombiners)
 
         def combineLocally(iterator: Iterable[Tuple[K, V]]) -> Iterable[Tuple[K, U]]:
-            merger = ExternalMerger(agg, memory * 0.9, serializer)
+            merger = ExternalMerger[K, V, U](agg, memory * 0.9, serializer)
             merger.mergeValues(iterator)
             return merger.items()
 
@@ -3857,7 +3849,7 @@ class RDD(Generic[T_co]):
         shuffled = locally_combined.partitionBy(numPartitions, partitionFunc)
 
         def _mergeCombiners(iterator: Iterable[Tuple[K, U]]) -> Iterable[Tuple[K, U]]:
-            merger = ExternalMerger(agg, memory, serializer)
+            merger = ExternalMerger[K, V, U](agg, memory, serializer)
             merger.mergeCombiners(iterator)
             return merger.items()
 
@@ -4041,15 +4033,15 @@ class RDD(Generic[T_co]):
         agg = Aggregator(createCombiner, mergeValue, mergeCombiners)
 
         def combine(iterator: Iterable[Tuple[K, V]]) -> Iterable[Tuple[K, List[V]]]:
-            merger = ExternalMerger(agg, memory * 0.9, serializer)
+            merger = ExternalMerger[K, V, list[V]](agg, memory * 0.9, serializer)
             merger.mergeValues(iterator)
             return merger.items()
 
         locally_combined = self.mapPartitions(combine, preservesPartitioning=True)
         shuffled = locally_combined.partitionBy(numPartitions, partitionFunc)
 
-        def groupByKey(it: Iterable[Tuple[K, List[V]]]) -> Iterable[Tuple[K, List[V]]]:
-            merger = ExternalGroupBy(agg, memory, serializer)
+        def groupByKey(it: Iterable[Tuple[K, List[V]]]) -> Iterable[Tuple[K, "SizedIterable[V]"]]:
+            merger = ExternalGroupBy[K, V](agg, memory, serializer)  # type: ignore[arg-type]
             merger.mergeCombiners(it)
             return merger.items()
 
@@ -4134,14 +4126,12 @@ class RDD(Generic[T_co]):
     @overload
     def groupWith(
         self: "RDD[Tuple[K, V]]", other: "RDD[Tuple[K, V1]]"
-    ) -> "RDD[Tuple[K, Tuple[ResultIterable[V], ResultIterable[V1]]]]":
-        ...
+    ) -> "RDD[Tuple[K, Tuple[ResultIterable[V], ResultIterable[V1]]]]": ...
 
     @overload
     def groupWith(
         self: "RDD[Tuple[K, V]]", other: "RDD[Tuple[K, V1]]", __o1: "RDD[Tuple[K, V2]]"
-    ) -> "RDD[Tuple[K, Tuple[ResultIterable[V], ResultIterable[V1], ResultIterable[V2]]]]":
-        ...
+    ) -> "RDD[Tuple[K, Tuple[ResultIterable[V], ResultIterable[V1], ResultIterable[V2]]]]": ...
 
     @overload
     def groupWith(
@@ -4159,8 +4149,7 @@ class RDD(Generic[T_co]):
                 ResultIterable[V3],
             ],
         ]
-    ]""":
-        ...
+    ]""": ...
 
     def groupWith(  # type: ignore[misc]
         self: "RDD[Tuple[Any, Any]]", other: "RDD[Tuple[Any, Any]]", *others: "RDD[Tuple[Any, Any]]"
@@ -4854,7 +4843,8 @@ class RDD(Generic[T_co]):
         jrdd = self.mapPartitions(lambda it: [float(sum(it))])._to_java_object_rdd()
         assert self.ctx._jvm is not None
         jdrdd = self.ctx._jvm.JavaDoubleRDD.fromRDD(jrdd.rdd())
-        r = jdrdd.sumApprox(timeout, confidence).getFinalValue()
+        partial = jdrdd.sumApprox(timeout, confidence)
+        r = partial.initialValue()
         return BoundedFloat(r.mean(), r.confidence(), r.low(), r.high())
 
     def meanApprox(
@@ -4892,7 +4882,8 @@ class RDD(Generic[T_co]):
         jrdd = self.map(float)._to_java_object_rdd()
         assert self.ctx._jvm is not None
         jdrdd = self.ctx._jvm.JavaDoubleRDD.fromRDD(jrdd.rdd())
-        r = jdrdd.meanApprox(timeout, confidence).getFinalValue()
+        partial = jdrdd.meanApprox(timeout, confidence)
+        r = partial.initialValue()
         return BoundedFloat(r.mean(), r.confidence(), r.low(), r.high())
 
     def countApproxDistinct(self: "RDD[T]", relativeSD: float = 0.05) -> int:
@@ -5087,21 +5078,18 @@ class RDD(Generic[T_co]):
         self: "RDD[RowLike]",
         schema: Optional[Union[List[str], Tuple[str, ...]]] = None,
         sampleRatio: Optional[float] = None,
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
     @overload
     def toDF(
         self: "RDD[RowLike]", schema: Optional[Union["StructType", str]] = None
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
     @overload
     def toDF(
         self: "RDD[AtomicValue]",
         schema: Union["AtomicType", str],
-    ) -> "DataFrame":
-        ...
+    ) -> "DataFrame": ...
 
     def toDF(
         self: "RDD[Any]", schema: Optional[Any] = None, sampleRatio: Optional[float] = None
@@ -5149,7 +5137,6 @@ def _wrap_function(
 
 
 class RDDBarrier(Generic[T]):
-
     """
     Wraps an RDD in a barrier stage, which forces Spark to launch tasks of this stage together.
     :class:`RDDBarrier` instances are created by :meth:`RDD.barrier`.
@@ -5265,7 +5252,6 @@ class RDDBarrier(Generic[T]):
 
 
 class PipelinedRDD(RDD[U], Generic[T, U]):
-
     """
     Examples
     --------
@@ -5370,6 +5356,7 @@ class PipelinedRDD(RDD[U], Generic[T, U]):
 def _test() -> None:
     import doctest
     import tempfile
+
     from pyspark.core.context import SparkContext
 
     try:
@@ -5380,7 +5367,7 @@ def _test() -> None:
 
         if Version(np.__version__) >= Version("2"):
             # `legacy="1.25"` only available in `nump>=2`
-            np.set_printoptions(legacy="1.25")  # type: ignore[arg-type]
+            np.set_printoptions(legacy="1.25")  # type: ignore[arg-type, unused-ignore]
     except (ModuleNotFoundError, TypeError):
         pass
 
@@ -5390,7 +5377,7 @@ def _test() -> None:
     # even in these small test examples:
     globs["sc"] = SparkContext("local[4]", "PythonTest")
     globs["sc"].setCheckpointDir(tmp_dir.name)
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     globs["sc"].stop()
     tmp_dir.cleanup()
     if failure_count:

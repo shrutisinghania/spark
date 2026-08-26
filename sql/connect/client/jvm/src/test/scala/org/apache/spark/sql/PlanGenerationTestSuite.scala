@@ -28,7 +28,6 @@ import com.google.protobuf
 import com.google.protobuf.util.JsonFormat
 import com.google.protobuf.util.JsonFormat.TypeRegistry
 import io.grpc.inprocess.InProcessChannelBuilder
-import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
 
 import org.apache.spark.connect.proto
 import org.apache.spark.connect.proto.StorageLevel
@@ -77,11 +76,7 @@ import org.apache.spark.util.SparkFileUtils
  * `sql/connect/server` module
  */
 // scalastyle:on
-class PlanGenerationTestSuite
-    extends ConnectFunSuite
-    with BeforeAndAfterAll
-    with BeforeAndAfterEach
-    with Logging {
+class PlanGenerationTestSuite extends ConnectFunSuite with Logging {
 
   // Borrowed from SparkFunSuite
   private val regenerateGoldenFiles: Boolean = System.getenv("SPARK_GENERATE_GOLDEN_FILES") == "1"
@@ -110,6 +105,8 @@ class PlanGenerationTestSuite
     .build()
 
   private val printer = JsonFormat.printer().usingTypeRegistry(registry)
+
+  private val testUDT = new TestUDT.NewArrayUDT()
 
   private var session: SparkSession = _
 
@@ -148,7 +145,7 @@ class PlanGenerationTestSuite
   }
 
   private def test(name: String)(f: => Dataset[_]): Unit = super.test(name) {
-    val actual = trimJvmOriginFields(f.plan.getRoot)
+    val actual = normalizeProtoForComparison(f.plan.getRoot)
     val goldenFile = queryFilePath.resolve(name.replace(' ', '_') + ".proto.bin")
     Try(readRelation(goldenFile)) match {
       case Success(expected) if expected == actual =>
@@ -200,7 +197,11 @@ class PlanGenerationTestSuite
     }
   }
 
-  private def trimJvmOriginFields[T <: protobuf.Message](message: T): T = {
+  /**
+   * Normalize proto messages for stable comparison:
+   *   - Trim JVM origin fields (lines, stack traces, anonymous function names)
+   */
+  private def normalizeProtoForComparison[T <: protobuf.Message](message: T): T = {
     def trim(builder: proto.JvmOrigin.Builder): Unit = {
       builder
         .clearLine()
@@ -232,10 +233,10 @@ class PlanGenerationTestSuite
 
     builder.getAllFields.asScala.foreach {
       case (desc, msg: protobuf.Message) =>
-        builder.setField(desc, trimJvmOriginFields(msg))
+        builder.setField(desc, normalizeProtoForComparison(msg))
       case (desc, list: java.util.List[_]) =>
         val newList = list.asScala.map {
-          case msg: protobuf.Message => trimJvmOriginFields(msg)
+          case msg: protobuf.Message => normalizeProtoForComparison(msg)
           case other => other // Primitive types
         }
         builder.setField(desc, newList.asJava)
@@ -306,6 +307,8 @@ class PlanGenerationTestSuite
   private def binary = createLocalRelation(binarySchemaString)
   private def temporals = createLocalRelation(temporalsSchemaString)
   private def boolean = createLocalRelation(booleanSchemaString)
+
+  private case class CaseClass(a: Int, b: String)
 
   /* Spark Session API */
   test("range") {
@@ -378,6 +381,21 @@ class PlanGenerationTestSuite
 
   test("table") {
     session.table("myTable")
+  }
+
+  test("read changes") {
+    session.read
+      .option("startingVersion", "1")
+      .option("endingVersion", "5")
+      .changes("myTable")
+  }
+
+  test("read changes with options") {
+    session.read
+      .option("startingTimestamp", "2026-01-01")
+      .option("deduplicationMode", "dropCarryovers")
+      .option("computeUpdates", "true")
+      .changes("myTable")
   }
 
   test("read text") {
@@ -486,6 +504,29 @@ class PlanGenerationTestSuite
 
   test("crossJoin") {
     left.crossJoin(right)
+  }
+
+  test("nearestByJoin inner_approx_similarity") {
+    left
+      .as("l")
+      .nearestByJoin(
+        right = right.as("r"),
+        rankingExpression = fn.col("l.a") + fn.col("r.a"),
+        numResults = 1,
+        mode = "approx",
+        direction = "similarity")
+  }
+
+  test("nearestByJoin leftouter_exact_distance") {
+    left
+      .as("l")
+      .nearestByJoin(
+        right = right.as("r"),
+        rankingExpression = fn.col("l.a") + fn.col("r.a"),
+        numResults = 5,
+        mode = "exact",
+        direction = "distance",
+        joinType = "leftouter")
   }
 
   test("sortWithinPartitions strings") {
@@ -687,6 +728,18 @@ class PlanGenerationTestSuite
     simple.withMetadata("id", builder.build())
   }
 
+  test("zip") {
+    left.select("id").zip(left.select("a"))
+  }
+
+  test("zipWithIndex") {
+    simple.zipWithIndex()
+  }
+
+  test("zipWithIndex custom column") {
+    simple.zipWithIndex("my_index")
+  }
+
   test("drop single string") {
     simple.drop("a")
   }
@@ -745,6 +798,10 @@ class PlanGenerationTestSuite
 
   test("repartitionByRange expressions") {
     simple.repartitionByRange(fn.col("a").asc, fn.col("id").desc_nulls_first)
+  }
+
+  test("repartitionById") {
+    simple.repartitionById(10, fn.col("id").cast("int"))
   }
 
   test("coalesce") {
@@ -1568,6 +1625,10 @@ class PlanGenerationTestSuite
     fn.round(fn.col("b"), 2)
   }
 
+  functionTest("truncate") {
+    fn.truncate(fn.col("b"), 2)
+  }
+
   functionTest("sec") {
     fn.sec(fn.col("b"))
   }
@@ -1654,6 +1715,14 @@ class PlanGenerationTestSuite
 
   functionTest("crc32") {
     fn.crc32(fn.col("g").cast("binary"))
+  }
+
+  functionTest("xxh3_64") {
+    fn.xxh3_64(fn.col("g").cast("binary"))
+  }
+
+  functionTest("xxh3_128") {
+    fn.xxh3_128(fn.col("g").cast("binary"))
   }
 
   functionTest("hash") {
@@ -1798,6 +1867,14 @@ class PlanGenerationTestSuite
 
   functionTest("unbase64") {
     fn.unbase64(fn.col("g"))
+  }
+
+  functionTest("to_base32") {
+    fn.to_base32(fn.col("g").cast("binary"))
+  }
+
+  functionTest("from_base32") {
+    fn.from_base32(fn.col("g"))
   }
 
   functionTest("rpad") {
@@ -2191,6 +2268,26 @@ class PlanGenerationTestSuite
     binary.select(fn.bitmap_or_agg(fn.col("bytes")))
   }
 
+  test("function bitmap_and") {
+    binary.select(fn.bitmap_and(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_or") {
+    binary.select(fn.bitmap_or(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_andnot") {
+    binary.select(fn.bitmap_andnot(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_xor") {
+    binary.select(fn.bitmap_xor(fn.col("bytes"), fn.col("bytes")))
+  }
+
+  test("function bitmap_xor_agg") {
+    binary.select(fn.bitmap_xor_agg(fn.col("bytes")))
+  }
+
   private def temporalFunctionTest(name: String)(f: => Column): Unit = {
     test("function " + name) {
       temporals.select(f)
@@ -2299,6 +2396,18 @@ class PlanGenerationTestSuite
 
   temporalFunctionTest("make_date") {
     fn.make_date(fn.lit(2018), fn.lit(5), fn.lit(14))
+  }
+
+  temporalFunctionTest("make_time") {
+    fn.make_time(fn.lit(12), fn.lit(13), fn.lit(14))
+  }
+
+  temporalFunctionTest("current_time") {
+    fn.current_time()
+  }
+
+  temporalFunctionTest("current_time with precision") {
+    fn.current_time(3)
   }
 
   temporalFunctionTest("months_between") {
@@ -2502,6 +2611,10 @@ class PlanGenerationTestSuite
     fn.slice(fn.col("e"), 0, 5)
   }
 
+  functionTest("trim_array") {
+    fn.trim_array(fn.col("e"), 2)
+  }
+
   functionTest("array_join") {
     fn.array_join(fn.col("e"), ";")
   }
@@ -2688,6 +2801,50 @@ class PlanGenerationTestSuite
     fn.is_variant_null(fn.parse_json(fn.col("g")))
   }
 
+  functionTest("is_valid_variant") {
+    fn.is_valid_variant(fn.parse_json(fn.col("g")))
+  }
+
+  functionTest("variant_delete") {
+    fn.variant_delete(fn.parse_json(fn.col("g")), "$.a", "$.b")
+  }
+
+  functionTest("variant_insert") {
+    fn.variant_insert(fn.parse_json(fn.col("g")), "$.a", fn.lit(1))
+  }
+
+  functionTest("try_variant_insert") {
+    fn.try_variant_insert(fn.parse_json(fn.col("g")), "$.a", fn.lit(1))
+  }
+
+  functionTest("variant_set") {
+    fn.variant_set(fn.parse_json(fn.col("g")), "$.a", fn.lit(1))
+  }
+
+  functionTest("variant_set with create_if_missing") {
+    fn.variant_set(fn.parse_json(fn.col("g")), "$.a", fn.lit(1), false)
+  }
+
+  functionTest("try_variant_set") {
+    fn.try_variant_set(fn.parse_json(fn.col("g")), "$.a", fn.lit(1))
+  }
+
+  functionTest("try_variant_set with create_if_missing") {
+    fn.try_variant_set(fn.parse_json(fn.col("g")), "$.a", fn.lit(1), false)
+  }
+
+  functionTest("variant_array_append") {
+    fn.variant_array_append(fn.parse_json(fn.col("g")), "$.a", fn.lit(1))
+  }
+
+  functionTest("try_variant_array_append") {
+    fn.try_variant_array_append(fn.parse_json(fn.col("g")), "$.a", fn.lit(1))
+  }
+
+  functionTest("variant_strip_nulls") {
+    fn.variant_strip_nulls(fn.parse_json(fn.col("g")), false)
+  }
+
   functionTest("variant_get") {
     fn.variant_get(fn.parse_json(fn.col("g")), "$", "int")
   }
@@ -2698,6 +2855,14 @@ class PlanGenerationTestSuite
 
   functionTest("schema_of_variant") {
     fn.schema_of_variant(fn.parse_json(fn.col("g")))
+  }
+
+  functionTest("variant_from_arrays") {
+    fn.variant_from_arrays(fn.array(lit("a"), lit("b")), fn.array(lit(1), lit(2)))
+  }
+
+  functionTest("variant_from_entries") {
+    fn.variant_from_entries(fn.array(fn.struct(lit("a"), lit(1)), fn.struct(lit("b"), lit(2))))
   }
 
   functionTest("schema_of_variant_agg") {
@@ -3022,6 +3187,10 @@ class PlanGenerationTestSuite
     fn.json_object_keys(fn.col("g"))
   }
 
+  functionTest("json_typeof") {
+    fn.json_typeof(fn.col("g"))
+  }
+
   functionTest("mask with specific upperChar lowerChar digitChar otherChar") {
     fn.mask(fn.col("g"), fn.lit('X'), fn.lit('x'), fn.lit('n'), fn.lit('*'))
   }
@@ -3131,6 +3300,14 @@ class PlanGenerationTestSuite
 
   functionTest("typeof") {
     fn.typeof(fn.col("g"))
+  }
+
+  functionTest("wrap_udt") {
+    fn.wrap_udt(fn.array(fn.col("b")), testUDT)
+  }
+
+  functionTest("unwrap_udt") {
+    fn.unwrap_udt(fn.wrap_udt(fn.array(fn.col("b")), testUDT))
   }
 
   functionTest("stack") {
@@ -3365,6 +3542,8 @@ class PlanGenerationTestSuite
       fn.lit(Array(java.sql.Date.valueOf("2023-02-23"), java.sql.Date.valueOf("2023-03-01"))),
       fn.lit(Array(java.time.Duration.ofSeconds(100L), java.time.Duration.ofSeconds(200L))),
       fn.lit(Array(java.time.Period.ofDays(100), java.time.Period.ofDays(200))),
+      fn.lit(
+        Array(java.time.LocalTime.of(23, 59, 59, 999999999), java.time.LocalTime.of(12, 0, 0))),
       fn.lit(Array(new CalendarInterval(2, 20, 100L), new CalendarInterval(2, 21, 200L))))
   }
 
@@ -3400,12 +3579,27 @@ class PlanGenerationTestSuite
       fn.typedLit(java.time.Period.ofDays(100)),
       fn.typedLit(java.time.LocalTime.of(23, 59, 59, 999999999)),
       fn.typedLit(new CalendarInterval(2, 20, 100L)),
+      fn.typedLit(
+        (
+          java.time.LocalDate.of(2020, 10, 10),
+          java.time.Instant.ofEpochMilli(1677155519808L),
+          new java.sql.Timestamp(12345L),
+          java.time.LocalDateTime.of(2023, 2, 23, 20, 36),
+          java.sql.Date.valueOf("2023-02-23"),
+          java.time.Duration.ofSeconds(200L),
+          java.time.Period.ofDays(100),
+          java.time.LocalTime.of(23, 59, 59, 999999999),
+          new CalendarInterval(2, 20, 100L))),
 
       // Handle parameterized scala types e.g.: List, Seq and Map.
       fn.typedLit(Some(1)),
       fn.typedLit(Array(1, 2, 3)),
+      fn.typedLit[Array[Integer]](Array(null, null)),
+      fn.typedLit[Array[(Int, String)]](Array(null, null, (1, "a"), (2, null))),
+      fn.typedLit[Array[Option[(Int, String)]]](Array(None, None, Some((1, "a")))),
       fn.typedLit(Seq(1, 2, 3)),
-      fn.typedLit(Map("a" -> 1, "b" -> 2)),
+      fn.typedLit(mutable.LinkedHashMap("a" -> 1, "b" -> 2)),
+      fn.typedLit(mutable.LinkedHashMap[String, Integer]("a" -> null, "b" -> null)),
       fn.typedLit(("a", 2, 1.0)),
       fn.typedLit[Option[Int]](None),
       fn.typedLit[Array[Option[Int]]](Array(Some(1))),
@@ -3414,9 +3608,27 @@ class PlanGenerationTestSuite
       fn.typedlit[collection.immutable.Map[Int, Option[Int]]](
         collection.immutable.Map(1 -> None)),
       fn.typedLit(Seq(Seq(1, 2, 3), Seq(4, 5, 6), Seq(7, 8, 9))),
-      fn.typedLit(Seq(Map("a" -> 1, "b" -> 2), Map("a" -> 3, "b" -> 4), Map("a" -> 5, "b" -> 6))),
-      fn.typedLit(Map(1 -> Map("a" -> 1, "b" -> 2), 2 -> Map("a" -> 3, "b" -> 4))),
-      fn.typedLit((Seq(1, 2, 3), Map("a" -> 1, "b" -> 2), ("a", Map(1 -> "a", 2 -> "b")))))
+      fn.typedLit(Seq((1, "2", Seq("3", "4")), (5, "6", Seq.empty[String]))),
+      fn.typedLit(Seq(CaseClass(1, "2"), CaseClass(3, "4"), CaseClass(5, "6"))),
+      fn.typedLit(
+        Seq(
+          mutable.LinkedHashMap("a" -> 1, "b" -> 2),
+          mutable.LinkedHashMap("a" -> 3, "b" -> 4),
+          mutable.LinkedHashMap("a" -> 5, "b" -> 6))),
+      fn.typedLit(
+        Seq(
+          mutable.LinkedHashMap("a" -> Seq("1", "2"), "b" -> Seq("3", "4")),
+          mutable.LinkedHashMap("a" -> Seq("5", "6"), "b" -> Seq("7", "8")),
+          mutable.LinkedHashMap("a" -> Seq.empty[String], "b" -> Seq.empty[String]))),
+      fn.typedLit(
+        mutable.LinkedHashMap(
+          1 -> mutable.LinkedHashMap("a" -> 1, "b" -> 2),
+          2 -> mutable.LinkedHashMap("a" -> 3, "b" -> 4))),
+      fn.typedLit(
+        (
+          Seq(1, 2, 3),
+          mutable.LinkedHashMap("a" -> 1, "b" -> 2),
+          ("a", mutable.LinkedHashMap(1 -> "a", 2 -> "b")))))
   }
 
   /* Window API */
@@ -3486,6 +3698,13 @@ class PlanGenerationTestSuite
   /* Stream Reader API  */
   test("streaming table API with options") {
     session.readStream.options(Map("p1" -> "v1", "p2" -> "v2")).table("tempdb.myStreamingTable")
+  }
+
+  test("streaming changes API with options") {
+    session.readStream
+      .option("startingVersion", "1")
+      .option("deduplicationMode", "dropCarryovers")
+      .changes("tempdb.myStreamingTable")
   }
 
   /* Avro functions */

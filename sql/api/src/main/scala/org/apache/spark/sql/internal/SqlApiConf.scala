@@ -21,7 +21,7 @@ import java.util.TimeZone
 import scala.util.Try
 
 import org.apache.spark.sql.types.{AtomicType, TimestampType}
-import org.apache.spark.util.SparkClassUtils
+import org.apache.spark.util.{SparkClassUtils, SparkEnvUtils}
 
 /**
  * Configuration for all objects that are placed in the `sql/api` project. The normal way of
@@ -37,10 +37,19 @@ private[sql] trait SqlApiConf {
   def exponentLiteralAsDecimalEnabled: Boolean
   def enforceReservedKeywords: Boolean
   def doubleQuotedIdentifiers: Boolean
+  def singleCharacterPipeOperatorEnabled: Boolean
   def timestampType: AtomicType
   def allowNegativeScaleOfDecimalEnabled: Boolean
   def charVarcharAsString: Boolean
   def preserveCharVarcharTypeInfo: Boolean
+  def charVarcharStandardSemantics: Boolean
+
+  /**
+   * True when CHAR/VARCHAR may appear as first-class types in schemas and plans (either the
+   * legacy preserve path or SQL standard semantics).
+   */
+  def charVarcharFirstClassTypes: Boolean =
+    preserveCharVarcharTypeInfo || charVarcharStandardSemantics
   def datetimeJava8ApiEnabled: Boolean
   def sessionLocalTimeZone: String
   def legacyTimeParserPolicy: LegacyBehaviorPolicy.Value
@@ -50,6 +59,11 @@ private[sql] trait SqlApiConf {
   def manageParserCaches: Boolean
   def parserDfaCacheFlushThreshold: Int
   def parserDfaCacheFlushRatio: Double
+  def legacyParameterSubstitutionConstantsOnly: Boolean
+  def legacyIdentifierClauseOnly: Boolean
+  def timestampNanosTypesEnabled: Boolean
+  def allowCreatingUDTFromString: Boolean
+  def allowedDynamicUDTClasses: Seq[String]
 }
 
 private[sql] object SqlApiConf {
@@ -60,14 +74,21 @@ private[sql] object SqlApiConf {
   val SESSION_LOCAL_TIMEZONE_KEY: String = SqlApiConfHelper.SESSION_LOCAL_TIMEZONE_KEY
   val ARROW_EXECUTION_USE_LARGE_VAR_TYPES: String =
     SqlApiConfHelper.ARROW_EXECUTION_USE_LARGE_VAR_TYPES
-  val LOCAL_RELATION_CACHE_THRESHOLD_KEY: String = {
+  val LOCAL_RELATION_CACHE_THRESHOLD_KEY: String =
     SqlApiConfHelper.LOCAL_RELATION_CACHE_THRESHOLD_KEY
-  }
+  val LOCAL_RELATION_CHUNK_SIZE_ROWS_KEY: String =
+    SqlApiConfHelper.LOCAL_RELATION_CHUNK_SIZE_ROWS_KEY
+  val LOCAL_RELATION_CHUNK_SIZE_BYTES_KEY: String =
+    SqlApiConfHelper.LOCAL_RELATION_CHUNK_SIZE_BYTES_KEY
+  val LOCAL_RELATION_BATCH_OF_CHUNKS_SIZE_BYTES_KEY: String =
+    SqlApiConfHelper.LOCAL_RELATION_BATCH_OF_CHUNKS_SIZE_BYTES_KEY
   val PARSER_DFA_CACHE_FLUSH_THRESHOLD_KEY: String =
     SqlApiConfHelper.PARSER_DFA_CACHE_FLUSH_THRESHOLD_KEY
   val PARSER_DFA_CACHE_FLUSH_RATIO_KEY: String =
     SqlApiConfHelper.PARSER_DFA_CACHE_FLUSH_RATIO_KEY
   val MANAGE_PARSER_CACHES_KEY: String = SqlApiConfHelper.MANAGE_PARSER_CACHES_KEY
+  val ALLOW_CREATING_UDT_FROM_STRING: String = SqlApiConfHelper.ALLOW_CREATING_UDT_FROM_STRING
+  val ALLOWED_DYNAMIC_UDT_CLASSES: String = SqlApiConfHelper.ALLOWED_DYNAMIC_UDT_CLASSES
 
   def get: SqlApiConf = SqlApiConfHelper.getConfGetter.get()()
 
@@ -86,10 +107,12 @@ private[sql] object DefaultSqlApiConf extends SqlApiConf {
   override def exponentLiteralAsDecimalEnabled: Boolean = false
   override def enforceReservedKeywords: Boolean = false
   override def doubleQuotedIdentifiers: Boolean = false
+  override def singleCharacterPipeOperatorEnabled: Boolean = true
   override def timestampType: AtomicType = TimestampType
   override def allowNegativeScaleOfDecimalEnabled: Boolean = false
   override def charVarcharAsString: Boolean = false
   override def preserveCharVarcharTypeInfo: Boolean = false
+  override def charVarcharStandardSemantics: Boolean = false
   override def datetimeJava8ApiEnabled: Boolean = false
   override def sessionLocalTimeZone: String = TimeZone.getDefault.getID
   override def legacyTimeParserPolicy: LegacyBehaviorPolicy.Value = LegacyBehaviorPolicy.CORRECTED
@@ -99,4 +122,9 @@ private[sql] object DefaultSqlApiConf extends SqlApiConf {
   override def manageParserCaches: Boolean = false
   override def parserDfaCacheFlushThreshold: Int = -1
   override def parserDfaCacheFlushRatio: Double = -1.0
+  override def legacyParameterSubstitutionConstantsOnly: Boolean = false
+  override def legacyIdentifierClauseOnly: Boolean = false
+  override def timestampNanosTypesEnabled: Boolean = SparkEnvUtils.isTesting
+  override def allowCreatingUDTFromString: Boolean = true
+  override def allowedDynamicUDTClasses: Seq[String] = Nil
 }

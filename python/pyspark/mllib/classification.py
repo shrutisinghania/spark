@@ -15,26 +15,24 @@
 # limitations under the License.
 #
 
-from math import exp
 import sys
 import warnings
-from typing import Any, Iterable, Optional, Union, overload, TYPE_CHECKING
+from math import exp
+from typing import TYPE_CHECKING, Any, Iterable, Optional, Union, overload
 
 import numpy
 
 from pyspark import RDD, SparkContext, since
-from pyspark.streaming.dstream import DStream
-from pyspark.mllib.common import callMLlibFunc, _py2java, _java2py
-from pyspark.mllib.linalg import _convert_to_vector
+from pyspark.mllib.common import _java2py, _py2java, callMLlibFunc
+from pyspark.mllib.linalg import Vector, _convert_to_vector
 from pyspark.mllib.regression import (
     LabeledPoint,
     LinearModel,
-    _regression_train_wrapper,
     StreamingLinearAlgorithm,
+    _regression_train_wrapper,
 )
-from pyspark.mllib.util import Saveable, Loader, inherit_doc
-from pyspark.mllib.linalg import Vector
-from pyspark.mllib.regression import LabeledPoint
+from pyspark.mllib.util import Loader, Saveable, inherit_doc
+from pyspark.streaming.dstream import DStream
 
 if TYPE_CHECKING:
     from pyspark.mllib._typing import VectorLike
@@ -59,7 +57,7 @@ class LinearClassificationModel(LinearModel):
     """
 
     def __init__(self, weights: Vector, intercept: float) -> None:
-        super(LinearClassificationModel, self).__init__(weights, intercept)
+        super().__init__(weights, intercept)
         self._threshold: Optional[float] = None
 
     @since("1.4.0")
@@ -92,12 +90,10 @@ class LinearClassificationModel(LinearModel):
         self._threshold = None
 
     @overload
-    def predict(self, test: "VectorLike") -> Union[int, float]:
-        ...
+    def predict(self, test: "VectorLike") -> Union[int, float]: ...
 
     @overload
-    def predict(self, test: RDD["VectorLike"]) -> RDD[Union[int, float]]:
-        ...
+    def predict(self, test: RDD["VectorLike"]) -> RDD[Union[int, float]]: ...
 
     def predict(
         self, test: Union["VectorLike", RDD["VectorLike"]]
@@ -112,7 +108,6 @@ class LinearClassificationModel(LinearModel):
 
 
 class LogisticRegressionModel(LinearClassificationModel):
-
     """
     Classification model trained using Multinomial/Binary Logistic
     Regression.
@@ -199,7 +194,7 @@ class LogisticRegressionModel(LinearClassificationModel):
     def __init__(
         self, weights: Vector, intercept: float, numFeatures: int, numClasses: int
     ) -> None:
-        super(LogisticRegressionModel, self).__init__(weights, intercept)
+        super().__init__(weights, intercept)
         self._numFeatures = int(numFeatures)
         self._numClasses = int(numClasses)
         self._threshold = 0.5
@@ -232,12 +227,10 @@ class LogisticRegressionModel(LinearClassificationModel):
         return self._numClasses
 
     @overload
-    def predict(self, x: "VectorLike") -> Union[int, float]:
-        ...
+    def predict(self, x: "VectorLike") -> Union[int, float]: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[Union[int, float]]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[Union[int, float]]: ...
 
     def predict(
         self, x: Union["VectorLike", RDD["VectorLike"]]
@@ -527,7 +520,6 @@ class LogisticRegressionWithLBFGS:
 
 
 class SVMModel(LinearClassificationModel):
-
     """
     Model for Support Vector Machines (SVMs).
 
@@ -585,16 +577,14 @@ class SVMModel(LinearClassificationModel):
     """
 
     def __init__(self, weights: Vector, intercept: float) -> None:
-        super(SVMModel, self).__init__(weights, intercept)
+        super().__init__(weights, intercept)
         self._threshold = 0.0
 
     @overload
-    def predict(self, x: "VectorLike") -> Union[int, float]:
-        ...
+    def predict(self, x: "VectorLike") -> Union[int, float]: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[Union[int, float]]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[Union[int, float]]: ...
 
     def predict(
         self, x: Union["VectorLike", RDD["VectorLike"]]
@@ -731,7 +721,6 @@ class SVMWithSGD:
 
 @inherit_doc
 class NaiveBayesModel(Saveable, Loader["NaiveBayesModel"]):
-
     """
     Model for Naive Bayes classifiers.
 
@@ -794,12 +783,10 @@ class NaiveBayesModel(Saveable, Loader["NaiveBayesModel"]):
         self.theta = theta
 
     @overload
-    def predict(self, x: "VectorLike") -> numpy.float64:
-        ...
+    def predict(self, x: "VectorLike") -> numpy.float64: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[numpy.float64]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[numpy.float64]: ...
 
     @since("0.9.0")
     def predict(
@@ -932,7 +919,7 @@ class StreamingLogisticRegressionWithSGD(StreamingLinearAlgorithm):
         self.miniBatchFraction = miniBatchFraction
         self.convergenceTol = convergenceTol
         self._model: Optional[LogisticRegressionModel] = None
-        super(StreamingLogisticRegressionWithSGD, self).__init__(model=self._model)
+        super().__init__(model=self._model)
 
     @since("1.5.0")
     def setInitialWeights(
@@ -947,7 +934,10 @@ class StreamingLogisticRegressionWithSGD(StreamingLinearAlgorithm):
 
         # LogisticRegressionWithSGD does only binary classification.
         self._model = LogisticRegressionModel(
-            initialWeights, 0, initialWeights.size, 2  # type: ignore[attr-defined]
+            initialWeights,
+            0,
+            initialWeights.size,  # type: ignore[attr-defined]
+            2,
         )
         return self
 
@@ -959,12 +949,13 @@ class StreamingLogisticRegressionWithSGD(StreamingLinearAlgorithm):
         def update(rdd: RDD[LabeledPoint]) -> None:
             # LogisticRegressionWithSGD.train raises an error for an empty RDD.
             if not rdd.isEmpty():
+                assert self._model is not None
                 self._model = LogisticRegressionWithSGD.train(
                     rdd,
                     self.numIterations,
                     self.stepSize,
                     self.miniBatchFraction,
-                    self._model.weights,  # type: ignore[union-attr]
+                    self._model.weights,
                     regParam=self.regParam,
                     convergenceTol=self.convergenceTol,
                 )
@@ -974,15 +965,16 @@ class StreamingLogisticRegressionWithSGD(StreamingLinearAlgorithm):
 
 def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.mllib.classification
+    from pyspark.sql import SparkSession
 
     globs = pyspark.mllib.classification.__dict__.copy()
     spark = (
         SparkSession.builder.master("local[4]").appName("mllib.classification tests").getOrCreate()
     )
     globs["sc"] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
         sys.exit(-1)

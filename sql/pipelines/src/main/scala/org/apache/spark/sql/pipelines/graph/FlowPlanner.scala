@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.pipelines.graph
 
+import org.apache.spark.sql.pipelines.autocdc.ScdType
 import org.apache.spark.sql.streaming.Trigger
 
 /**
@@ -31,8 +32,7 @@ import org.apache.spark.sql.streaming.Trigger
 class FlowPlanner(
     graph: DataflowGraph,
     updateContext: PipelineUpdateContext,
-    triggerFor: Flow => Trigger
-) {
+    triggerFor: Flow => Trigger) {
 
   /**
    * Turns a [[Flow]] into an executable [[FlowExecution]].
@@ -50,6 +50,7 @@ class FlowPlanner(
           updateContext = updateContext
         )
       case sf: StreamingFlow =>
+        val flowMetadata = FlowSystemMetadata(updateContext, sf, graph)
         output match {
           case o: Table =>
             new StreamingTableWrite(
@@ -60,18 +61,67 @@ class FlowPlanner(
               updateContext = updateContext,
               sqlConf = sf.sqlConf,
               trigger = triggerFor(sf),
-              checkpointPath = output.path
+              checkpointPath = flowMetadata.latestCheckpointLocation
             )
-          case _ =>
-            throw new UnsupportedOperationException(
-              s"Streaming flow ${sf.identifier} cannot write to non-table destination: " +
-              s"${output.getClass.getSimpleName} (${flow.destinationIdentifier})"
+          case s: Sink =>
+            new SinkWrite(
+              graph = graph,
+              flow = flow,
+              identifier = sf.identifier,
+              destination = s,
+              updateContext = updateContext,
+              sqlConf = sf.sqlConf,
+              trigger = triggerFor(sf),
+              checkpointPath = flowMetadata.latestCheckpointLocation
             )
+          case _ => unsupportedDestinationType(sf, output)
+        }
+      case acmf: AutoCdcMergeFlow =>
+        acmf.changeArgs.storedAsScdType match {
+          case ScdType.Type1 =>
+            val flowMetadata = FlowSystemMetadata(updateContext, acmf, graph)
+            output match {
+              case o: Table =>
+                new Scd1MergeStreamingWrite(
+                  identifier = acmf.identifier,
+                  flow = acmf,
+                  graph = graph,
+                  updateContext = updateContext,
+                  checkpointPath = flowMetadata.latestCheckpointLocation,
+                  trigger = triggerFor(acmf),
+                  destination = o,
+                  sqlConf = acmf.sqlConf
+                )
+              case _ => unsupportedDestinationType(acmf, output)
+            }
+          case ScdType.Type2 =>
+            val flowMetadata = FlowSystemMetadata(updateContext, acmf, graph)
+            output match {
+              case o: Table =>
+                new Scd2MergeStreamingWrite(
+                  identifier = acmf.identifier,
+                  flow = acmf,
+                  graph = graph,
+                  updateContext = updateContext,
+                  checkpointPath = flowMetadata.latestCheckpointLocation,
+                  trigger = triggerFor(acmf),
+                  destination = o,
+                  sqlConf = acmf.sqlConf
+                )
+              case _ => unsupportedDestinationType(acmf, output)
+            }
         }
       case _ =>
         throw new UnsupportedOperationException(
           s"Unable to plan flow of type ${flow.getClass.getSimpleName}"
         )
     }
+  }
+
+  private def unsupportedDestinationType(flow: ResolvedFlow, output: Output): Nothing = {
+    throw new UnsupportedOperationException(
+      s"Unsupported destination type: ${output.getClass.getSimpleName} for " +
+      s"flow ${flow.identifier} writing to ${flow.destinationIdentifier}"
+    )
   }
 }

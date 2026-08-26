@@ -22,12 +22,13 @@
 # cd python/packaging/connect
 # python setup.py sdist
 
-import sys
-from setuptools import setup
-import os
-from shutil import copyfile, copytree, move, rmtree
 import glob
+import os
+import sys
 from pathlib import Path
+from shutil import copyfile, copytree, rmtree
+
+from setuptools import setup
 
 if (
     # When we package, the parent directory 'connect' dir
@@ -57,18 +58,14 @@ in_spark = os.path.isfile("../core/src/main/scala/org/apache/spark/SparkContext.
 
 try:
     if in_spark:
-        # !!HACK ALTERT!!
-        # 1. `setup.py` has to be located with the same directory with the package.
-        #    Therefore, we copy the current file, and place it at `spark/python` directory.
-        #    After that, we remove it in the end.
-        # 2. Here it renames `pyspark` and `lib` to `pyspark.back` and `lib.back` so MANIFEST.in
-        #    does not pick `pyspark` and `py4j` up. We rename it back in the end.
-        move("pyspark", "pyspark.back")
-        move("lib", "lib.back")
+        # !!HACK ALERT!!
+        # `setup.py` has to be located with the same directory with the package.
+        # Therefore, we copy the current file, and place it at `spark/python` directory.
+        # After that, we remove it in the end.
         copyfile("packaging/connect/setup.py", "setup.py")
         copyfile("packaging/connect/setup.cfg", "setup.cfg")
         copytree("packaging/connect/pyspark_connect", "pyspark_connect")
-        copyfile("pyspark.back/version.py", "pyspark_connect/version.py")
+        copyfile("pyspark/version.py", "pyspark_connect/version.py")
 
     try:
         exec(open("pyspark_connect/version.py").read())
@@ -85,15 +82,17 @@ try:
     # For Arrow, you should also check ./pom.xml and ensure there are no breaking changes in the
     # binary format protocol with the Java version, see ARROW_HOME/format/* for specifications.
     # Also don't forget to update python/docs/source/getting_started/install.rst,
+    # python/docs/source/tutorial/sql/arrow_pandas.rst,
     # python/packaging/classic/setup.py, and python/packaging/client/setup.py
-    _minimum_pandas_version = "2.0.0"
-    _minimum_numpy_version = "1.21"
-    _minimum_pyarrow_version = "11.0.0"
-    _minimum_grpc_version = "1.67.0"
-    _minimum_googleapis_common_protos_version = "1.65.0"
+    _minimum_pandas_version = "2.2.0"
+    _minimum_numpy_version = "1.23.2"
+    _minimum_pyarrow_version = "18.0.0"
+    _minimum_grpc_version = "1.76.0"
+    _minimum_googleapis_common_protos_version = "1.71.0"
     _minimum_pyyaml_version = "3.11"
+    _minimum_zstandard_version = "0.25.0"
 
-    with open("README.md") as f:
+    with open("README.md", encoding="utf-8") as f:
         long_description = f.read()
 
     connect_packages = [
@@ -111,7 +110,8 @@ try:
         url="https://github.com/apache/spark/tree/master/python",
         packages=connect_packages,
         include_package_data=True,
-        license="http://www.apache.org/licenses/LICENSE-2.0",
+        license="Apache-2.0",
+        license_files=["LICENSE", "NOTICE"],
         # Don't forget to update python/docs/source/getting_started/install.rst
         # if you're updating the versions or dependencies.
         install_requires=[
@@ -121,27 +121,23 @@ try:
             "grpcio>=%s" % _minimum_grpc_version,
             "grpcio-status>=%s" % _minimum_grpc_version,
             "googleapis-common-protos>=%s" % _minimum_googleapis_common_protos_version,
+            "zstandard>=%s" % _minimum_zstandard_version,
             "numpy>=%s" % _minimum_numpy_version,
             "pyyaml>=%s" % _minimum_pyyaml_version,
         ],
-        python_requires=">=3.9",
+        python_requires=">=3.11",
         classifiers=[
             "Development Status :: 5 - Production/Stable",
-            "License :: OSI Approved :: Apache Software License",
-            "Programming Language :: Python :: 3.9",
-            "Programming Language :: Python :: 3.10",
             "Programming Language :: Python :: 3.11",
             "Programming Language :: Python :: 3.12",
             "Programming Language :: Python :: 3.13",
+            "Programming Language :: Python :: 3.14",
             "Programming Language :: Python :: Implementation :: CPython",
-            "Programming Language :: Python :: Implementation :: PyPy",
             "Typing :: Typed",
         ],
     )
 finally:
     if in_spark:
-        move("pyspark.back", "pyspark")
-        move("lib.back", "lib")
         os.remove("setup.py")
         os.remove("setup.cfg")
         rmtree("pyspark_connect")

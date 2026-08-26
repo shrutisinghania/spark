@@ -18,7 +18,7 @@
 import unittest
 
 from pyspark.testing.connectutils import ReusedConnectTestCase
-from pyspark.testing.utils import have_graphviz, graphviz_requirement_message
+from pyspark.testing.utils import graphviz_requirement_message, have_graphviz
 
 
 class SparkConnectDataFrameDebug(ReusedConnectTestCase):
@@ -68,12 +68,6 @@ class SparkConnectDataFrameDebug(ReusedConnectTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_df_debug import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

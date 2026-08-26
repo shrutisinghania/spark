@@ -22,9 +22,11 @@ import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, SortOrde
 import org.apache.spark.sql.catalyst.plans.logical.{EventTime, ProcessingTime}
 import org.apache.spark.sql.catalyst.plans.physical.Distribution
 import org.apache.spark.sql.execution.{BinaryExecNode, SparkPlan}
+import org.apache.spark.sql.execution.datasources.v2.LowLatencyClock
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorCustomMetric, StatefulOperatorCustomSumMetric, StatefulOperatorPartitioning, StateStoreWriter, WatermarkSupport}
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.statefulprocessor.ImplicitGroupingKeyTracker
-import org.apache.spark.sql.execution.streaming.state.{OperatorStateMetadata, TransformWithStateUserFunctionException}
+import org.apache.spark.sql.execution.streaming.state.{OperatorStateMetadata, RocksDBStateStoreProvider, StateStoreErrors, TransformWithStateUserFunctionException}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{OutputMode, TimeMode}
 import org.apache.spark.sql.types.{BinaryType, StructType}
 import org.apache.spark.util.NextIterator
@@ -45,13 +47,20 @@ abstract class TransformWithStateExecBase(
     eventTimeWatermarkForEviction: Option[Long],
     child: SparkPlan,
     initialStateGroupingAttrs: Seq[Attribute],
-    initialState: SparkPlan)
+    initialState: SparkPlan,
+    isRealTimeMode: Boolean = false)
   extends BinaryExecNode
   with StateStoreWriter
   with WatermarkSupport
   with TransformWithStateMetadataUtils {
 
   override def operatorStateMetadataVersion: Int = 2
+
+  // Supported state store providers for TransformWithState.
+  // TransformWithState currently supports only RocksDBStateStoreProvider.
+  private val SUPPORTED_STATE_STORE_PROVIDERS = Set(
+    classOf[RocksDBStateStoreProvider].getName
+  )
 
   override def supportsSchemaEvolution: Boolean = true
 
@@ -61,6 +70,22 @@ abstract class TransformWithStateExecBase(
 
   // The keys that may have a watermark attribute.
   override def keyExpressions: Seq[Attribute] = groupingAttributes
+
+  @inline
+  protected lazy val currentTimestampMsFn: () => Long = () => {
+    assert(
+      batchTimestampMs.isDefined,
+      "batchTimestampMs should be set when " +
+        "invoking the currentTimestampMs function. This function must have been " +
+        "eagerly created; ensure it is lazy and never invoked before physical planning.")
+    // In real-time mode, we use the local wall time as the current processing time.
+    // Skew between executors is possible, but we assume it is acceptable for now.
+    if (isRealTimeMode) {
+      LowLatencyClock.getClock.getTimeMillis()
+    } else {
+      batchTimestampMs.get
+    }
+  }
 
   /**
    * Distribute by grouping attributes - We need the underlying data and the initial state data to
@@ -82,9 +107,18 @@ abstract class TransformWithStateExecBase(
    * We need the initial state to also use the ordering as the data so that we can co-locate the
    * keys from the underlying data and the initial state.
    */
-  override def requiredChildOrdering: Seq[Seq[SortOrder]] = Seq(
-    groupingAttributes.map(SortOrder(_, Ascending)),
-    initialStateGroupingAttrs.map(SortOrder(_, Ascending)))
+  override def requiredChildOrdering: Seq[Seq[SortOrder]] = {
+    if (isRealTimeMode) {
+      // In real-time mode, we don't need to order the initial state data since we produce the
+      // (key, value) pair for every single data. Also, streaming shuffle does not support
+      // sorting by nature.
+      Seq.fill(children.size)(Nil)
+    } else {
+      Seq(
+        groupingAttributes.map(SortOrder(_, Ascending)),
+        initialStateGroupingAttrs.map(SortOrder(_, Ascending)))
+    }
+  }
 
   override def shouldRunAnotherBatch(newInputWatermark: Long): Boolean = {
     if (timeMode == ProcessingTime) {
@@ -213,6 +247,14 @@ abstract class TransformWithStateExecBase(
         TransformWithStateVariableUtils.validateTimeMode(timeMode, eventTimeWatermarkForEviction)
 
       case _ =>
+    }
+  }
+
+  /** Validates that the configured state store provider is supported by TransformWithState. */
+  protected def validateStateStoreProvider(isStreaming: Boolean): Unit = {
+    val providerName = conf.getConf(SQLConf.STATE_STORE_PROVIDER_CLASS)
+    if (isStreaming && !SUPPORTED_STATE_STORE_PROVIDERS.contains(providerName)) {
+      throw StateStoreErrors.storeBackendNotSupportedForTWS(providerName)
     }
   }
 

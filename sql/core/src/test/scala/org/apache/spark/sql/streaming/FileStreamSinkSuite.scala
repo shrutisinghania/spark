@@ -19,6 +19,7 @@ package org.apache.spark.sql.streaming
 
 import java.io.{File, IOException}
 import java.nio.file.{Files, Paths}
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.Locale
 
 import scala.collection.mutable.ArrayBuffer
@@ -37,7 +38,7 @@ import org.apache.spark.sql.catalyst.util.stringToFile
 import org.apache.spark.sql.execution.DataSourceScanExec
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
-import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceV2Relation, FileScan, FileTable}
+import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, ExtractV2Table, FileScan, FileTable}
 import org.apache.spark.sql.execution.streaming.ManifestFileCommitProtocol
 import org.apache.spark.sql.execution.streaming.runtime._
 import org.apache.spark.sql.execution.streaming.sinks.{FileStreamSink, FileStreamSinkLog, SinkFileStatus}
@@ -534,10 +535,25 @@ abstract class FileStreamSinkSuite extends StreamTest {
         }
 
         import PendingCommitFilesTrackingManifestFileCommitProtocol._
-        val outputFileNames = Files.walk(outputDir.toPath).iterator().asScala
-          .filter(_.toString.endsWith(".parquet"))
-          .map(_.getFileName.toString)
-          .toSet
+        import java.nio.file.{Path, _}
+        val outputFileNames = scala.collection.mutable.Set.empty[String]
+        Files.walkFileTree(
+          outputDir.toPath,
+          new SimpleFileVisitor[Path] {
+            override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult = {
+              val fileName = file.getFileName.toString
+              if (fileName.endsWith(".parquet")) outputFileNames += fileName
+              FileVisitResult.CONTINUE
+            }
+            override def visitFileFailed(file: Path, exc: IOException): FileVisitResult = {
+              exc match {
+                case _: NoSuchFileException =>
+                  FileVisitResult.CONTINUE
+                case _ =>
+                  FileVisitResult.TERMINATE
+              }
+            }
+          })
         val trackingFileNames = tracking.map(SparkPath.fromUrlString(_).toPath.getName).toSet
 
         // there would be possible to have race condition:
@@ -681,6 +697,44 @@ abstract class FileStreamSinkSuite extends StreamTest {
     }
   }
 
+  test("SPARK-56414: per-write options take precedence over session config in streaming sink") {
+    val inputData = MemoryStream[java.sql.Timestamp]
+
+    val outputDir = Utils.createTempDir(namePrefix = "stream.output").getCanonicalPath
+    val checkpointDir = Utils.createTempDir(namePrefix = "stream.checkpoint").getCanonicalPath
+
+    // Session sets INT96, but the per-write option overrides to TIMESTAMP_MICROS.
+    withSQLConf(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key -> "INT96") {
+      var query: StreamingQuery = null
+      try {
+        query = inputData.toDF()
+          .toDF("ts")
+          .writeStream
+          .option("checkpointLocation", checkpointDir)
+          .option(SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key, "TIMESTAMP_MICROS")
+          .format("parquet")
+          .start(outputDir)
+        inputData.addData(java.sql.Timestamp.valueOf("2024-01-01 12:00:00"))
+        query.processAllAvailable()
+      } finally {
+        if (query != null) query.stop()
+      }
+    }
+
+    // Read back and verify the timestamp column is INT64 (TIMESTAMP_MICROS), not INT96.
+    import org.apache.parquet.hadoop.ParquetFileReader
+    import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
+    val hadoopConf = spark.sessionState.newHadoopConf()
+    val parquetFiles = new java.io.File(outputDir).listFiles()
+      .filter(_.getName.endsWith(".parquet"))
+    assert(parquetFiles.nonEmpty, "Expected at least one parquet file")
+    val footer = ParquetFileReader.readFooter(hadoopConf,
+      new Path(parquetFiles.head.getAbsolutePath))
+    val tsField = footer.getFileMetaData.getSchema.getFields.asScala
+      .find(_.getName == "ts").get.asPrimitiveType()
+    assert(tsField.getPrimitiveTypeName === PrimitiveTypeName.INT64)
+  }
+
   test("SPARK-50854: Make path fully qualified before passing it to FileStreamSink") {
     val fileFormat = new ParquetFileFormat() // any valid FileFormat
     val partitionColumnNames = Seq.empty[String]
@@ -776,7 +830,7 @@ class FileStreamSinkV2Suite extends FileStreamSinkSuite {
     // Verify that MetadataLogFileIndex is being used and the correct partitioning schema has
     // been inferred
     val table = df.queryExecution.analyzed.collect {
-      case DataSourceV2Relation(table: FileTable, _, _, _, _) => table
+      case ExtractV2Table(table: FileTable) => table
     }
     assert(table.size === 1)
     assert(table.head.fileIndex.isInstanceOf[MetadataLogFileIndex])

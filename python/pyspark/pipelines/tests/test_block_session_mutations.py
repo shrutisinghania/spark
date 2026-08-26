@@ -21,15 +21,15 @@ from pyspark.errors import PySparkException
 from pyspark.sql.types import StringType
 from pyspark.testing.connectutils import (
     ReusedConnectTestCase,
-    should_test_connect,
     connect_requirement_message,
+    should_test_connect,
 )
 
 if should_test_connect:
     from pyspark.pipelines.block_session_mutations import (
-        block_session_mutations,
         BLOCKED_METHODS,
         ERROR_CLASS,
+        block_session_mutations,
     )
 
 
@@ -251,10 +251,6 @@ class BlockImperativeConfSetConnectTests(ReusedConnectTestCase):
 
 
 if __name__ == "__main__":
-    try:
-        import xmlrunner  # type: ignore
+    from pyspark.testing import main
 
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

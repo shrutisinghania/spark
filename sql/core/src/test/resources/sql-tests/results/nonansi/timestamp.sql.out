@@ -453,6 +453,106 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
 
 
 -- !query
+SELECT try_make_timestamp(make_date(2021, 07, 11))
+-- !query schema
+struct<try_make_timestamp(make_date(2021, 7, 11)):timestamp>
+-- !query output
+2021-07-11 00:00:00
+
+
+-- !query
+SELECT try_make_timestamp(make_date(2021, 07, 11), make_time(6, 30, 45.678))
+-- !query schema
+struct<try_make_timestamp(make_date(2021, 7, 11), make_time(6, 30, 45.678)):timestamp>
+-- !query output
+2021-07-11 06:30:45.678
+
+
+-- !query
+SELECT try_make_timestamp(make_date(2021, 07, 11), make_time(6, 30, 45.678), 'CET')
+-- !query schema
+struct<try_make_timestamp(make_date(2021, 7, 11), make_time(6, 30, 45.678), CET):timestamp>
+-- !query output
+2021-07-10 21:30:45.678
+
+
+-- !query
+SELECT try_make_timestamp(NULL)
+-- !query schema
+struct<try_make_timestamp(NULL):timestamp>
+-- !query output
+NULL
+
+
+-- !query
+SELECT try_make_timestamp(NULL, NULL)
+-- !query schema
+struct<try_make_timestamp(NULL, NULL):timestamp>
+-- !query output
+NULL
+
+
+-- !query
+SELECT try_make_timestamp(NULL, NULL, NULL)
+-- !query schema
+struct<try_make_timestamp(NULL, NULL, NULL):timestamp>
+-- !query output
+NULL
+
+
+-- !query
+SELECT try_make_timestamp(timestamp '2018-11-17 13:33:33', TIME'0:0:0', 'CET')
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.sql.catalyst.ExtendedAnalysisException
+{
+  "errorClass" : "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+  "sqlState" : "42K09",
+  "messageParameters" : {
+    "inputSql" : "\"TIMESTAMP '2018-11-17 13:33:33'\"",
+    "inputType" : "\"TIMESTAMP\"",
+    "paramIndex" : "first",
+    "requiredType" : "\"DATE\"",
+    "sqlExpr" : "\"make_timestamp(TIMESTAMP '2018-11-17 13:33:33', TIME '00:00:00', CET)\""
+  },
+  "queryContext" : [ {
+    "objectType" : "",
+    "objectName" : "",
+    "startIndex" : 8,
+    "stopIndex" : 78,
+    "fragment" : "try_make_timestamp(timestamp '2018-11-17 13:33:33', TIME'0:0:0', 'CET')"
+  } ]
+}
+
+
+-- !query
+SELECT try_make_timestamp(DATE'1970-01-01', timestamp_ntz '2018-11-17 13:33:33', 'CET')
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.sql.catalyst.ExtendedAnalysisException
+{
+  "errorClass" : "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+  "sqlState" : "42K09",
+  "messageParameters" : {
+    "inputSql" : "\"TIMESTAMP_NTZ '2018-11-17 13:33:33'\"",
+    "inputType" : "\"TIMESTAMP_NTZ\"",
+    "paramIndex" : "second",
+    "requiredType" : "\"TIME\"",
+    "sqlExpr" : "\"make_timestamp(DATE '1970-01-01', TIMESTAMP_NTZ '2018-11-17 13:33:33', CET)\""
+  },
+  "queryContext" : [ {
+    "objectType" : "",
+    "objectName" : "",
+    "startIndex" : 8,
+    "stopIndex" : 87,
+    "fragment" : "try_make_timestamp(DATE'1970-01-01', timestamp_ntz '2018-11-17 13:33:33', 'CET')"
+  } ]
+}
+
+
+-- !query
 select TIMESTAMP_SECONDS(1230219000),TIMESTAMP_SECONDS(-1230219000),TIMESTAMP_SECONDS(null)
 -- !query schema
 struct<timestamp_seconds(1230219000):timestamp,timestamp_seconds(-1230219000):timestamp,timestamp_seconds(NULL):timestamp>
@@ -489,8 +589,14 @@ select TIMESTAMP_SECONDS(1230219000123123)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from 1230219000123123L seconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -498,8 +604,14 @@ select TIMESTAMP_SECONDS(-1230219000123123)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from -1230219000123123L seconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -507,8 +619,14 @@ select TIMESTAMP_MILLIS(92233720368547758)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from 92233720368547758L milliseconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -516,8 +634,14 @@ select TIMESTAMP_MILLIS(-92233720368547758)
 -- !query schema
 struct<>
 -- !query output
-java.lang.ArithmeticException
-long overflow
+org.apache.spark.SparkArithmeticException
+{
+  "errorClass" : "DATETIME_OVERFLOW",
+  "sqlState" : "22008",
+  "messageParameters" : {
+    "operation" : "create a TIMESTAMP from -92233720368547758L milliseconds since the epoch"
+  }
+}
 
 
 -- !query
@@ -911,7 +1035,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"2011-11-11 11:11:10\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "second",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(TIMESTAMP '2011-11-11 11:11:11' - 2011-11-11 11:11:10)\""
   },
   "queryContext" : [ {
@@ -937,7 +1061,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"2011-11-11 11:11:11\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "first",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(2011-11-11 11:11:11 - TIMESTAMP '2011-11-11 11:11:10')\""
   },
   "queryContext" : [ {
@@ -987,7 +1111,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"str\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "first",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(str - TIMESTAMP '2011-11-11 11:11:11')\""
   },
   "queryContext" : [ {
@@ -1013,7 +1137,7 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"str\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "second",
-    "requiredType" : "\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\"",
+    "requiredType" : "(\"(TIMESTAMP OR TIMESTAMP WITHOUT TIME ZONE)\" or \"(TIMESTAMP_LTZ(P) OR TIMESTAMP_NTZ(P) WITH P IN [7, 9])\")",
     "sqlExpr" : "\"(TIMESTAMP '2011-11-11 11:11:11' - str)\""
   },
   "queryContext" : [ {

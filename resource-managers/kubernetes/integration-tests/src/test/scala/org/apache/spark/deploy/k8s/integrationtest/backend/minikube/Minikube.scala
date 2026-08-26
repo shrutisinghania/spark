@@ -19,6 +19,7 @@ package org.apache.spark.deploy.k8s.integrationtest.backend.minikube
 import io.fabric8.kubernetes.client.{Config, KubernetesClient, KubernetesClientBuilder}
 
 import org.apache.spark.deploy.k8s.integrationtest.ProcessUtils
+import org.apache.spark.deploy.k8s.integrationtest.TestConstants._
 import org.apache.spark.internal.Logging
 
 // TODO support windows
@@ -47,9 +48,9 @@ private[spark] object Minikube extends Logging {
 
     versionArrayOpt match {
       case Some(Array(x, y, z)) =>
-        if (Ordering.Tuple3[Int, Int, Int].lt((x, y, z), (1, 28, 0))) {
+        if (Ordering.Tuple3[Int, Int, Int].lt((x, y, z), (1, 38, 0))) {
           assert(false, s"Unsupported Minikube version is detected: $minikubeVersionString." +
-            "For integration testing Minikube version 1.28.0 or greater is expected.")
+            "For integration testing Minikube version 1.38.0 or greater is expected.")
         }
       case _ =>
         assert(false, s"Unexpected version format detected in `$minikubeVersionString`." +
@@ -57,7 +58,7 @@ private[spark] object Minikube extends Logging {
           "non-numeric suffix is intentionally dropped)")
     }
 
-    new KubernetesClientBuilder().withConfig(Config.autoConfigure("minikube")).build()
+    new KubernetesClientBuilder().withConfig(Config.autoConfigure(BACKEND_MINIKUBE)).build()
   }
 
   def getMinikubeStatus(): MinikubeStatus.Value = {

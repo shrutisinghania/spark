@@ -21,7 +21,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock
 
 import scala.collection.mutable.HashMap
 
-import org.apache.spark.{SparkConf, SparkException}
+import org.apache.spark.{SparkConf, SparkException, SparkMasterRegex}
 import org.apache.spark.annotation.Evolving
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.internal.LogKeys
@@ -49,7 +49,7 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
   private val dynamicEnabled = Utils.isDynamicAllocationEnabled(sparkConf)
   private val master = sparkConf.getOption("spark.master")
   private val isYarn = master.isDefined && master.get.equals("yarn")
-  private val isK8s = master.isDefined && master.get.startsWith("k8s://")
+  private val isK8s = SparkMasterRegex.isK8s(master)
   private val isStandaloneOrLocalCluster = master.isDefined && (
       master.get.startsWith("spark://") || master.get.startsWith("local-cluster")
     )
@@ -127,6 +127,22 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
 
   def addResourceProfile(rp: ResourceProfile): Unit = {
     isSupported(rp)
+    // Validate before inserting so a malformed profile never enters the registry, where it
+    // would stay visible to the whole application. The cpus amount is checked under the map
+    // key -- the identity scheduling uses -- with the same rule as the request entry points:
+    // construction stays lenient (deserialization of persisted data must accept anything an
+    // earlier release wrote), so registration is the enforcement point for every live path,
+    // including raw profile construction and Spark Connect.
+    rp.taskResources.get(ResourceProfile.CPUS).foreach { treq =>
+      require(!treq.amount.isNaN && !treq.amount.isInfinity &&
+        CpuAmount.isInRange(CpuAmount.normalize(BigDecimal(treq.amount.toString))),
+        s"The cpus amount ${treq.amount} must be at least 1e-9 and at most ${Int.MaxValue}.")
+    }
+    // Force the computation of maxTasks and limitingResource now so we don't have cost later;
+    // doing it before the insert also surfaces any other malformed shape (e.g. a task
+    // resource without a matching executor resource) before registration instead of after.
+    // The result is cached in the profile, so re-adding an existing profile stays cheap.
+    rp.limitingResource(sparkConf)
     var putNewProfile = false
     writeLock.lock()
     try {
@@ -139,8 +155,6 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
     }
     // do this outside the write lock only when we add a new profile
     if (putNewProfile) {
-      // force the computation of maxTasks and limitingResource now so we don't have cost later
-      rp.limitingResource(sparkConf)
       logInfo(log"Added ResourceProfile id: ${MDC(LogKeys.RESOURCE_PROFILE_ID, rp.id)}")
       listenerBus.post(SparkListenerResourceProfileAdded(rp))
     }

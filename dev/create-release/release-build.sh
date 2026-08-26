@@ -40,6 +40,7 @@ SPARK_VERSION - (optional) Version of Spark being built (e.g. 2.1.2)
 
 ASF_USERNAME - Username of ASF committer account
 ASF_PASSWORD - Password of ASF committer account
+ASF_NEXUS_TOKEN - API token in ASF Nexus repository
 
 GPG_KEY - GPG key used to sign release artifacts
 GPG_PASSPHRASE - Passphrase for GPG key
@@ -102,6 +103,12 @@ if [[ "$1" == "finalize" ]]; then
     error 'The environment variable PYPI_API_TOKEN is not set. Exiting.'
   fi
 
+  # Pass the token to twine via an environment variable to keep it out of
+  # the process command line, which is visible to other users via ps.
+  { set +x; } 2>/dev/null
+  export TWINE_PASSWORD="$PYPI_API_TOKEN"
+  [ "$DEBUG_MODE" = 1 ] && set -x
+
   git config --global user.name "$GIT_NAME"
   git config --global user.email "$GIT_EMAIL"
 
@@ -127,19 +134,19 @@ if [[ "$1" == "finalize" ]]; then
   PYSPARK_VERSION=`echo "$RELEASE_VERSION" |  sed -e "s/-/./" -e "s/preview/dev/"`
   svn update "pyspark-$PYSPARK_VERSION.tar.gz"
   svn update "pyspark-$PYSPARK_VERSION.tar.gz.asc"
-  twine upload -u __token__  -p $PYPI_API_TOKEN \
+  twine upload -u __token__ \
     --repository-url https://upload.pypi.org/legacy/ \
     "pyspark-$PYSPARK_VERSION.tar.gz" \
     "pyspark-$PYSPARK_VERSION.tar.gz.asc"
   svn update "pyspark_connect-$PYSPARK_VERSION.tar.gz"
   svn update "pyspark_connect-$PYSPARK_VERSION.tar.gz.asc"
-  twine upload -u __token__  -p $PYPI_API_TOKEN \
+  twine upload -u __token__ \
     --repository-url https://upload.pypi.org/legacy/ \
     "pyspark_connect-$PYSPARK_VERSION.tar.gz" \
     "pyspark_connect-$PYSPARK_VERSION.tar.gz.asc"
   svn update "pyspark_client-$PYSPARK_VERSION.tar.gz"
   svn update "pyspark_client-$PYSPARK_VERSION.tar.gz.asc"
-  twine upload -u __token__ -p $PYPI_API_TOKEN \
+  twine upload -u __token__ \
     --repository-url https://upload.pypi.org/legacy/ \
     "pyspark_client-$PYSPARK_VERSION.tar.gz" \
     "pyspark_client-$PYSPARK_VERSION.tar.gz.asc"
@@ -162,7 +169,6 @@ if [[ "$1" == "finalize" ]]; then
   echo "Uploading release docs to spark-website"
   cd spark-website
 
-  # TODO: Test it in the actual release
   # 1. Add download link to documentation.md
   python3 <<EOF
 import re
@@ -172,7 +178,7 @@ is_preview = bool(re.search(r'-preview\d*$', release_version))
 base_version = re.sub(r'-preview\d*$', '', release_version)
 
 stable_newline = f'  <li><a href="{{{{site.baseurl}}}}/docs/{release_version}/">Spark {release_version}</a></li>'
-preview_newline = f'  <li><a href="{{{{site.baseurl}}}}/docs/{release_version}/">Spark {release_version} preview</a></li>'
+preview_newline = f'  <li><a href="{{{{site.baseurl}}}}/docs/{release_version}/">Spark {release_version}</a></li>'
 
 inserted = False
 
@@ -296,7 +302,73 @@ EOF
     echo "Edited js/downloads.js"
   fi
 
-  # 3. Add news post
+  # 3. Update the latest stable version in downloads.md and site/static/versions.json.
+  #    site/downloads.html is regenerated from downloads.md by the jekyll build below,
+  #    so it does not need to be edited here.
+  if [[ "$RELEASE_VERSION" =~ -preview[0-9]*$ ]]; then
+    echo "Skipping downloads.md and versions.json for preview release: $RELEASE_VERSION"
+  else
+    python3 <<EOF
+import json
+import re
+
+release_version = "${RELEASE_VERSION}"
+
+def parse_version(v):
+    return [int(p) for p in v.strip().split(".")]
+
+def vercmp(v1, v2):
+    a = parse_version(v1)
+    b = parse_version(v2)
+    return (a > b) - (a < b)
+
+# downloads.md: bump the Maven coordinate example to the latest stable version.
+# Only update when this release is newer than the version currently shown, so a
+# maintenance release on an older branch does not downgrade the coordinate.
+with open("downloads.md") as f:
+    lines = f.readlines()
+
+with open("downloads.md", "w") as f:
+    in_maven_block = False
+    for line in lines:
+        if re.match(r"\s*artifactId:\s*spark-core", line):
+            in_maven_block = True
+        m = re.match(r"(\s*version:\s*)(\d+\.\d+\.\d+)(\s*)$", line)
+        if in_maven_block and m:
+            if vercmp(release_version, m.group(2)) > 0:
+                line = f"{m.group(1)}{release_version}{m.group(3)}"
+            in_maven_block = False
+        f.write(line)
+
+# site/static/versions.json: add (or replace) the entry for this release, keeping
+# the list sorted in descending version order (it drives the API docs version picker).
+path = "site/static/versions.json"
+with open(path) as f:
+    versions = json.load(f)
+
+entry = {
+    "name": release_version,
+    "version": release_version,
+    "url": f"https://spark.apache.org/docs/{release_version}/api/python/",
+}
+
+versions = [v for v in versions if v.get("version") != release_version]
+insert_at = len(versions)
+for i, v in enumerate(versions):
+    if vercmp(release_version, v.get("version", "0.0.0")) > 0:
+        insert_at = i
+        break
+versions.insert(insert_at, entry)
+
+with open(path, "w") as f:
+    json.dump(versions, f, indent=4)
+    f.write("\n")
+EOF
+
+    echo "Edited downloads.md and site/static/versions.json"
+  fi
+
+  # 4. Add news post
   RELEASE_DATE=$(TZ=America/Los_Angeles date +"%Y-%m-%d")
   FILENAME="news/_posts/${RELEASE_DATE}-spark-${RELEASE_VERSION//./-}-released.md"
   mkdir -p news/_posts
@@ -318,10 +390,10 @@ meta:
   _wpas_done_all: '1'
 ---
 To enable wide-scale community testing of the upcoming Spark ${BASE_VERSION} release, the Apache Spark community has posted a
-<a href="https://archive.apache.org/dist/spark/spark-${RELEASE_VERSION}/">Spark ${RELEASE_VERSION} release</a>.
+<a href="${RELEASE_LOCATION}/spark-${RELEASE_VERSION}">Spark ${RELEASE_VERSION} release</a>.
 This preview is not a stable release in terms of either API or functionality, but it is meant to give the community early
 access to try the code that will become Spark ${BASE_VERSION}. If you would like to test the release,
-please <a href="https://archive.apache.org/dist/spark/spark-${RELEASE_VERSION}/">download</a> it, and send feedback using either
+please <a href="${RELEASE_LOCATION}/spark-${RELEASE_VERSION}">download</a> it, and send feedback using either
 <a href="https://spark.apache.org/community.html">mailing lists</a> or
 <a href="https://issues.apache.org/jira/browse/SPARK/?selectedTab=com.atlassian.jira.jira-projects-plugin:summary-panel">JIRA</a>.
 The documentation is available at the <a href="https://spark.apache.org/docs/${RELEASE_VERSION}/">link</a>.
@@ -344,13 +416,13 @@ meta:
   _edit_last: '4'
   _wpas_done_all: '1'
 ---
-We are happy to announce the availability of <a href="{{site.baseurl}}/releases/spark-release-${RELEASE_VERSION}.html" title="Spark Release ${RELEASE_VERSION}">Apache Spark ${RELEASE_VERSION}</a>! Visit the <a href="{{site.baseurl}}/releases/spark-release-${RELEASE_VERSION}.html" title="Spark Release ${RELEASE_VERSION}">release notes</a> to read about the new features, or <a href="{{site.baseurl}}/downloads.html">download</a> the release today.
+We are happy to announce the availability of <a href="{{site.baseurl}}/releases/spark-release-${RELEASE_VERSION//./-}.html" title="Spark Release ${RELEASE_VERSION}">Apache Spark ${RELEASE_VERSION}</a>! Visit the <a href="{{site.baseurl}}/releases/spark-release-${RELEASE_VERSION//./-}.html" title="Spark Release ${RELEASE_VERSION}">release notes</a> to read about the new features, or <a href="{{site.baseurl}}/downloads.html">download</a> the release today.
 EOF
   fi
 
   echo "Created $FILENAME"
 
-  # 4. Add release notes with Python to extract JIRA version ID
+  # 5. Add release notes with Python to extract JIRA version ID
   if [[ "$RELEASE_VERSION" =~ -preview[0-9]*$ ]]; then
     echo "Skipping JIRA release notes for preview release: $RELEASE_VERSION"
   else
@@ -402,7 +474,7 @@ You can find the list of resolved issues and detailed changes in the [JIRA relea
 
 We would like to acknowledge all community members for contributing ${ACKNOWLEDGE}"
 
-    FILENAME="releases/_posts/${RELEASE_DATE}-spark-release-${RELEASE_VERSION}.md"
+    FILENAME="releases/_posts/${RELEASE_DATE}-spark-release-${RELEASE_VERSION//./-}.md"
     mkdir -p releases/_posts
     cat > "$FILENAME" <<EOF
 ---
@@ -424,11 +496,11 @@ EOF
     echo "Created $FILENAME"
   fi
 
-  # 5. Build the website
+  # 6. Build the website
   bundle install
   bundle exec jekyll build
 
-  # 6. Update latest or preview symlink
+  # 7. Update latest or preview symlink
   IFS='.' read -r rel_maj rel_min rel_patch <<< "$RELEASE_VERSION"
 
   if [[ "$RELEASE_VERSION" =~ -preview[0-9]*$ ]]; then
@@ -490,19 +562,22 @@ EOF
   echo "Sync'ing KEYS"
   svn co --depth=files "$RELEASE_LOCATION" svn-spark
   curl "$RELEASE_STAGING_LOCATION/KEYS" > svn-spark/KEYS
-  (cd svn-spark && svn ci --username $ASF_USERNAME --password "$ASF_PASSWORD" -m"Update KEYS")
+  (cd svn-spark && svn ci --username $ASF_USERNAME --password "$ASF_PASSWORD" -m"Update KEYS" --no-auth-cache)
   echo "KEYS sync'ed"
   rm -rf svn-spark
 
-  # TODO: Test it in the actual release
   # Release artifacts in the Nexus repository
   # Find latest orgapachespark-* repo for this release version
-  REPO_ID=$(curl --retry 10 --retry-all-errors -s -u "$ASF_USERNAME:$ASF_PASSWORD" \
-    https://repository.apache.org/service/local/staging/profile_repositories | \
-    grep -A 5 "<repositoryId>orgapachespark-" | \
-    awk '/<repositoryId>/ { id = $0 } /<description>/ && $0 ~ /Apache Spark '"$RELEASE_VERSION"'/ { print id }' | \
-    grep -oP '(?<=<repositoryId>)orgapachespark-[0-9]+(?=</repositoryId>)' | \
-    sort -V | tail -n 1)
+  REPO_ID=$(
+    curl --retry 10 --retry-all-errors -s -u "$ASF_USERNAME:$ASF_NEXUS_TOKEN" \
+      https://repository.apache.org/service/local/staging/profile_repositories |
+    grep -A 13 "<repositoryId>orgapachespark-" |
+    awk '/<repositoryId>/ { id = $0 }
+         /<description>/ && $0 ~ /Apache Spark '"$RELEASE_VERSION"'/ { print id }' |
+    sed -n 's/.*<repositoryId>\(orgapachespark-[0-9][0-9]*\)<\/repositoryId>.*/\1/p' |
+    sort -V |
+    tail -n 1
+  )
 
   if [[ -z "$REPO_ID" ]]; then
     echo "No matching staging repository found for Apache Spark $RELEASE_VERSION"
@@ -512,7 +587,7 @@ EOF
   echo "Using repository ID: $REPO_ID"
 
   # Release the repository
-  curl --retry 10 --retry-all-errors -s -u "$APACHE_USERNAME:$APACHE_PASSWORD" \
+  curl --retry 10 --retry-all-errors -s -u "$ASF_USERNAME:$ASF_NEXUS_TOKEN" \
     -H "Content-Type: application/json" \
     -X POST https://repository.apache.org/service/local/staging/bulk/promote \
     -d "{\"data\": {\"stagedRepositoryIds\": [\"$REPO_ID\"], \"description\": \"Apache Spark $RELEASE_VERSION\"}}"
@@ -520,9 +595,13 @@ EOF
   # Wait for release to complete
   echo "Waiting for release to complete..."
   while true; do
-    STATUS=$(curl --retry 10 --retry-all-errors -s -u "$APACHE_USERNAME:$APACHE_PASSWORD" \
-      https://repository.apache.org/service/local/staging/repository/$REPO_ID | \
-      grep -oPm1 "(?<=<type>)[^<]+")
+    STATUS=$(
+      curl --retry 10 --retry-all-errors -s -u "$ASF_USERNAME:$ASF_NEXUS_TOKEN" \
+        https://repository.apache.org/service/local/staging/repository/$REPO_ID |
+      sed -n 's:.*<type>\([^<]*\)</type>.*:\1:p' |
+      head -n 1
+    )
+
     echo "Current state: $STATUS"
     if [[ "$STATUS" == "released" ]]; then
       echo "Release complete."
@@ -538,18 +617,17 @@ EOF
   done
 
   # Drop the repository after release
-  curl --retry 10 --retry-all-errors -s -u "$APACHE_USERNAME:$APACHE_PASSWORD" \
+  curl --retry 10 --retry-all-errors -s -u "$ASF_USERNAME:$ASF_NEXUS_TOKEN" \
     -H "Content-Type: application/json" \
     -X POST https://repository.apache.org/service/local/staging/bulk/drop \
     -d "{\"data\": {\"stagedRepositoryIds\": [\"$REPO_ID\"], \"description\": \"Dropped after release\"}}"
 
   echo "Done."
 
-  # TODO: Test it in the actual official release
   # Remove old releases from the mirror
   # Extract major.minor prefix
   RELEASE_SERIES=$(echo "$RELEASE_VERSION" | cut -d. -f1-2)
-  
+
   # Fetch existing dist URLs
   OLD_VERSION=$(svn ls https://dist.apache.org/repos/dist/release/spark/ | \
     grep "^spark-$RELEASE_SERIES" | \
@@ -559,7 +637,7 @@ EOF
   
   if [[ -n "$OLD_VERSION" ]]; then
     echo "Removing old version: spark-$OLD_VERSION"
-    svn rm "https://dist.apache.org/repos/dist/release/spark/spark-$OLD_VERSION" -m "Remove older $RELEASE_SERIES release after $RELEASE_VERSION"
+    svn rm "https://dist.apache.org/repos/dist/release/spark/spark-$OLD_VERSION" --username "$ASF_USERNAME" --password "$ASF_PASSWORD" --non-interactive --no-auth-cache -m "Remove older $RELEASE_SERIES release after $RELEASE_VERSION"
   else
     echo "No previous $RELEASE_SERIES version found to remove. Manually remove it if there is."
   fi
@@ -605,7 +683,7 @@ SCALA_2_12_PROFILES="-Pscala-2.12"
 HIVE_PROFILES="-Phive -Phive-thriftserver"
 # Profiles for publishing snapshots and release to Maven Central
 # We use Apache Hive 2.3 for publishing
-PUBLISH_PROFILES="$BASE_PROFILES $HIVE_PROFILES -Pspark-ganglia-lgpl -Pkinesis-asl -Phadoop-cloud -Pjvm-profiler"
+PUBLISH_PROFILES="$BASE_PROFILES $HIVE_PROFILES -Pspark-ganglia-lgpl -Pkinesis-asl -Pcredential-aws -Phadoop-cloud -Pjvm-profiler"
 # Profiles for building binary releases
 BASE_RELEASE_PROFILES="$BASE_PROFILES -Psparkr"
 
@@ -617,14 +695,6 @@ elif [[ $JAVA_VERSION < "17.0." ]] && [[ $SPARK_VERSION > "3.5.99" ]]; then
   echo "Java version $JAVA_VERSION is less than required 17 for 4.0+"
   echo "Please set JAVA_HOME correctly."
   exit 1
-fi
-
-# This is a band-aid fix to avoid the failure of Maven nightly snapshot in some Jenkins
-# machines by explicitly calling /usr/sbin/lsof. Please see SPARK-22377 and the discussion
-# in its pull request.
-LSOF=lsof
-if ! hash $LSOF 2>/dev/null; then
-  LSOF=/usr/sbin/lsof
 fi
 
 if [ -z "$SPARK_PACKAGE_VERSION" ]; then
@@ -835,6 +905,7 @@ if [[ "$1" == "docs" ]]; then
   fi
   bundle install
   PRODUCTION=1 RELEASE_VERSION="$SPARK_VERSION" bundle exec jekyll build
+
   cd ..
   cd ..
 
@@ -870,6 +941,7 @@ if [[ "$1" == "publish-snapshot" ]]; then
   # Coerce the requested version
   $MVN versions:set -DnewVersion=$SPARK_VERSION
   tmp_settings="tmp-settings.xml"
+  fcreate_secure $tmp_settings
   echo "<settings><servers><server>" > $tmp_settings
   echo "<id>apache.snapshots.https</id><username>$ASF_USERNAME</username>" >> $tmp_settings
   echo "<password>$ASF_PASSWORD</password>" >> $tmp_settings
@@ -905,7 +977,7 @@ if [[ "$1" == "publish-release" ]]; then
     echo "Creating Nexus staging repository"
     repo_request="<promoteRequest><data><description>Apache Spark $SPARK_VERSION (commit $git_hash)</description></data></promoteRequest>"
     out=$(curl --retry 10 --retry-all-errors -X POST -d "$repo_request" -u $ASF_USERNAME:$ASF_PASSWORD \
-      -H "Content-Type:application/xml" -v \
+      -H "Content-Type:application/xml" \
       $NEXUS_ROOT/profiles/$NEXUS_PROFILE/start)
     staged_repo_id=$(echo $out | sed -e "s/.*\(orgapachespark-[0-9]\{4\}\).*/\1/")
     echo "Created Nexus staging repository: $staged_repo_id"
@@ -983,7 +1055,7 @@ if [[ "$1" == "publish-release" ]]; then
     echo "Closing nexus staging repository"
     repo_request="<promoteRequest><data><stagedRepositoryId>$staged_repo_id</stagedRepositoryId><description>Apache Spark $SPARK_VERSION (commit $git_hash)</description></data></promoteRequest>"
     out=$(curl --retry 10 --retry-all-errors -X POST -d "$repo_request" -u $ASF_USERNAME:$ASF_PASSWORD \
-      -H "Content-Type:application/xml" -v \
+      -H "Content-Type:application/xml" \
       $NEXUS_ROOT/profiles/$NEXUS_PROFILE/finish)
     echo "Closed Nexus staging repository: $staged_repo_id"
 
@@ -992,7 +1064,7 @@ if [[ "$1" == "publish-release" ]]; then
     EMAIL_SUBJECT="[VOTE] Release Spark ${SPARK_VERSION} (RC${SPARK_RC_COUNT})"
 
     # Calculate deadline in Pacific Time (PST/PDT)
-    DEADLINE=$(TZ=America/Los_Angeles date -d "+4 days" "+%a, %d %b %Y %H:%M:%S %Z")
+    DEADLINE=$(TZ=America/Los_Angeles date -d "+73 hour" "+%a, %d %b %Y %H:%M:%S %Z")
     PYSPARK_VERSION=`echo "$RELEASE_VERSION" |  sed -e "s/-/./" -e "s/preview/dev/"`
 
     JIRA_API_URL="https://issues.apache.org/jira/rest/api/2/project/SPARK/versions"
@@ -1009,6 +1081,7 @@ if [[ "$1" == "publish-release" ]]; then
       head -1)
 
     # Configure msmtp
+    fcreate_secure ~/.msmtprc
     cat > ~/.msmtprc <<EOF
 defaults
 auth           on
@@ -1025,8 +1098,6 @@ password       $ASF_PASSWORD
 
 account default : apache
 EOF
-
-    chmod 600 ~/.msmtprc
 
     # Compose and send the email
     {
@@ -1079,6 +1150,7 @@ EOF
       echo "with the RC (make sure to clean up the artifact cache before/after so"
       echo "you don't end up building with an out of date RC going forward)."
     } | msmtp -t
+    rm -f ~/.msmtprc
   fi
 
   popd

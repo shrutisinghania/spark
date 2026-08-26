@@ -22,6 +22,7 @@ import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark.sql.catalyst.InternalRow
@@ -40,16 +41,37 @@ class BasicInMemoryTableCatalog extends TableCatalog {
   protected val namespaces: util.Map[List[String], Map[String, String]] =
     new ConcurrentHashMap[List[String], Map[String, String]]()
 
-  protected val tables: util.Map[Identifier, Table] =
+  protected var tables: util.Map[Identifier, Table] =
     new ConcurrentHashMap[Identifier, Table]()
 
   private val invalidatedTables: util.Set[Identifier] = ConcurrentHashMap.newKeySet()
 
   private var _name: Option[String] = None
+  private var copyOnLoad: Boolean = false
+  private var stateOptionKeys: util.Set[String] = util.Set.of()
+
+  // Records every (TableContext, table-state options) pair passed to the options-aware
+  // loadTable(), in call order, so tests can verify that the analyzer / DataFrame API correctly
+  // constructed and forwarded them -- including how many times loadTable was called when the same
+  // table is referenced more than once in a statement with different options.
+  // "loadTable" is in the name because the subclass InMemoryChangelogCatalog has an analogous
+  // `lastOptions` recording the options passed to loadChangelog(); the two must not collide.
+  private val _loadTableCalls = mutable.ArrayBuffer.empty[(TableContext, CaseInsensitiveStringMap)]
+  def loadTableCalls: Seq[(TableContext, CaseInsensitiveStringMap)] = _loadTableCalls.toSeq
+  def resetLoadTableCalls(): Unit = _loadTableCalls.clear()
+
+  def lastTableContext: Option[TableContext] = _loadTableCalls.lastOption.map(_._1)
+  def lastLoadTableOptions: Option[CaseInsensitiveStringMap] = _loadTableCalls.lastOption.map(_._2)
 
   override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = {
     _name = Some(name)
+    copyOnLoad = options.getBoolean("copyOnLoad", false)
+    stateOptionKeys = Option(options.get("tableStateOptionKeys"))
+      .map(_.split(",").iterator.map(_.trim).filter(_.nonEmpty).toSet.asJava)
+      .getOrElse(util.Set.of())
   }
+
+  override def tableStateOptionKeys(): util.Set[String] = stateOptionKeys
 
   override def name: String = _name.get
 
@@ -57,10 +79,46 @@ class BasicInMemoryTableCatalog extends TableCatalog {
     tables.keySet.asScala.filter(_.namespace.sameElements(namespace)).toArray
   }
 
+  // load table for scans
   override def loadTable(ident: Identifier): Table = {
+    Option(tables.get(ident)) match {
+      case Some(table: InMemoryTable) if copyOnLoad =>
+        table.copy() // copy to validate logical table equality
+      case Some(table) =>
+        table
+      case _ =>
+        throw new NoSuchTableException(ident.asMultipartIdentifier)
+    }
+  }
+
+  // Returns the underlying live instance without copying. Used by tests that need to mutate
+  // state in a way that's observable to subsequent `loadTable` callers, and by wrappers that
+  // need to propagate writes to the live state.
+  def liveTable(ident: Identifier): Table = {
+    Option(tables.get(ident)).getOrElse(
+      throw new NoSuchTableException(ident.asMultipartIdentifier))
+  }
+
+  // load table for writes
+  override def loadTable(
+      ident: Identifier,
+      writePrivileges: util.Set[TableWritePrivilege]): Table = {
     Option(tables.get(ident)) match {
       case Some(table) =>
         table
+      case _ =>
+        throw new NoSuchTableException(ident.asMultipartIdentifier)
+    }
+  }
+
+  def pinTable(ident: Identifier, version: String): Unit = {
+    Option(tables.get(ident)) match {
+      case Some(table: InMemoryBaseTable) =>
+        val versionIdent = Identifier.of(ident.namespace, ident.name + version)
+        val versionTable = table.copy()
+        tables.put(versionIdent, versionTable)
+      case Some(table) =>
+        throw new UnsupportedOperationException(s"Can't pin ${table.getClass.getName}")
       case _ =>
         throw new NoSuchTableException(ident.asMultipartIdentifier)
     }
@@ -84,6 +142,16 @@ class BasicInMemoryTableCatalog extends TableCatalog {
       case _ =>
         throw new NoSuchTableException(ident.asMultipartIdentifier)
     }
+  }
+
+  // Records the forwarded context/state options so tests can verify they reached the catalog, then
+  // defers to the default dispatch in TableCatalog (rather than reimplementing it here).
+  override def loadTable(
+      ident: Identifier,
+      context: TableContext,
+      stateOptions: CaseInsensitiveStringMap): Table = {
+    _loadTableCalls += ((context, stateOptions))
+    super.loadTable(ident, context, stateOptions)
   }
 
   override def invalidateTable(ident: Identifier): Unit = {
@@ -134,7 +202,7 @@ class BasicInMemoryTableCatalog extends TableCatalog {
   }
 
   override def alterTable(ident: Identifier, changes: TableChange*): Table = {
-    val table = loadTable(ident).asInstanceOf[InMemoryTable]
+    val table = loadTable(ident).asInstanceOf[InMemoryBaseTable]
     val properties = CatalogV2Util.applyPropertiesChanges(table.properties, changes)
     val schema = CatalogV2Util.applySchemaChanges(
       table.schema,
@@ -149,16 +217,49 @@ class BasicInMemoryTableCatalog extends TableCatalog {
       throw new IllegalArgumentException(s"Cannot drop all fields")
     }
 
-    table.increaseCurrentVersion()
-    val currentVersion = table.currentVersion()
-    val newTable = new InMemoryTable(
-      name = table.name,
-      columns = CatalogV2Util.structTypeToV2Columns(schema),
-      partitioning = finalPartitioning,
-      properties = properties,
-      constraints = constraints)
-      .withData(table.data)
-    newTable.setCurrentVersion(currentVersion)
+    // Compute the intermediate schema that only reflects column deletions.
+    // [[InMemoryBaseTable.alterTableWithData]] decides which old-row fields to keep by
+    // matching names against its newSchema argument. Passing this post-drop schema
+    // (rather than the final schema that may re-add a same-named column) ensures that
+    // dropped column values are physically removed from existing data.
+    // Note: this only handles top-level column deletions. Nested column deletions
+    // would need additional handling, but [[alterTableWithData]] only filters by
+    // top-level field name anyway.
+    val deletedTopLevelNames = changes.collect {
+      case d: TableChange.DeleteColumn if d.fieldNames.length == 1 => d.fieldNames.head
+    }.toSet
+    val schemaAfterDrops = if (deletedTopLevelNames.nonEmpty) {
+      StructType(table.schema.fields.filterNot(f => deletedTopLevelNames(f.name)))
+    } else {
+      schema
+    }
+
+    table.increaseVersion()
+    val currentVersion = table.version()
+    val columnsWithIds = InMemoryBaseTable.assignMissingIds(
+      CatalogV2Util.structTypeToV2Columns(schema))
+    val newTable = table match {
+      case _: InMemoryTable =>
+        new InMemoryTable(
+          name = table.name,
+          columns = columnsWithIds,
+          partitioning = finalPartitioning,
+          properties = properties,
+          constraints = constraints,
+          id = table.id)
+          .alterTableWithData(table.data, schemaAfterDrops)
+      case _: InMemoryTableWithV2Filter =>
+        new InMemoryTableWithV2Filter(
+          name = table.name,
+          columns = columnsWithIds,
+          partitioning = finalPartitioning,
+          properties = properties)
+          .alterTableWithData(table.data, schemaAfterDrops)
+      case other =>
+        throw new UnsupportedOperationException(
+          s"Unsupported InMemoryBaseTable subclass: ${other.getClass.getName}")
+    }
+    newTable.setVersion(currentVersion)
     changes.foreach {
       case a: TableChange.AddConstraint =>
         newTable.setValidatedVersion(a.validatedTableVersion())
@@ -178,7 +279,7 @@ class BasicInMemoryTableCatalog extends TableCatalog {
 
     Option(tables.remove(oldIdent)) match {
       case Some(table: InMemoryBaseTable) =>
-        table.increaseCurrentVersion()
+        table.increaseVersion()
         tables.put(newIdent, table)
       case _ =>
         throw new NoSuchTableException(oldIdent.asMultipartIdentifier)
@@ -196,6 +297,19 @@ class BasicInMemoryTableCatalog extends TableCatalog {
 
 class InMemoryTableCatalog extends BasicInMemoryTableCatalog with SupportsNamespaces
   with ProcedureCatalog {
+
+  override def createTableLike(
+      ident: Identifier,
+      tableInfo: TableInfo,
+      sourceTable: Table): Table = {
+    // columns, partitioning, constraints, explicit properties, and owner are all provided in
+    // tableInfo by Spark. Merge source properties so that connector-specific custom state
+    // (e.g. format.version, format.feature) is cloned; tableInfo properties win on conflict.
+    val mergedProps =
+      (sourceTable.properties().asScala ++ tableInfo.properties().asScala).asJava
+    createTable(ident, tableInfo.columns(), tableInfo.partitions(), mergedProps,
+      Distributions.unspecified(), Array.empty, None, None, tableInfo.constraints())
+  }
 
   override def capabilities: java.util.Set[TableCatalogCapability] = {
     Set(

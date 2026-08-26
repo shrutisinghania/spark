@@ -23,18 +23,8 @@ import numpy as np
 import pandas as pd
 from pandas.api.types import CategoricalDtype
 
-from pyspark.sql import Column, functions as F
-from pyspark.sql.types import (
-    BooleanType,
-    LongType,
-    StringType,
-    TimestampType,
-    TimestampNTZType,
-    NumericType,
-)
-from pyspark.sql.utils import pyspark_column_op
+from pyspark.loose_version import LooseVersion
 from pyspark.pandas._typing import Dtype, IndexOpsLike, SeriesOrIndex
-from pyspark.sql.internal import InternalFunction as SF
 from pyspark.pandas.base import IndexOpsMixin
 from pyspark.pandas.data_type_ops.base import (
     DataTypeOps,
@@ -44,6 +34,18 @@ from pyspark.pandas.data_type_ops.base import (
     _sanitize_list_like,
 )
 from pyspark.pandas.typedef import pandas_on_spark_type
+from pyspark.sql import Column
+from pyspark.sql import functions as F
+from pyspark.sql.internal import InternalFunction as SF
+from pyspark.sql.types import (
+    BooleanType,
+    LongType,
+    NumericType,
+    StringType,
+    TimestampNTZType,
+    TimestampType,
+)
+from pyspark.sql.utils import pyspark_column_op
 
 
 class DatetimeOps(DataTypeOps):
@@ -93,6 +95,8 @@ class DatetimeOps(DataTypeOps):
             "The timestamp subtraction returns an integer in seconds, "
             "whereas pandas returns 'timedelta64[ns]'."
         )
+        if isinstance(right, pd.Series):
+            raise NotImplementedError()
         if isinstance(right, datetime.datetime):
             warnings.warn(msg, UserWarning)
             return cast(
@@ -127,6 +131,13 @@ class DatetimeOps(DataTypeOps):
     def prepare(self, col: pd.Series) -> pd.Series:
         """Prepare column when from_pandas."""
         return col
+
+    def restore(self, col: pd.Series) -> pd.Series:
+        """Restore column when to_pandas."""
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return col
+        else:
+            return col.astype(self.dtype)
 
     def astype(self, index_ops: IndexOpsLike, dtype: Union[str, type, Dtype]) -> IndexOpsLike:
         dtype, spark_type = pandas_on_spark_type(dtype)
@@ -166,4 +177,4 @@ class DatetimeNTZOps(DatetimeOps):
             )
             return index_ops._with_new_scol(scol, field=InternalField(dtype=dtype))
         else:
-            return super(DatetimeNTZOps, self).astype(index_ops, dtype)
+            return super().astype(index_ops, dtype)

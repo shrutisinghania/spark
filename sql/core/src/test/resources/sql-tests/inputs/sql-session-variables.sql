@@ -83,6 +83,19 @@ DROP TEMPORARY VARIABLE var1;
 SET VARIABLE title = 'Test variable in aggregate';
 SELECT (SELECT MAX(id) FROM RANGE(10) WHERE id < title) FROM VALUES 1, 2 AS t(title);
 
+SET VARIABLE title = 'Dropped struct variable -- field access vs qualified name';
+-- `session.a` is ambiguous: (a) 2-part qualified variable, or (b) field `a` of a 1-part
+-- variable `session`. Variable resolution tries (a) first via longest match, falls back to
+-- (b). With `session` declared as a struct, (b) succeeds. After the variable is dropped,
+-- both interpretations fail and the SELECT falls through to column resolution, which
+-- reports `UNRESOLVED_COLUMN`. Because either interpretation could have been intended,
+-- the variable error path (when reached) must dump the full SQL path -- see
+-- `VariableResolution.searchPathEntriesForError`.
+DECLARE OR REPLACE VARIABLE session STRUCT<a INT> = NAMED_STRUCT('a', 1);
+SELECT session.a;
+DROP TEMPORARY VARIABLE session;
+SELECT session.a;
+
 SET VARIABLE title = 'Test qualifiers - fail';
 DECLARE OR REPLACE VARIABLE builtin.var1 INT;
 DECLARE OR REPLACE VARIABLE system.sesion.var1 INT;
@@ -206,6 +219,35 @@ SET VARIABLE var1 = 1, var2 = 0, vAr1 = 1;
 DROP TEMPORARY VARIABLE var1;
 DROP TEMPORARY VARIABLE var2;
 DROP TEMPORARY VARIABLE var3;
+
+SET VARIABLE title = 'DECLARE VARIABLE - multiple variables declared at once';
+
+DECLARE VARIABLE var1, var2, var3 INT;
+DECLARE VARIABLE var4, var5, var6 INT DEFAULT CAST(RAND(0) * 10 AS INT);
+DECLARE VARIABLE var7, var8, var9 DEFAULT 5;
+
+SELECT var4 = var5, var4 = var6, var5 = var6;
+
+DECLARE OR REPLACE VARIABLE var1, var2, var3 DOUBLE;
+DECLARE OR REPLACE VARIABLE var4, var5, var6 DOUBLE DEFAULT RAND(0);
+DECLARE OR REPLACE VARIABLE var7, var8, var9 DEFAULT 1.5;
+
+SELECT var4 = var5, var4 = var6, var5 = var6;
+
+DROP TEMPORARY VARIABLE var1;
+DROP TEMPORARY VARIABLE var2;
+DROP TEMPORARY VARIABLE var3;
+DROP TEMPORARY VARIABLE var4;
+DROP TEMPORARY VARIABLE var5;
+DROP TEMPORARY VARIABLE var6;
+DROP TEMPORARY VARIABLE var7;
+DROP TEMPORARY VARIABLE var8;
+DROP TEMPORARY VARIABLE var9;
+
+SET VARIABLE title = 'DECLARE VARIABLE - duplicate names';
+
+DECLARE VARIABLE var1, var2, vAr1 INT;
+DECLARE OR REPLACE VARIABLE var1, var2, vAr1 INT;
 
 SET VARIABLE title = 'SET VARIABLE - row assignment';
 

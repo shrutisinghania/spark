@@ -15,50 +15,50 @@
 # limitations under the License.
 #
 
-import unittest
-import inspect
 import functools
+import inspect
+import unittest
 
-from pyspark.testing.connectutils import should_test_connect, connect_requirement_message
-from pyspark.testing.sqlutils import ReusedSQLTestCase
-from pyspark.sql.classic.dataframe import DataFrame as ClassicDataFrame
-from pyspark.sql.classic.column import Column as ClassicColumn
-from pyspark.sql.session import SparkSession as ClassicSparkSession
+import pyspark.sql.avro.functions as ClassicAvro
+import pyspark.sql.functions as ClassicFunctions
+import pyspark.sql.protobuf.functions as ClassicProtobuf
 from pyspark.sql.catalog import Catalog as ClassicCatalog
+from pyspark.sql.classic.column import Column as ClassicColumn
+from pyspark.sql.classic.dataframe import DataFrame as ClassicDataFrame
+from pyspark.sql.group import GroupedData as ClassicGroupedData
 from pyspark.sql.readwriter import DataFrameReader as ClassicDataFrameReader
 from pyspark.sql.readwriter import DataFrameWriter as ClassicDataFrameWriter
 from pyspark.sql.readwriter import DataFrameWriterV2 as ClassicDataFrameWriterV2
-from pyspark.sql.window import Window as ClassicWindow
-from pyspark.sql.window import WindowSpec as ClassicWindowSpec
-import pyspark.sql.functions as ClassicFunctions
-from pyspark.sql.group import GroupedData as ClassicGroupedData
-import pyspark.sql.avro.functions as ClassicAvro
-import pyspark.sql.protobuf.functions as ClassicProtobuf
+from pyspark.sql.session import SparkSession as ClassicSparkSession
 from pyspark.sql.streaming.query import StreamingQuery as ClassicStreamingQuery
 from pyspark.sql.streaming.query import StreamingQueryManager as ClassicStreamingQueryManager
 from pyspark.sql.streaming.readwriter import DataStreamReader as ClassicDataStreamReader
 from pyspark.sql.streaming.readwriter import DataStreamWriter as ClassicDataStreamWriter
+from pyspark.sql.window import Window as ClassicWindow
+from pyspark.sql.window import WindowSpec as ClassicWindowSpec
+from pyspark.testing.connectutils import connect_requirement_message, should_test_connect
+from pyspark.testing.sqlutils import ReusedSQLTestCase
 
 if should_test_connect:
-    from pyspark.sql.connect.dataframe import DataFrame as ConnectDataFrame
-    from pyspark.sql.connect.column import Column as ConnectColumn
-    from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
+    import pyspark.sql.connect.avro.functions as ConnectAvro
+    import pyspark.sql.connect.functions as ConnectFunctions
+    import pyspark.sql.connect.protobuf.functions as ConnectProtobuf
     from pyspark.sql.connect.catalog import Catalog as ConnectCatalog
+    from pyspark.sql.connect.column import Column as ConnectColumn
+    from pyspark.sql.connect.dataframe import DataFrame as ConnectDataFrame
+    from pyspark.sql.connect.group import GroupedData as ConnectGroupedData
     from pyspark.sql.connect.readwriter import DataFrameReader as ConnectDataFrameReader
     from pyspark.sql.connect.readwriter import DataFrameWriter as ConnectDataFrameWriter
     from pyspark.sql.connect.readwriter import DataFrameWriterV2 as ConnectDataFrameWriterV2
-    from pyspark.sql.connect.window import Window as ConnectWindow
-    from pyspark.sql.connect.window import WindowSpec as ConnectWindowSpec
-    import pyspark.sql.connect.functions as ConnectFunctions
-    from pyspark.sql.connect.group import GroupedData as ConnectGroupedData
-    import pyspark.sql.connect.avro.functions as ConnectAvro
-    import pyspark.sql.connect.protobuf.functions as ConnectProtobuf
+    from pyspark.sql.connect.session import SparkSession as ConnectSparkSession
     from pyspark.sql.connect.streaming.query import StreamingQuery as ConnectStreamingQuery
     from pyspark.sql.connect.streaming.query import (
         StreamingQueryManager as ConnectStreamingQueryManager,
     )
     from pyspark.sql.connect.streaming.readwriter import DataStreamReader as ConnectDataStreamReader
     from pyspark.sql.connect.streaming.readwriter import DataStreamWriter as ConnectDataStreamWriter
+    from pyspark.sql.connect.window import Window as ConnectWindow
+    from pyspark.sql.connect.window import WindowSpec as ConnectWindowSpec
 
 
 class ConnectCompatibilityTestsMixin:
@@ -100,7 +100,7 @@ class ConnectCompatibilityTestsMixin:
             connect_signature = inspect.signature(connect_methods[method])
 
             # Cannot support RDD arguments from Spark Connect
-            has_rdd_arguments = ("createDataFrame", "xml", "json")
+            has_rdd_arguments = ("createDataFrame", "xml", "json", "csv", "toJSON")
             if method not in has_rdd_arguments:
                 self.assertEqual(
                     classic_signature,
@@ -264,11 +264,10 @@ class ConnectCompatibilityTestsMixin:
         expected_missing_connect_methods = {
             "clearProgressHandlers",
             "copyFromLocalToFs",
-            "newSession",
             "registerProgressHandler",
             "removeProgressHandler",
         }
-        expected_missing_classic_methods = set()
+        expected_missing_classic_methods = {"cloneSession"}
         self.check_compatibility(
             ClassicSparkSession,
             ConnectSparkSession,
@@ -379,9 +378,8 @@ class ConnectCompatibilityTestsMixin:
         """Test Functions compatibility between classic and connect."""
         expected_missing_connect_properties = set()
         expected_missing_classic_properties = set()
-        # TODO(SPARK-53012): support arrow_udtf in Spark Connect
-        expected_missing_connect_methods = {"arrow_udtf"}
-        expected_missing_classic_methods = {"check_dependencies"}
+        expected_missing_connect_methods = set()
+        expected_missing_classic_methods = set()
         self.check_compatibility(
             ClassicFunctions,
             ConnectFunctions,
@@ -419,7 +417,7 @@ class ConnectCompatibilityTestsMixin:
             "cast",
             "get_active_spark_context",
         }
-        expected_missing_classic_methods = {"lit", "check_dependencies"}
+        expected_missing_classic_methods = {"lit"}
         self.check_compatibility(
             ClassicAvro,
             ConnectAvro,
@@ -457,7 +455,7 @@ class ConnectCompatibilityTestsMixin:
             "try_remote_protobuf_functions",
             "get_active_spark_context",
         }
-        expected_missing_classic_methods = {"lit", "check_dependencies"}
+        expected_missing_classic_methods = {"lit"}
         self.check_compatibility(
             ClassicProtobuf,
             ConnectProtobuf,
@@ -523,12 +521,6 @@ class ConnectCompatibilityTests(ConnectCompatibilityTestsMixin, ReusedSQLTestCas
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_connect_compatibility import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

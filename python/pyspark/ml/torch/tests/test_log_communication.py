@@ -18,18 +18,18 @@
 from __future__ import absolute_import, division, print_function
 
 import contextlib
-from io import StringIO
 import sys
 import time
-from typing import Any, Callable
 import unittest
+from io import StringIO
+from typing import Any, Callable
 
 import pyspark.ml.torch.log_communication
 from pyspark.ml.torch.log_communication import (
-    LogStreamingServer,
+    _SERVER_POLL_INTERVAL,
     LogStreamingClient,
     LogStreamingClientBase,
-    _SERVER_POLL_INTERVAL,
+    LogStreamingServer,
 )
 
 
@@ -161,12 +161,6 @@ class LogStreamingServiceTestCase(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.torch.tests.test_log_communication import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

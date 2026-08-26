@@ -18,7 +18,10 @@
 package org.apache.spark.sql
 
 import java.io.File
+import java.lang.management.ManagementFactory
 import java.net.{MalformedURLException, URI}
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
 import java.sql.{Date, Timestamp}
 import java.time.{Duration, Period}
 import java.util.Locale
@@ -35,6 +38,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{ConvertToLocalRelation, NestedColumnAliasingSuite}
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.logical.{LocalLimit, Project, RepartitionByExpression, Sort}
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.execution.{CommandResultExec, OneRowRelationExec, UnionExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
@@ -55,10 +59,10 @@ import org.apache.spark.sql.test.SQLTestData._
 import org.apache.spark.sql.types._
 import org.apache.spark.tags.ExtendedSQLTest
 import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
-import org.apache.spark.util.{ResetSystemProperties, Utils}
+import org.apache.spark.util.{ResetSystemProperties, SparkTestUtils, Utils}
 
 @ExtendedSQLTest
-class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSparkPlanHelper
+class SQLQuerySuite extends SharedSparkSession with AdaptiveSparkPlanHelper
     with ResetSystemProperties {
   import testImplicits._
 
@@ -119,9 +123,13 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
   }
 
   test("SPARK-14415: All functions should have own descriptions") {
+    val excludedBuiltins = Seq("cube", "grouping", "grouping_id", "rollup").map { name =>
+      s"${CatalogManager.SYSTEM_CATALOG_NAME}.${CatalogManager.BUILTIN_NAMESPACE}.$name"
+    }
     for (f <- spark.sessionState.functionRegistry.listFunction()) {
-      if (!Seq("cube", "grouping", "grouping_id", "rollup").contains(f.unquotedString)) {
-        checkKeywordsNotExist(sql(s"describe function $f"), "N/A.")
+      if (!excludedBuiltins.contains(f.unquotedString)) {
+        // Use quotedString so special characters (e.g. ^) in function names are valid in SQL.
+        checkKeywordsNotExist(sql(s"describe function ${f.quotedString}"), "N/A.")
       }
     }
   }
@@ -546,19 +554,19 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
 
     checkAnswer(
       sql("SELECT * FROM arrayData ORDER BY data[0] ASC"),
-      arrayData.collect().sortBy(_.data(0)).map(Row.fromTuple).toSeq)
+      arrayData.collect().sortBy(_.getAs[Seq[Int]](0)(0)).toSeq)
 
     checkAnswer(
       sql("SELECT * FROM arrayData ORDER BY data[0] DESC"),
-      arrayData.collect().sortBy(_.data(0)).reverse.map(Row.fromTuple).toSeq)
+      arrayData.collect().sortBy(_.getAs[Seq[Int]](0)(0)).reverse.toSeq)
 
     checkAnswer(
       sql("SELECT * FROM mapData ORDER BY data[1] ASC"),
-      mapData.collect().sortBy(_.data(1)).map(Row.fromTuple).toSeq)
+      mapData.collect().sortBy(_.getAs[Map[Int, String]](0)(1)).toSeq)
 
     checkAnswer(
       sql("SELECT * FROM mapData ORDER BY data[1] DESC"),
-      mapData.collect().sortBy(_.data(1)).reverse.map(Row.fromTuple).toSeq)
+      mapData.collect().sortBy(_.getAs[Map[Int, String]](0)(1)).reverse.toSeq)
   }
 
   test("external sorting") {
@@ -1002,7 +1010,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
         StructField("f3", BooleanType, false) ::
         StructField("f4", IntegerType, true) :: Nil)
 
-      val rowRDD1 = unparsedStrings.map { r =>
+      val rowRDD1 = unparsedStrings.as[String].rdd.map { r =>
         val values = r.split(",").map(_.trim)
         val v4 = try values(3).toInt catch {
           case _: NumberFormatException => null
@@ -1032,7 +1040,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
           StructField("f12", BooleanType, false) :: Nil), false) ::
         StructField("f2", MapType(StringType, IntegerType, true), false) :: Nil)
 
-      val rowRDD2 = unparsedStrings.map { r =>
+      val rowRDD2 = unparsedStrings.as[String].rdd.map { r =>
         val values = r.split(",").map(_.trim)
         val v4 = try values(3).toInt catch {
           case _: NumberFormatException => null
@@ -1059,7 +1067,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
             Row(4, 2147483644) :: Nil)
 
         // The value of a MapType column can be a mutable map.
-        val rowRDD3 = unparsedStrings.map { r =>
+        val rowRDD3 = unparsedStrings.as[String].rdd.map { r =>
           val values = r.split(",").map(_.trim)
           val v4 = try values(3).toInt catch {
             case _: NumberFormatException => null
@@ -1668,7 +1676,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
       exception = intercept[AnalysisException] {
         sql(s"select id from `org.apache.spark.sql.hive.orc`.`file_path`")
       },
-      condition = "_LEGACY_ERROR_TEMP_1138"
+      condition = "ORC_DATA_SOURCE_REQUIRES_HIVE_SUPPORT"
     )
 
     e = intercept[AnalysisException] {
@@ -1689,6 +1697,20 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
     }
     assert(e.message.contains("Unsupported data source type for direct query on files: " +
       "org.apache.spark.sql.execution.datasources.jdbc"))
+
+    // Test for empty and whitespace-only paths
+    Seq("", " ", "\t", "\n", "\t\n", " \t ").foreach { file_path =>
+      checkError(
+        exception = intercept[AnalysisException] {
+          sql(s"select id from json.`$file_path`")
+        },
+        condition = "INVALID_EMPTY_LOCATION",
+        parameters = Map("location" -> file_path),
+        queryContext = Array(ExpectedContext(
+          fragment = s"json.`$file_path`",
+          start = 15,
+          stop = 15 + s"json.`$file_path`".length - 1)))
+    }
   }
 
   test("SortMergeJoin returns wrong results when using UnsafeRows") {
@@ -3311,6 +3333,27 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
     }
   }
 
+  test("SPARK-58211: subexpression elimination respects AND/OR short-circuit with chained ANDs") {
+    // A subexpression (1 / id) repeated inside a short-circuited operand of a chained AND/OR
+    // must not be hoisted and eagerly evaluated. For id = 0, `id != 0` is false, so the second
+    // operand should never be evaluated and no divide-by-zero should be raised. The subexpression
+    // is duplicated *inside* operand 2 (not split across operands 2 and 3) so the failure shape
+    // does not depend on how many operands the one-level peel happened to drop, and operand 3 is
+    // non-foldable to keep it in the plan. skipForShortcutExpr must peel every leading AND/OR
+    // operand, not just one, to make this hold for three or more operands.
+    withSQLConf(
+      SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+      SQLConf.SUBEXPRESSION_ELIMINATION_SKIP_FOR_SHORTCUT_EXPR.key -> "true") {
+      val andQuery =
+        "select id != 0 and (1 / id + 1 / id) > 0 and id >= 0 from range(0, 1, 1, 1)"
+      checkAnswer(sql(andQuery), Row(false))
+
+      val orQuery =
+        "select id == 0 or (1 / id + 1 / id) > 0 or id < 0 from range(0, 1, 1, 1)"
+      checkAnswer(sql(orQuery), Row(true))
+    }
+  }
+
   test("SPARK-29213: FilterExec should not throw NPE") {
     // Under ANSI mode, casting string '' as numeric will cause runtime error
     if (!conf.ansiEnabled) {
@@ -3860,19 +3903,25 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
   }
 
   test("SPARK-33084: Add jar support Ivy URI in SQL -- jar contains udf class") {
-    val jarPath = Thread.currentThread().getContextClassLoader
-      .getResource("SPARK-33084.jar")
-    assume(jarPath != null)
     val sumFuncClass = "org.apache.spark.examples.sql.Spark33084"
+    val resourceName = "SPARK-33084/Spark33084.java"
+    val sourceUrl = Thread.currentThread().getContextClassLoader
+      .getResource(resourceName)
+    assert(sourceUrl != null, s"Resource not found: $resourceName")
+    val source = Map(sumFuncClass ->
+      new String(Files.readAllBytes(Paths.get(sourceUrl.toURI)), StandardCharsets.UTF_8))
+    val classpath = ManagementFactory.getRuntimeMXBean.getClassPath
+      .split(File.pathSeparator).map(p => new File(p).toURI.toURL).toSeq
+    val jarFile = new File(Utils.createTempDir(), "SPARK-33084.jar")
+    SparkTestUtils.createJarWithJavaSources(source, jarFile, classpath)
     val functionName = "test_udf"
     withTempDir { dir =>
       System.setProperty("ivy.home", dir.getAbsolutePath)
-      val sourceJar = new File(jarPath.getFile)
       val targetCacheJarDir = new File(dir.getAbsolutePath +
         "/local/org.apache.spark/SPARK-33084/1.0/jars/")
       targetCacheJarDir.mkdir()
       // copy jar to local cache
-      Utils.copyFileToDirectory(sourceJar, targetCacheJarDir)
+      Utils.copyFileToDirectory(jarFile, targetCacheJarDir)
       withTempView("v1") {
         withUserDefinedFunction(
           s"default.$functionName" -> false,
@@ -4770,7 +4819,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
       spark.sql("explain explain explain select ?", Array(1)),
       """== Physical Plan ==
         |Execute ExplainCommand
-        |   +- ExplainCommand ExplainCommand 'PosParameterizedQuery [1], SimpleMode, SimpleMode
+        |   +- ExplainCommand ExplainCommand 'Project [unresolvedalias(1)], SimpleMode, SimpleMode
 
         |"""
     )
@@ -4779,7 +4828,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
       // scalastyle:off
       """== Physical Plan ==
         |Execute ExplainCommand
-        |   +- ExplainCommand ExplainCommand 'NameParameterizedQuery [first], [1], SimpleMode, SimpleMode
+        |   +- ExplainCommand ExplainCommand 'Project [unresolvedalias(1)], SimpleMode, SimpleMode
 
         |"""
       // scalastyle:on
@@ -4789,7 +4838,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
       spark.sql("explain describe select ?", Array(1)),
       """== Physical Plan ==
         |Execute DescribeQueryCommand
-        |   +- DescribeQueryCommand select ?
+        |   +- DescribeQueryCommand select 1
 
         |"""
     )
@@ -4797,7 +4846,7 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
       spark.sql("explain describe select :first", Map("first" -> 1)),
       """== Physical Plan ==
         |Execute DescribeQueryCommand
-        |   +- DescribeQueryCommand select :first
+        |   +- DescribeQueryCommand select 1
 
         |"""
     )
@@ -4805,10 +4854,9 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
     checkQueryPlan(
       spark.sql("explain extended select * from values (?, ?) t(x, y)", Array(1, "a")),
       """== Parsed Logical Plan ==
-        |'PosParameterizedQuery [1, a]
-        |+- 'Project [*]
-        |   +- 'SubqueryAlias t
-        |      +- 'UnresolvedInlineTable [x, y], [[posparameter(39), posparameter(42)]]
+        |'Project [*]
+        |+- SubqueryAlias t
+        |   +- LocalRelation [x#N, y#N]
 
         |== Analyzed Logical Plan ==
         |x: int, y: string
@@ -4829,10 +4877,9 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
         Map("first" -> 1, "second" -> "a")
       ),
       """== Parsed Logical Plan ==
-        |'NameParameterizedQuery [first, second], [1, a]
-        |+- 'Project [*]
-        |   +- 'SubqueryAlias t
-        |      +- 'UnresolvedInlineTable [x, y], [[namedparameter(first), namedparameter(second)]]
+        |'Project [*]
+        |+- SubqueryAlias t
+        |   +- LocalRelation [x#N, y#N]
 
         |== Analyzed Logical Plan ==
         |x: int, y: string
@@ -5015,7 +5062,8 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
 
       for (confValue <- Seq(false, true)) {
         withSQLConf(
-          SQLConf.UNION_IS_RESOLVED_WHEN_DUPLICATES_PER_CHILD_RESOLVED.key -> confValue.toString
+          SQLConf.UNION_IS_RESOLVED_WHEN_DUPLICATES_PER_CHILD_RESOLVED.key -> confValue.toString,
+          SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> confValue.toString
         ) {
           val analyzedPlan = sql(
             """SELECT
@@ -5072,6 +5120,200 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
         |ORDER BY s DESC""".stripMargin)
 
     checkAnswer(df, Seq(Row(null, null, 820), Row(null, "east", 420), Row("a", null, 370)))
+  }
+
+  test("SPARK-53308: Don't remove aliases in RemoveRedundantAliases that would cause duplicates") {
+    val df = sql("SELECT col1 FROM values(1) WHERE 1 IN (SELECT col1 UNION SELECT col1);")
+
+    checkAnswer(df, Row(1))
+  }
+
+  test("SPARK-53734: Prefer table column over LCA when resolving array index") {
+    val query = "SELECT 1 AS col1, col2[col1] FROM VALUES(0, ARRAY(1, 2));"
+    withSQLConf(SQLConf.PREFER_COLUMN_OVER_LCA_IN_ARRAY_INDEX.key -> "true") {
+      checkAnswer(sql(query), Row(1, 1))
+    }
+
+    withSQLConf(
+      SQLConf.PREFER_COLUMN_OVER_LCA_IN_ARRAY_INDEX.key -> "false",
+      // Single-pass analyzer doesn't support this legacy behavior.
+      SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false"
+    ) {
+      checkAnswer(sql(query), Row(1, 2))
+    }
+  }
+
+  gridTest("SPARK-55811: Catch NonFatal instead of UnresolvedException when calling " +
+    "nodeWithOutputColumnsString")(Seq("TRACE", "DEBUG", "INFO", "WARN", "ERROR")) { level =>
+    withSQLConf(SQLConf.PLAN_CHANGE_LOG_LEVEL.key -> level) {
+      checkAnswer(sql("SELECT 1L UNION SELECT 1"), Row(1L))
+    }
+  }
+
+  test("SPARK-56035: Introduce `AggregationValidator` for single-pass `Aggregate` validation") {
+    withSQLConf(SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "true") {
+      sql("SELECT col1 + rand() FROM VALUES(1) GROUP BY ALL")
+      sql("SELECT col1 + rand() FROM VALUES(1) GROUP BY 1")
+      sql("SELECT rand() FROM VALUES(1) GROUP BY ALL")
+      sql("SELECT col1 - rand() FROM VALUES(1) GROUP BY ALL")
+    }
+  }
+
+  test("SPARK-57353: CUBE with ORDER BY - single pass resolver (tentative fallback)") {
+    // ORDER BY + grouping analytics throws ExplicitlyUnsupportedResolverFeature in pure
+    // single-pass (SPARK-57346). In tentative mode, the HybridAnalyzer falls back to legacy.
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) as s FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY CUBE(a) ORDER BY s""".stripMargin),
+        Row(1, 30) :: Row(2, 30) :: Row(null, 60) :: Nil)
+    }
+  }
+
+  test("SPARK-57353: ROLLUP with HAVING - single pass resolver (tentative fallback)") {
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY ROLLUP(a) HAVING SUM(b) > 30""".stripMargin),
+        Row(null, 60) :: Nil)
+    }
+  }
+
+  test("SPARK-57353: GROUPING SETS with ORDER BY - single pass resolver (tentative fallback)") {
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      checkAnswer(
+        sql(
+          """SELECT a, b, SUM(b) as s FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY a, b GROUPING SETS ((a, b), (a)) ORDER BY s""".stripMargin),
+        Row(1, 10, 10) :: Row(1, 20, 20) :: Row(1, null, 30) ::
+          Row(2, 30, 30) :: Row(2, null, 30) :: Nil)
+    }
+  }
+
+  test("SPARK-57353: CUBE with NULL grouping columns - single pass resolver (tentative fallback)") {
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) as s FROM VALUES (1,10),(null,20),(2,30) AS t(a,b)
+            |GROUP BY CUBE(a) ORDER BY s""".stripMargin),
+        Row(1, 10) :: Row(null, 20) :: Row(2, 30) :: Row(null, 60) :: Nil)
+    }
+  }
+
+  test("SPARK-57353: ROLLUP with HAVING filtering all rows - single pass resolver" +
+      " (tentative fallback)") {
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY ROLLUP(a) HAVING SUM(b) > 100""".stripMargin),
+        Nil)
+    }
+  }
+
+  test("SPARK-57353: CUBE with multiple aggregates in ORDER BY - single pass resolver" +
+      " (tentative fallback)") {
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) as s, COUNT(b) as c
+            |FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY CUBE(a) ORDER BY COUNT(b), SUM(b)""".stripMargin),
+        Row(2, 30, 1) :: Row(1, 30, 2) :: Row(null, 60, 3) :: Nil)
+    }
+  }
+
+  test("SPARK-57353: multi-column ROLLUP with HAVING - single pass resolver (tentative fallback" +
+      ", SPARK-57346)") {
+    // SPARK-57346: multi-column ROLLUP with HAVING previously produced wrong results (1 row
+    // instead of 4) in pure single-pass. Now throws ExplicitlyUnsupportedResolverFeature so
+    // tentative mode falls back to legacy for correct results.
+    val query =
+      """SELECT a, b, SUM(b) FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+        |GROUP BY ROLLUP(a, b) HAVING SUM(b) > 25""".stripMargin
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      val legacyResult = withSQLConf(
+        SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "false") {
+        sql(query).collect().toSeq
+      }
+      checkAnswer(sql(query), legacyResult)
+    }
+  }
+
+  test("SPARK-57353: missing-aggregation still detected after GROUPING SETS expansion") {
+    // Confirms aggregate-expression validation still fires: column 'b' is not in GROUP BY
+    // ROLLUP(a) and is not aggregated, so MISSING_AGGREGATION should be raised.
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "true") {
+      val ex = intercept[AnalysisException] {
+        sql(
+          """SELECT a, b, SUM(b) FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY ROLLUP(a) HAVING SUM(b) > 10""".stripMargin).collect()
+      }
+      assert(ex.getCondition === "MISSING_AGGREGATION")
+    }
+  }
+
+  test("SPARK-57353: LCA with GROUPING SETS - single pass resolver") {
+    // LCA + grouping analytics throws ExplicitlyUnsupportedResolverFeature in single-pass mode.
+    // In tentative mode, the HybridAnalyzer catches it and falls back to legacy for correct
+    // results.
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false",
+      SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true") {
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) as total, total + 1
+            |FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY CUBE(a) ORDER BY total""".stripMargin),
+        Row(1, 30, 31) :: Row(2, 30, 31) :: Row(null, 60, 61) :: Nil)
+    }
+  }
+
+  test("SPARK-57353: legacy analyzer handles CUBE/ROLLUP/GROUPING SETS correctly") {
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "false") {
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) as s FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY CUBE(a) ORDER BY s""".stripMargin),
+        Row(1, 30) :: Row(2, 30) :: Row(null, 60) :: Nil)
+      checkAnswer(
+        sql(
+          """SELECT a, SUM(b) FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY ROLLUP(a) HAVING SUM(b) > 30""".stripMargin),
+        Row(null, 60) :: Nil)
+    }
+  }
+
+  test("SPARK-57353: nested aggregate with GROUPING SETS is rejected") {
+    // Confirms aggregate-expression validation (nested agg check) still fires with grouping sets.
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "true") {
+      val ex = intercept[AnalysisException] {
+        sql(
+          """SELECT a, SUM(COUNT(b)) FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY CUBE(a)""".stripMargin).collect()
+      }
+      assert(ex.getCondition === "NESTED_AGGREGATE_FUNCTION")
+    }
+  }
+
+  test("SPARK-57353: GROUPING SETS with empty grouping list - all rows") {
+    // GROUPING SETS (()) produces a single grand-total row.
+    withSQLConf(SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED.key -> "true") {
+      QueryTest.checkAnswer(
+        sql(
+          """SELECT SUM(b) as s FROM VALUES (1,10),(1,20),(2,30) AS t(a,b)
+            |GROUP BY a GROUPING SETS (())""".stripMargin),
+        Row(60) :: Nil,
+        checkToRDD = false)
+    }
   }
 }
 

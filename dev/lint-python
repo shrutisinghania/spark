@@ -16,22 +16,20 @@
 # limitations under the License.
 #
 # define test binaries + versions
-FLAKE8_BUILD="flake8"
-MINIMUM_FLAKE8="3.9.0"
-MINIMUM_MYPY="1.8.0"
+RUFF_BUILD="ruff"
+MINIMUM_RUFF="0.14.0"
+MINIMUM_MYPY="1.19.1"
 MYPY_BUILD="mypy"
 PYTEST_BUILD="pytest"
 
 PYTHON_EXECUTABLE="${PYTHON_EXECUTABLE:-python3}"
-
-BLACK_BUILD="$PYTHON_EXECUTABLE -m black"
 
 function exit_with_usage {
   set +x
   echo "lint-python - linter for Python"
   echo ""
   echo "usage:"
-  cl_options="[--compile] [--black] [--custom-pyspark-error] [--flake8] [--mypy] [--mypy-examples] [--mypy-data]"
+  cl_options="[--compile] [--custom-pyspark-error] [--ruff] [--mypy] [--mypy-examples] [--mypy-data]"
   echo "lint-python $cl_options"
   echo ""
   exit 1
@@ -43,14 +41,11 @@ while (( "$#" )); do
     --compile)
       COMPILE_TEST=true
       ;;
-    --black)
-      BLACK_TEST=true
-      ;;
     --custom-pyspark-error)
       PYSPARK_CUSTOM_ERRORS_CHECK_TEST=true
       ;;
-    --flake8)
-      FLAKE8_TEST=true
+    --ruff)
+      RUFF_TEST=true
       ;;
     --mypy)
       MYPY_TEST=true
@@ -69,11 +64,10 @@ while (( "$#" )); do
   shift
 done
 
-if [[ -z "$COMPILE_TEST$BLACK_TEST$PYSPARK_CUSTOM_ERRORS_CHECK_TEST$FLAKE8_TEST$MYPY_TEST$MYPY_EXAMPLES_TEST$MYPY_DATA_TEST" ]]; then
+if [[ -z "$COMPILE_TEST$PYSPARK_CUSTOM_ERRORS_CHECK_TEST$RUFF_TEST$MYPY_TEST$MYPY_EXAMPLES_TEST$MYPY_DATA_TEST" ]]; then
   COMPILE_TEST=true
-  BLACK_TEST=true
   PYSPARK_CUSTOM_ERRORS_CHECK_TEST=true
-  FLAKE8_TEST=true
+  RUFF_TEST=true
   MYPY_TEST=true
   MYPY_EXAMPLES_TEST=true
   MYPY_DATA_TEST=true
@@ -159,11 +153,14 @@ function mypy_data_test {
     fi
 
     PYTEST_REPORT=$( (MYPYPATH=python $PYTEST_BUILD \
-      -c dev/pyproject.toml \
+      -o "python_files=test_*.yml" \
       --rootdir python \
       --mypy-only-local-stub \
       --mypy-ini-file python/mypy.ini \
-      python/pyspark ) 2>&1)
+      python/pyspark/tests/typing \
+      python/pyspark/sql/tests/typing \
+      python/pyspark/ml/tests/typing \
+      ) 2>&1)
 
     PYTEST_STATUS=$?
 
@@ -232,70 +229,56 @@ function mypy_test {
 }
 
 
-function flake8_test {
-    local FLAKE8_VERSION=
-    local EXPECTED_FLAKE8=
-    local FLAKE8_REPORT=
-    local FLAKE8_STATUS=
+function ruff_test {
+    local RUFF_VERSION=
+    local EXPECTED_RUFF=
+    local RUFF_REPORT=
+    local RUFF_STATUS=
 
-    if ! hash "$FLAKE8_BUILD" 2> /dev/null; then
-        echo "The flake8 command was not found. Skipping for now."
+    if ! hash "$RUFF_BUILD" 2> /dev/null; then
+        echo "The ruff command was not found. Skipping for now."
         return
     fi
 
-    _FLAKE8_VERSION=($($FLAKE8_BUILD --version))
-    FLAKE8_VERSION="${_FLAKE8_VERSION[0]}"
-    EXPECTED_FLAKE8="$(satisfies_min_version $FLAKE8_VERSION $MINIMUM_FLAKE8)"
+    _RUFF_VERSION=($($RUFF_BUILD --version))
+    RUFF_VERSION="${_RUFF_VERSION[1]}"
+    EXPECTED_RUFF="$(satisfies_min_version $RUFF_VERSION $MINIMUM_RUFF)"
 
-    if [[ "$EXPECTED_FLAKE8" == "False" ]]; then
+    if [[ "$EXPECTED_RUFF" == "False" ]]; then
         echo "\
-The minimum flake8 version needs to be $MINIMUM_FLAKE8. Your current version is $FLAKE8_VERSION
+The minimum ruff version needs to be $MINIMUM_RUFF. Your current version is $RUFF_VERSION
 
-flake8 checks failed."
+ruff checks failed."
         exit 1
     fi
 
-    echo "starting $FLAKE8_BUILD test..."
-    FLAKE8_REPORT=$( ($FLAKE8_BUILD --append-config dev/tox.ini --count --show-source --statistics .) 2>&1)
-    FLAKE8_STATUS=$?
+    echo "starting $RUFF_BUILD test..."
+    RUFF_REPORT=$( ($RUFF_BUILD check) 2>&1)
+    RUFF_STATUS=$?
 
-    if [ "$FLAKE8_STATUS" -ne 0 ]; then
-        echo "flake8 checks failed:"
-        echo "$FLAKE8_REPORT"
-        echo "$FLAKE8_STATUS"
-        exit "$FLAKE8_STATUS"
+    if [ "$RUFF_STATUS" -ne 0 ]; then
+        echo "ruff checks failed:"
+        echo "$RUFF_REPORT"
+        echo "$RUFF_STATUS"
+        exit "$RUFF_STATUS"
     else
-        echo "flake8 checks passed."
+        echo "ruff checks passed."
         echo
     fi
-}
 
-function black_test {
-    local BLACK_REPORT=
-    local BLACK_STATUS=
+    RUFF_REPORT=$( ($RUFF_BUILD format --diff python/pyspark dev python/packaging python/benchmarks) 2>&1)
+    RUFF_STATUS=$?
 
-    # Skip check if black is not installed.
-    $PYTHON_EXECUTABLE -c 'import black' &> /dev/null
-    if [ $? -ne 0 ]; then
-        echo "The Python library providing 'black' module was not found. Skipping black checks for now."
-        echo
-        return
-    fi
-
-    echo "starting black test..."
-    BLACK_REPORT=$( ($BLACK_BUILD  --config dev/pyproject.toml --check python/pyspark dev python/packaging) 2>&1)
-    BLACK_STATUS=$?
-
-    if [ "$BLACK_STATUS" -ne 0 ]; then
-        echo "black checks failed:"
-        echo "$BLACK_REPORT"
-        echo "Please run 'dev/reformat-python' script."
-        echo "$BLACK_STATUS"
-        exit "$BLACK_STATUS"
+    if [ "$RUFF_STATUS" -ne 0 ]; then
+        echo "ruff format checks failed:"
+        echo "$RUFF_REPORT"
+        echo "$RUFF_STATUS"
+        exit "$RUFF_STATUS"
     else
-        echo "black checks passed."
+        echo "ruff format checks passed."
         echo
     fi
+
 }
 
 function pyspark_custom_errors_check_test {
@@ -326,14 +309,11 @@ PYTHON_SOURCE="$(git ls-files '*.py')"
 if [[ "$COMPILE_TEST" == "true" ]]; then
     compile_python_test "$PYTHON_SOURCE"
 fi
-if [[ "$BLACK_TEST" == "true" ]]; then
-    black_test
-fi
 if [[ "$PYSPARK_CUSTOM_ERRORS_CHECK_TEST" == "true" ]]; then
     pyspark_custom_errors_check_test
 fi
-if [[ "$FLAKE8_TEST" == "true" ]]; then
-    flake8_test
+if [[ "$RUFF_TEST" == "true" ]]; then
+    ruff_test
 fi
 if [[ "$MYPY_TEST" == "true" ]] || [[ "$MYPY_EXAMPLES_TEST" == "true" ]] || [[ "$MYPY_DATA_TEST" == "true" ]]; then
     mypy_test

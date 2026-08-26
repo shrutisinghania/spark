@@ -38,10 +38,14 @@ private[ui] class SparkConnectServerSessionPage(parent: SparkConnectServerTab)
   def render(request: HttpServletRequest): Seq[Node] = {
     val sessionId = request.getParameter("id")
     require(sessionId != null && sessionId.nonEmpty, "Missing id parameter")
+    // userId arrives as a base64url token; see ConnectUiUtils.
+    val userIdParam = request.getParameter("userId")
+    require(userIdParam != null, "Missing userId parameter")
+    val userId = ConnectUiUtils.decodeUserId(userIdParam)
 
     val content = store.synchronized { // make sure all parts in this page are consistent
       store
-        .getSession(sessionId)
+        .getSession(userId, sessionId)
         .map { sessionStat =>
           generateBasicStats(sessionId) ++
             <br/> ++
@@ -56,7 +60,7 @@ private[ui] class SparkConnectServerSessionPage(parent: SparkConnectServerTab)
             {sessionStat.totalExecution}
             Request(s)
           </h4> ++
-            generateSQLStatsTable(request, sessionStat.sessionId)
+            generateSQLStatsTable(request, sessionStat.userId, sessionStat.sessionId)
         }
         .getOrElse(<div>No information to display for session {sessionId}</div>)
     }
@@ -80,9 +84,12 @@ private[ui] class SparkConnectServerSessionPage(parent: SparkConnectServerTab)
   }
 
   /** Generate stats of batch statements of the Spark Connect server */
-  private def generateSQLStatsTable(request: HttpServletRequest, sessionID: String): Seq[Node] = {
+  private def generateSQLStatsTable(
+      request: HttpServletRequest,
+      userId: String,
+      sessionId: String): Seq[Node] = {
     val executionList = store.getExecutionList
-      .filter(_.sessionId == sessionID)
+      .filter(exec => exec.userId == userId && exec.sessionId == sessionId)
     val numStatement = executionList.size
     val table = if (numStatement > 0) {
 
@@ -103,7 +110,7 @@ private[ui] class SparkConnectServerSessionPage(parent: SparkConnectServerTab)
             showSessionLink = false).table(sqlTablePage))
       } catch {
         case e @ (_: IllegalArgumentException | _: IndexOutOfBoundsException) =>
-          Some(<div class="alert alert-error">
+          Some(<div class="alert alert-danger">
             <p>Error while rendering job table:</p>
             <pre>
               {Utils.exceptionString(e)}
@@ -114,15 +121,16 @@ private[ui] class SparkConnectServerSessionPage(parent: SparkConnectServerTab)
       None
     }
     val content =
-      <span id="sqlsessionstat" class="collapse-aggregated-sqlsessionstat collapse-table"
-            onClick="collapseTable('collapse-aggregated-sqlsessionstat',
-                'aggregated-sqlsessionstat')">
+      <span id="sqlsessionstat" class="collapse-table" data-bs-toggle="collapse"
+            data-bs-target="#aggregated-sqlsessionstat"
+            aria-expanded="true" aria-controls="aggregated-sqlsessionstat"
+            data-collapse-name="collapse-aggregated-sqlsessionstat">
         <h4>
           <span class="collapse-table-arrow arrow-open"></span>
           <a>Request Statistics</a>
         </h4>
       </span> ++
-        <div class="aggregated-sqlsessionstat collapsible-table">
+        <div class="collapsible-table collapse show" id="aggregated-sqlsessionstat">
           {table.getOrElse("No statistics have been generated yet.")}
         </div>
 

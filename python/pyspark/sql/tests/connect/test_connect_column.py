@@ -15,52 +15,54 @@
 # limitations under the License.
 #
 
-import decimal
 import datetime
+import decimal
 
+from pyspark.errors import PySparkTypeError, PySparkValueError
 from pyspark.sql.types import (
-    Row,
-    StructField,
-    StructType,
+    BinaryType,
+    BooleanType,
+    ByteType,
+    DateType,
+    DayTimeIntervalType,
+    DecimalType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
     MapType,
     NullType,
-    DateType,
-    TimeType,
-    TimestampType,
-    TimestampNTZType,
-    ByteType,
-    BinaryType,
+    Row,
     ShortType,
-    IntegerType,
-    FloatType,
-    DayTimeIntervalType,
     StringType,
-    DoubleType,
-    LongType,
-    DecimalType,
-    BooleanType,
+    StructField,
+    StructType,
+    TimestampNTZType,
+    TimestampType,
+    TimeType,
 )
-from pyspark.errors import PySparkTypeError, PySparkValueError
-from pyspark.testing.connectutils import should_test_connect, ReusedMixedTestCase
+from pyspark.testing import assertDataFrameEqual
+from pyspark.testing.connectutils import ReusedMixedTestCase, should_test_connect
 from pyspark.testing.pandasutils import PandasOnSparkTestUtils
 
 if should_test_connect:
     import pandas as pd
+
+    from pyspark.errors.exceptions.connect import SparkConnectException
     from pyspark.sql import functions as SF
     from pyspark.sql.connect import functions as CF
     from pyspark.sql.connect.column import Column
     from pyspark.sql.connect.expressions import DistributedSequenceID, LiteralExpression
     from pyspark.util import (
-        JVM_BYTE_MIN,
         JVM_BYTE_MAX,
-        JVM_SHORT_MIN,
-        JVM_SHORT_MAX,
-        JVM_INT_MIN,
+        JVM_BYTE_MIN,
         JVM_INT_MAX,
-        JVM_LONG_MIN,
+        JVM_INT_MIN,
         JVM_LONG_MAX,
+        JVM_LONG_MIN,
+        JVM_SHORT_MAX,
+        JVM_SHORT_MIN,
     )
-    from pyspark.errors.exceptions.connect import SparkConnectException
 
 
 class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
@@ -136,12 +138,35 @@ class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN_OR_INT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column or int",
                 "arg_name": "startPos",
                 "arg_type": "float",
             },
         )
+
+    def test_select_column_replaced_by_withcolumn(self):
+        from pyspark.errors.exceptions.connect import AnalysisException
+
+        # Selecting the original DataFrame's column after `withColumn` replaces it
+        # with a cast: the plan-id-tagged reference must resolve to the overwritten
+        # alias rather than the inner column. With non-strict DataFrame column
+        # resolution, the analyzer falls back to name-based resolution for the
+        # tagged attribute and the query succeeds.
+        with self.connect_conf({"spark.sql.analyzer.strictDataFrameColumnResolution": False}):
+            df = self.connect.sql("SELECT 123 AS c")
+            df.withColumn("c", CF.col("c").cast("string")).select(df["c"]).collect()
+
+        # Under strict DataFrame column resolution (the default), the tagged
+        # reference cannot be resolved: the resolved attribute from the original
+        # plan is filtered out at the shadowing `withColumn` Project, and
+        # name-based fallback is disabled, so analysis fails with
+        # CANNOT_RESOLVE_DATAFRAME_COLUMN.
+        with self.connect_conf({"spark.sql.analyzer.strictDataFrameColumnResolution": True}):
+            df = self.connect.sql("SELECT 123 AS c")
+            with self.assertRaisesRegex(AnalysisException, "CANNOT_RESOLVE_DATAFRAME_COLUMN"):
+                df.withColumn("c", CF.col("c").cast("string")).select(df["c"]).collect()
 
     def test_column_with_null(self):
         # SPARK-41751: test isNull, isNotNull, eqNullSafe
@@ -553,8 +578,12 @@ class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_DATATYPE_OR_STR",
-            messageParameters={"arg_name": "dataType", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "DataType or str",
+                "arg_name": "dataType",
+                "arg_type": "int",
+            },
         )
 
     def test_isin(self):
@@ -910,8 +939,12 @@ class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "fieldName", "arg_type": "Column"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "str",
+                "arg_name": "fieldName",
+                "arg_type": "Column",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -919,8 +952,8 @@ class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_COLUMN",
-            messageParameters={"arg_name": "col", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "Column", "arg_name": "col", "arg_type": "int"},
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -928,8 +961,8 @@ class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_STR",
-            messageParameters={"arg_name": "fieldName", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={"expected_type": "str", "arg_name": "fieldName", "arg_type": "int"},
         )
 
         with self.assertRaises(PySparkValueError) as pe:
@@ -996,8 +1029,7 @@ class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
         sdf = self.spark.createDataFrame(data)
         sdf1 = sdf.withColumn("a", sdf["a"].withField("b", SF.lit(3))).select("a.b")
 
-        self.assertEqual(cdf1.schema, sdf1.schema)
-        self.assertEqual(cdf1.collect(), sdf1.collect())
+        assertDataFrameEqual(cdf1, sdf1)
 
     def test_distributed_sequence_id(self):
         cdf = self.connect.range(10)
@@ -1044,16 +1076,35 @@ class SparkConnectColumnTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
         )
         self.assertEqual(cdf.columns, sdf.columns)
 
+    def test_transform(self):
+        # Test with built-in functions
+        cdf = self.connect.createDataFrame([("  hello  ",), ("  world  ",)], ["text"])
+        sdf = self.spark.createDataFrame([("  hello  ",), ("  world  ",)], ["text"])
+
+        self.assert_eq(
+            cdf.select(cdf.text.transform(CF.trim).transform(CF.upper)).toPandas(),
+            sdf.select(sdf.text.transform(SF.trim).transform(SF.upper)).toPandas(),
+        )
+
+        # Test with lambda functions
+        cdf = self.connect.createDataFrame([(10,), (20,), (30,)], ["value"])
+        sdf = self.spark.createDataFrame([(10,), (20,), (30,)], ["value"])
+
+        self.assert_eq(
+            cdf.select(
+                cdf.value.transform(lambda c: c + 5)
+                .transform(lambda c: c * 2)
+                .transform(lambda c: c - 10)
+            ).toPandas(),
+            sdf.select(
+                sdf.value.transform(lambda c: c + 5)
+                .transform(lambda c: c * 2)
+                .transform(lambda c: c - 10)
+            ).toPandas(),
+        )
+
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.connect.test_connect_column import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

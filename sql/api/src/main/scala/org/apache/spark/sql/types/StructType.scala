@@ -43,8 +43,8 @@ import org.apache.spark.util.{SparkCollectionUtils, SparkStringUtils}
  * }}}
  * For a [[StructType]] object, one or multiple [[StructField]]s can be extracted by names. If
  * multiple [[StructField]]s are extracted, a [[StructType]] object will be returned. If a
- * provided name does not have a matching field, it will be ignored. For the case of extracting a
- * single [[StructField]], a `null` will be returned.
+ * provided name does not have a matching field, an `IllegalArgumentException` is thrown, whether
+ * extracting a single [[StructField]] or multiple.
  *
  * Scala Example:
  * {{{
@@ -122,6 +122,10 @@ case class StructType(fields: Array[StructField]) extends DataType with Seq[Stru
   private lazy val nameToIndex: Map[String, Int] = SparkCollectionUtils.toMapWithIndex(fieldNames)
   private lazy val nameToIndexCaseInsensitive: CaseInsensitiveMap[Int] =
     CaseInsensitiveMap[Int](nameToIndex.toMap)
+  lazy val nameToDataType: collection.immutable.Map[String, DataType] =
+    fields.map(f => f.name -> f.dataType).toMap
+  lazy val nameToDataTypeCaseInsensitive: CaseInsensitiveMap[DataType] =
+    CaseInsensitiveMap[DataType](nameToDataType)
 
   override def equals(that: Any): Boolean = {
     that match {
@@ -613,7 +617,7 @@ object StructType extends AbstractDataType {
             .map { case rightField @ StructField(rightName, rightType, rightNullable, _) =>
               try {
                 leftField.copy(
-                  dataType = merge(leftType, rightType),
+                  dataType = merge(leftType, rightType, caseSensitive),
                   nullable = leftNullable || rightNullable)
               } catch {
                 case NonFatal(e) =>

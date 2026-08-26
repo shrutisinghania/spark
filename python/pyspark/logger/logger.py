@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -16,11 +15,11 @@
 # limitations under the License.
 #
 
-import logging
 import json
-import traceback
+import logging
 import sys
-from typing import cast, Mapping, Optional, TYPE_CHECKING
+import traceback
+from typing import TYPE_CHECKING, Mapping, Optional, cast
 
 if TYPE_CHECKING:
     from logging import _ArgsType, _ExcInfoType
@@ -50,6 +49,10 @@ class JSONFormatter(logging.Formatter):
 
     default_msec_format = "%s.%03d"
 
+    def __init__(self, ensure_ascii: bool = False):
+        super().__init__()
+        self._ensure_ascii = ensure_ascii
+
     def format(self, record: logging.LogRecord) -> str:
         """
         Format the specified record as a JSON string.
@@ -69,7 +72,7 @@ class JSONFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
-            "context": record.__dict__.get("kwargs", {}),
+            "context": record.__dict__.get("context", {}),
         }
         if record.exc_info:
             exc_type, exc_value, exc_tb = record.exc_info
@@ -89,7 +92,7 @@ class JSONFormatter(logging.Formatter):
                 "msg": str(exc_value),
                 "stacktrace": structured_stacktrace,
             }
-        return json.dumps(log_entry, ensure_ascii=False)
+        return json.dumps(log_entry, ensure_ascii=self._ensure_ascii)
 
 
 class PySparkLogger(logging.Logger):
@@ -136,7 +139,19 @@ class PySparkLogger(logging.Logger):
     """
 
     def __init__(self, name: str = "PySparkLogger"):
+        from pyspark.logger.worker_io import JSONFormatterWithMarker
+
         super().__init__(name, level=logging.WARN)
+
+        root_logger = logging.getLogger()
+        if any(
+            isinstance(h, logging.StreamHandler)
+            and isinstance(h.formatter, JSONFormatterWithMarker)
+            for h in root_logger.handlers
+        ):
+            # Likely in the `capture_outputs` context, so don't add a handler
+            return
+
         _handler = logging.StreamHandler()
         self.addHandler(_handler)
 
@@ -291,7 +306,7 @@ class PySparkLogger(logging.Logger):
             msg=msg,
             args=args,
             exc_info=exc_info,
-            extra={"kwargs": kwargs},
+            extra={"context": kwargs},
             stack_info=stack_info,
             stacklevel=stacklevel,
         )
@@ -299,10 +314,11 @@ class PySparkLogger(logging.Logger):
 
 def _test() -> None:
     import doctest
+
     import pyspark.logger.logger
 
     globs = pyspark.logger.logger.__dict__.copy()
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.logger.logger, globs=globs, optionflags=doctest.ELLIPSIS
     )
 

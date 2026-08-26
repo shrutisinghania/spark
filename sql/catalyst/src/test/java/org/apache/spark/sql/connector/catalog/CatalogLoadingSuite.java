@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.connector.catalog;
 
+import org.apache.spark.network.util.JavaUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -24,6 +25,7 @@ import org.apache.spark.SparkException;
 import org.apache.spark.sql.internal.SQLConf;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.apache.spark.util.Utils;
+
 public class CatalogLoadingSuite {
   @Test
   public void testLoad() throws SparkException {
@@ -58,6 +60,7 @@ public class CatalogLoadingSuite {
     conf.setConfString("spark.sql.catalog.test-name", TestCatalogPlugin.class.getCanonicalName());
     conf.setConfString("spark.sql.catalog.test-name.name", "not-catalog-name");
     conf.setConfString("spark.sql.catalog.test-name.kEy", "valUE");
+    conf.setConfString("spark.sql.catalog.test-name.osName", "${system:os.name}");
 
     CatalogPlugin plugin = Catalogs.load("test-name", conf);
     Assertions.assertNotNull(plugin,"Should instantiate a non-null plugin");
@@ -66,11 +69,13 @@ public class CatalogLoadingSuite {
 
     TestCatalogPlugin testPlugin = (TestCatalogPlugin) plugin;
 
-    Assertions.assertEquals(2, testPlugin.options.size(), "Options should contain only two keys");
+    Assertions.assertEquals(3, testPlugin.options.size(), "Options should contain only three keys");
     Assertions.assertEquals("not-catalog-name", testPlugin.options.get("name"),
       "Options should contain correct value for name (not overwritten)");
     Assertions.assertEquals("valUE", testPlugin.options.get("key"),
       "Options should contain correct value for key");
+    Assertions.assertEquals(JavaUtils.osName, testPlugin.options.get("osName"),
+      "Options should contain correct substitution for value");
   }
 
   @Test
@@ -92,7 +97,7 @@ public class CatalogLoadingSuite {
     SparkException exc = Assertions.assertThrows(SparkException.class,
       () -> Catalogs.load("missing", conf));
 
-    Assertions.assertTrue(exc.getMessage().contains("Cannot find catalog plugin class"),
+    Assertions.assertEquals("CANNOT_LOAD_CATALOG.PLUGIN_CLASS_NOT_FOUND", exc.getCondition(),
       "Should complain that the class is not found");
     Assertions.assertTrue(exc.getMessage().contains("missing"),
       "Should identify the catalog by name");
@@ -122,7 +127,7 @@ public class CatalogLoadingSuite {
     SparkException exc = Assertions.assertThrows(SparkException.class,
       () -> Catalogs.load("invalid", conf));
 
-    Assertions.assertTrue(exc.getMessage().contains("does not implement CatalogPlugin"),
+    Assertions.assertEquals("CANNOT_LOAD_CATALOG.NOT_A_CATALOG_PLUGIN", exc.getCondition(),
       "Should complain that class does not implement CatalogPlugin");
     Assertions.assertTrue(exc.getMessage().contains("invalid"),
       "Should identify the catalog by name");
@@ -139,8 +144,7 @@ public class CatalogLoadingSuite {
     SparkException exc = Assertions.assertThrows(SparkException.class,
       () -> Catalogs.load("invalid", conf));
 
-    Assertions.assertTrue(
-      exc.getMessage().contains("Failed during instantiating constructor for catalog"),
+    Assertions.assertEquals("CANNOT_LOAD_CATALOG.CONSTRUCTOR_FAILURE", exc.getCondition(),
       "Should identify the constructor error");
     Assertions.assertTrue(exc.getCause().getMessage().contains("Expected failure"),
       "Should have expected error message");
@@ -155,9 +159,42 @@ public class CatalogLoadingSuite {
     SparkException exc = Assertions.assertThrows(SparkException.class,
       () -> Catalogs.load("invalid", conf));
 
-    Assertions.assertTrue(
-      exc.getMessage().contains("Failed to call public no-arg constructor for catalog"),
+    Assertions.assertEquals("CANNOT_LOAD_CATALOG.CONSTRUCTOR_NOT_ACCESSIBLE", exc.getCondition(),
       "Should complain that no public constructor is provided");
+    Assertions.assertTrue(exc.getMessage().contains("invalid"),
+      "Should identify the catalog by name");
+    Assertions.assertTrue(exc.getMessage().contains(invalidClassName),
+      "Should identify the class");
+  }
+
+  @Test
+  public void testLoadNoNoArgConstructorCatalogPlugin() {
+    SQLConf conf = new SQLConf();
+    String invalidClassName = NoNoArgConstructorCatalogPlugin.class.getCanonicalName();
+    conf.setConfString("spark.sql.catalog.invalid", invalidClassName);
+
+    SparkException exc = Assertions.assertThrows(SparkException.class,
+      () -> Catalogs.load("invalid", conf));
+
+    Assertions.assertEquals("CANNOT_LOAD_CATALOG.CONSTRUCTOR_NOT_FOUND", exc.getCondition(),
+      "Should complain that no public no-arg constructor is found");
+    Assertions.assertTrue(exc.getMessage().contains("invalid"),
+      "Should identify the catalog by name");
+    Assertions.assertTrue(exc.getMessage().contains(invalidClassName),
+      "Should identify the class");
+  }
+
+  @Test
+  public void testLoadAbstractCatalogPlugin() {
+    SQLConf conf = new SQLConf();
+    String invalidClassName = AbstractCatalogPlugin.class.getCanonicalName();
+    conf.setConfString("spark.sql.catalog.invalid", invalidClassName);
+
+    SparkException exc = Assertions.assertThrows(SparkException.class,
+      () -> Catalogs.load("invalid", conf));
+
+    Assertions.assertEquals("CANNOT_LOAD_CATALOG.ABSTRACT_CLASS", exc.getCondition(),
+      "Should complain that the class is abstract");
     Assertions.assertTrue(exc.getMessage().contains("invalid"),
       "Should identify the catalog by name");
     Assertions.assertTrue(exc.getMessage().contains(invalidClassName),
@@ -210,6 +247,25 @@ class AccessErrorCatalogPlugin implements CatalogPlugin { // no public construct
   @Override
   public String name() {
     return null;
+  }
+}
+
+class NoNoArgConstructorCatalogPlugin implements CatalogPlugin { // no public no-arg constructor
+  NoNoArgConstructorCatalogPlugin(String arg) {
+  }
+
+  @Override
+  public void initialize(String name, CaseInsensitiveStringMap options) {
+  }
+
+  @Override
+  public String name() {
+    return null;
+  }
+}
+
+abstract class AbstractCatalogPlugin implements CatalogPlugin { // abstract, cannot be instantiated
+  AbstractCatalogPlugin() {
   }
 }
 

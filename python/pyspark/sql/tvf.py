@@ -362,7 +362,7 @@ class TableValuedFunction:
         |value1|value2|
         +------+------+
         """
-        from pyspark.sql.classic.column import _to_seq, _to_java_column
+        from pyspark.sql.classic.column import _to_java_column, _to_seq
 
         if len(fields) == 0:
             raise PySparkValueError(
@@ -507,7 +507,7 @@ class TableValuedFunction:
         |   3|NULL|
         +----+----+
         """
-        from pyspark.sql.classic.column import _to_seq, _to_java_column
+        from pyspark.sql.classic.column import _to_java_column, _to_seq
 
         sc = self._sparkSession.sparkContext
         return DataFrame(
@@ -550,12 +550,8 @@ class TableValuedFunction:
 
         Examples
         --------
-        >>> spark.tvf.sql_keywords().show()
-        +-------------+--------+
-        |      keyword|reserved|
-        +-------------+--------+
-        ...
-        +-------------+--------+...
+        >>> spark.tvf.sql_keywords().columns
+        ['keyword', 'reserved']
         """
         return self._fn("sql_keywords")
 
@@ -677,6 +673,45 @@ class TableValuedFunction:
         """
         return self._fn("variant_explode_outer", input)
 
+    def python_worker_logs(self) -> DataFrame:
+        """
+        Returns a DataFrame of logs collected from Python workers.
+
+        .. versionadded:: 4.1.0
+
+        Returns
+        -------
+        :class:`DataFrame`
+
+        Examples
+        --------
+        >>> import pyspark.sql.functions as sf
+        >>> import logging
+        >>>
+        >>> @sf.udf("string")
+        ... def my_udf(x):
+        ...     logger = logging.getLogger("my_custom_logger")
+        ...     logger.warning("This is a warning")
+        ...     return str(x)
+        ...
+        >>> spark.conf.set("spark.sql.pyspark.worker.logging.enabled", "true")
+        >>> spark.range(1).select(my_udf("id")).show()
+        +----------+
+        |my_udf(id)|
+        +----------+
+        |         0|
+        +----------+
+        >>> spark.tvf.python_worker_logs().select(
+        ...     "level", "msg", "context", "logger"
+        ... ).show(truncate=False)  # doctest: +SKIP
+        +-------+-----------------+---------------------+----------------+
+        |level  |msg              |context              |logger          |
+        +-------+-----------------+---------------------+----------------+
+        |WARNING|This is a warning|{func_name -> my_udf}|my_custom_logger|
+        +-------+-----------------+---------------------+----------------+
+        """
+        return self._fn("python_worker_logs")
+
     def _fn(self, functionName: str, *args: Column) -> DataFrame:
         from pyspark.sql.classic.column import _to_java_column
 
@@ -689,16 +724,17 @@ class TableValuedFunction:
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
+
     import pyspark.sql.tvf
 
     os.chdir(os.environ["SPARK_HOME"])
 
     globs = pyspark.sql.tvf.__dict__.copy()
     globs["spark"] = SparkSession.builder.master("local[4]").appName("sql.tvf tests").getOrCreate()
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.tvf,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

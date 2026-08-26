@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import inspect
 import uuid
-from typing import Any, Callable, Iterator, List, Mapping, TYPE_CHECKING, Tuple, Union, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Mapping, Optional, Tuple, Union
 
 import numpy as np
 
@@ -27,8 +27,9 @@ try:
 except ImportError:
     pass  # Let it throw a better error message later when the API is invoked.
 
-from pyspark.sql.functions import pandas_udf
+from pyspark.ml.util import try_remote_functions
 from pyspark.sql.column import Column
+from pyspark.sql.functions import pandas_udf
 from pyspark.sql.types import (
     ArrayType,
     ByteType,
@@ -41,7 +42,6 @@ from pyspark.sql.types import (
     StringType,
     StructType,
 )
-from pyspark.ml.util import try_remote_functions
 
 if TYPE_CHECKING:
     from pyspark.sql._typing import UserDefinedFunctionLike
@@ -217,9 +217,11 @@ def _validate_and_transform_multiple_inputs(
     if input_shapes:
         if len(input_shapes) == num_input_cols:
             multi_inputs = [
-                np.vstack(v).reshape([-1] + input_shapes[i])  # type: ignore
-                if input_shapes[i]
-                else v
+                (
+                    np.vstack(v).reshape([-1] + input_shapes[i])  # type: ignore
+                    if input_shapes[i]
+                    else v
+                )
                 for i, v in enumerate(multi_inputs)
             ]
             if not all([len(x) == len(batch) for x in multi_inputs]):
@@ -241,7 +243,7 @@ def _validate_and_transform_single_input(
         # tensor columns
         if len(batch.columns) == 1:
             # one tensor column and one expected input, vstack rows
-            single_input = np.vstack(batch.iloc[:, 0])
+            single_input = np.vstack(batch.iloc[:, 0])  # type: ignore[call-overload]
         else:
             raise ValueError(
                 "Multiple input columns found, but model expected a single "
@@ -824,19 +826,17 @@ def predict_batch_udf(
                     raise ValueError(msg.format(num_expected_cols, num_input_cols))
 
                 # return transformed predictions to Spark
-                yield _validate_and_transform_prediction_result(
-                    preds, num_input_rows, return_type
-                )  # type: ignore
+                yield _validate_and_transform_prediction_result(preds, num_input_rows, return_type)  # type: ignore
 
     return pandas_udf(predict, return_type)  # type: ignore[call-overload]
 
 
 def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
-    import pyspark.ml.functions
     import sys
 
+    import pyspark.ml.functions
+    from pyspark.sql import SparkSession
     from pyspark.sql.pandas.utils import (
         require_minimum_pandas_version,
         require_minimum_pyarrow_version,
@@ -858,7 +858,7 @@ def _test() -> None:
     globs["sc"] = sc
     globs["spark"] = spark
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.ml.functions,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

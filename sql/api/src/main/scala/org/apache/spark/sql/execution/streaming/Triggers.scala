@@ -19,7 +19,9 @@ package org.apache.spark.sql.execution.streaming
 
 import java.util.concurrent.TimeUnit
 
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration.{Duration, MINUTES}
+
+import org.json4s.DefaultFormats
 
 import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.MICROS_PER_DAY
@@ -112,5 +114,40 @@ object ContinuousTrigger {
 
   def create(interval: Long, unit: TimeUnit): ContinuousTrigger = {
     ContinuousTrigger(convert(interval, unit))
+  }
+}
+
+/**
+ * A [[Trigger]] that runs a query in real time mode.
+ * @param batchDurationMs
+ *   The duration of each batch in milliseconds. This must be strictly positive.
+ */
+case class RealTimeTrigger(batchDurationMs: Long) extends Trigger {
+  require(batchDurationMs > 0, "the batch duration should not be negative")
+
+  implicit val defaultFormats: DefaultFormats = DefaultFormats
+}
+
+object RealTimeTrigger {
+  import Triggers._
+
+  def apply(): RealTimeTrigger = {
+    RealTimeTrigger(Duration(5, MINUTES))
+  }
+
+  def apply(batchDuration: String): RealTimeTrigger = {
+    RealTimeTrigger(convert(batchDuration))
+  }
+
+  def apply(batchDuration: Duration): RealTimeTrigger = {
+    RealTimeTrigger(convert(batchDuration))
+  }
+
+  def create(batchDuration: String): RealTimeTrigger = {
+    apply(batchDuration)
+  }
+
+  def create(batchDuration: Long, unit: TimeUnit): RealTimeTrigger = {
+    RealTimeTrigger(convert(batchDuration, unit))
   }
 }

@@ -47,6 +47,7 @@ import org.apache.spark.sql.catalyst.expressions.{
 }
 import org.apache.spark.sql.types.{
   AnsiIntervalType,
+  AnyTimestampNanoType,
   AnyTimestampTypeExpression,
   CalendarIntervalType,
   DatetimeType,
@@ -63,7 +64,7 @@ import org.apache.spark.sql.types.DayTimeIntervalType.DAY
 
 object BinaryArithmeticWithDatetimeResolver {
   def resolve(expr: Expression): Expression = expr match {
-    case a @ Add(l, r, mode) =>
+    case a @ Add(l, r, context) =>
       (l.dataType, r.dataType) match {
         case (DateType, DayTimeIntervalType(DAY, DAY)) => DateAdd(l, ExtractANSIIntervalDays(r))
         case (DateType, _: DayTimeIntervalType) => TimestampAddInterval(Cast(l, TimestampType), r)
@@ -75,6 +76,10 @@ object BinaryArithmeticWithDatetimeResolver {
           TimestampAddYMInterval(l, r)
         case (_: YearMonthIntervalType, TimestampType | TimestampNTZType) =>
           TimestampAddYMInterval(r, l)
+        case (_: AnyTimestampNanoType, _: YearMonthIntervalType) =>
+          TimestampAddYMInterval(l, r)
+        case (_: YearMonthIntervalType, _: AnyTimestampNanoType) =>
+          TimestampAddYMInterval(r, l)
         case (CalendarIntervalType, CalendarIntervalType) |
              (_: DayTimeIntervalType, _: DayTimeIntervalType) =>
           a
@@ -83,7 +88,7 @@ object BinaryArithmeticWithDatetimeResolver {
         case (_: AnsiIntervalType, _: NullType) =>
           a.copy(right = Cast(a.right, a.left.dataType))
         case (DateType, CalendarIntervalType) =>
-          DateAddInterval(l, r, ansiEnabled = mode == EvalMode.ANSI)
+          DateAddInterval(l, r, ansiEnabled = context.evalMode == EvalMode.ANSI)
         case (_: TimeType, _: DayTimeIntervalType) => TimeAddInterval(l, r)
         case (_: DatetimeType, _: NullType) =>
           a.copy(right = Cast(a.right, DayTimeIntervalType.DEFAULT))
@@ -93,24 +98,29 @@ object BinaryArithmeticWithDatetimeResolver {
         case (_, CalendarIntervalType | _: DayTimeIntervalType) =>
           Cast(TimestampAddInterval(l, r), l.dataType)
         case (CalendarIntervalType, DateType) =>
-          DateAddInterval(r, l, ansiEnabled = mode == EvalMode.ANSI)
+          DateAddInterval(r, l, ansiEnabled = context.evalMode == EvalMode.ANSI)
         case (CalendarIntervalType | _: DayTimeIntervalType, _) =>
           Cast(TimestampAddInterval(r, l), r.dataType)
         case (DateType, dt) if dt != StringType => DateAdd(l, r)
         case (dt, DateType) if dt != StringType => DateAdd(r, l)
         case _ => a
       }
-    case s @ Subtract(l, r, mode) =>
+    case s @ Subtract(l, r, context) =>
       (l.dataType, r.dataType) match {
         case (DateType, DayTimeIntervalType(DAY, DAY)) =>
-          DateAdd(l, UnaryMinus(ExtractANSIIntervalDays(r), mode == EvalMode.ANSI))
+          DateAdd(l, UnaryMinus(ExtractANSIIntervalDays(r), context.evalMode == EvalMode.ANSI))
         case (DateType, _: DayTimeIntervalType) =>
           DatetimeSub(l, r,
-            TimestampAddInterval(Cast(l, TimestampType), UnaryMinus(r, mode == EvalMode.ANSI)))
+            TimestampAddInterval(Cast(l, TimestampType),
+              UnaryMinus(r, context.evalMode == EvalMode.ANSI)))
         case (DateType, _: YearMonthIntervalType) =>
-          DatetimeSub(l, r, DateAddYMInterval(l, UnaryMinus(r, mode == EvalMode.ANSI)))
+          DatetimeSub(l, r, DateAddYMInterval(l, UnaryMinus(r, context.evalMode == EvalMode.ANSI)))
         case (TimestampType | TimestampNTZType, _: YearMonthIntervalType) =>
-          DatetimeSub(l, r, TimestampAddYMInterval(l, UnaryMinus(r, mode == EvalMode.ANSI)))
+          DatetimeSub(l, r, TimestampAddYMInterval(l,
+            UnaryMinus(r, context.evalMode == EvalMode.ANSI)))
+        case (_: AnyTimestampNanoType, _: YearMonthIntervalType) =>
+          DatetimeSub(l, r, TimestampAddYMInterval(l,
+            UnaryMinus(r, context.evalMode == EvalMode.ANSI)))
         case (CalendarIntervalType, CalendarIntervalType) |
              (_: DayTimeIntervalType, _: DayTimeIntervalType) =>
           s
@@ -124,37 +134,39 @@ object BinaryArithmeticWithDatetimeResolver {
             r,
             DateAddInterval(
               l,
-              UnaryMinus(r, mode == EvalMode.ANSI),
-              ansiEnabled = mode == EvalMode.ANSI
+              UnaryMinus(r, context.evalMode == EvalMode.ANSI),
+              ansiEnabled = context.evalMode == EvalMode.ANSI
             )
           )
         case (_: TimeType, _: DayTimeIntervalType) =>
-          DatetimeSub(l, r, TimeAddInterval(l, UnaryMinus(r, mode == EvalMode.ANSI)))
+          DatetimeSub(l, r, TimeAddInterval(l, UnaryMinus(r, context.evalMode == EvalMode.ANSI)))
         case (_, CalendarIntervalType | _: DayTimeIntervalType) =>
           Cast(DatetimeSub(l, r,
-            TimestampAddInterval(l, UnaryMinus(r, mode == EvalMode.ANSI))), l.dataType)
+            TimestampAddInterval(l, UnaryMinus(r, context.evalMode == EvalMode.ANSI))), l.dataType)
         case _
           if AnyTimestampTypeExpression.unapply(l) ||
-            AnyTimestampTypeExpression.unapply(r) =>
+            AnyTimestampTypeExpression.unapply(r) ||
+            AnyTimestampNanoType.acceptsType(l.dataType) ||
+            AnyTimestampNanoType.acceptsType(r.dataType) =>
           SubtractTimestamps(l, r)
         case (_, DateType) => SubtractDates(l, r)
         case (DateType, dt) if dt != StringType => DateSub(l, r)
         case (_: TimeType, _: TimeType) => SubtractTimes(l, r)
         case _ => s
       }
-    case m @ Multiply(l, r, mode) =>
+    case m @ Multiply(l, r, context) =>
       (l.dataType, r.dataType) match {
-        case (CalendarIntervalType, _) => MultiplyInterval(l, r, mode == EvalMode.ANSI)
-        case (_, CalendarIntervalType) => MultiplyInterval(r, l, mode == EvalMode.ANSI)
+        case (CalendarIntervalType, _) => MultiplyInterval(l, r, context.evalMode == EvalMode.ANSI)
+        case (_, CalendarIntervalType) => MultiplyInterval(r, l, context.evalMode == EvalMode.ANSI)
         case (_: YearMonthIntervalType, _) => MultiplyYMInterval(l, r)
         case (_, _: YearMonthIntervalType) => MultiplyYMInterval(r, l)
         case (_: DayTimeIntervalType, _) => MultiplyDTInterval(l, r)
         case (_, _: DayTimeIntervalType) => MultiplyDTInterval(r, l)
         case _ => m
       }
-    case d @ Divide(l, r, mode) =>
+    case d @ Divide(l, r, context) =>
       (l.dataType, r.dataType) match {
-        case (CalendarIntervalType, _) => DivideInterval(l, r, mode == EvalMode.ANSI)
+        case (CalendarIntervalType, _) => DivideInterval(l, r, context.evalMode == EvalMode.ANSI)
         case (_: YearMonthIntervalType, _) => DivideYMInterval(l, r)
         case (_: DayTimeIntervalType, _) => DivideDTInterval(l, r)
         case _ => d

@@ -20,6 +20,7 @@ package org.apache.spark.sql.pipelines.utils
 import org.apache.spark.sql.pipelines.graph.{DataflowGraph, DatasetManager, PipelineUpdateContext}
 
 trait BaseCoreExecutionTest extends ExecutionTest {
+  import testImplicits._
 
   /**
    * Materializes the given graph using the provided context.
@@ -27,10 +28,11 @@ trait BaseCoreExecutionTest extends ExecutionTest {
    */
   protected def materializeGraph(
       graph: DataflowGraph,
-      contextOpt: Option[PipelineUpdateContext] = None
+      contextOpt: Option[PipelineUpdateContext] = None,
+      storageRoot: String
   ): DataflowGraph = {
     val contextToUse = contextOpt.getOrElse(
-      TestPipelineUpdateContext(spark = spark, unresolvedGraph = graph)
+      TestPipelineUpdateContext(spark = spark, unresolvedGraph = graph, storageRoot = storageRoot)
     )
     DatasetManager.materializeDatasets(graph, contextToUse)
   }

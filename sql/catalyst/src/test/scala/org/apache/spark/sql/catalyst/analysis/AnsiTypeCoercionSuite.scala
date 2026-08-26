@@ -88,6 +88,7 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     shouldCast(checkedType, DecimalType, DecimalType.SYSTEM_DEFAULT)
     shouldCast(checkedType, NumericType, NumericType.defaultConcreteType)
     shouldCast(checkedType, AnyTimestampType, AnyTimestampType.defaultConcreteType)
+    shouldCast(checkedType, AnyTimeType, AnyTimeType.defaultConcreteType)
     shouldNotCast(checkedType, IntegralType)
   }
 
@@ -143,6 +144,18 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     Seq(DateType, TimestampType, BinaryType, BooleanType).foreach { dt =>
       widenTest(dt, StringType, Some(dt))
     }
+
+    // Nanosecond-precision timestamp types (SPARK-57454).
+    Seq(7, 8, 9).foreach { p =>
+      widenTest(TimestampLTZNanosType(p), StringType, Some(TimestampLTZNanosType(p)))
+      widenTest(TimestampNTZNanosType(p), StringType, Some(TimestampNTZNanosType(p)))
+    }
+    widenTest(TimestampType, TimestampLTZNanosType(9), Some(TimestampLTZNanosType(9)))
+    widenTest(TimestampLTZNanosType(7), TimestampNTZNanosType(9), Some(TimestampLTZNanosType(9)))
+    widenTest(DateType, TimestampNTZNanosType(7), Some(TimestampNTZNanosType(7)))
+    // Two TIME operands widen to the larger fractional-seconds precision (SPARK-57585).
+    widenTest(TimeType(3), TimeType(6), Some(TimeType(6)))
+    widenTest(TimeType(0), TimeType(9), Some(TimeType(9)))
   }
 
   test("tightest common bound for types") {
@@ -174,6 +187,25 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     widenTest(FloatType, FloatType, Some(FloatType))
     widenTest(DoubleType, DoubleType, Some(DoubleType))
 
+    // Geography with same fixed SRIDs.
+    widenTest(GeographyType(4326), GeographyType(4326), Some(GeographyType(4326)))
+    // Geography with mixed SRIDs.
+    widenTest(GeographyType("ANY"), GeographyType("ANY"), Some(GeographyType("ANY")))
+    widenTest(GeographyType("ANY"), GeographyType(4326), Some(GeographyType("ANY")))
+    widenTest(GeographyType(4326), GeographyType("ANY"), Some(GeographyType("ANY")))
+    // Geometry with same fixed SRIDs.
+    widenTest(GeometryType(0), GeometryType(0), Some(GeometryType(0)))
+    widenTest(GeometryType(3857), GeometryType(3857), Some(GeometryType(3857)))
+    widenTest(GeometryType(4326), GeometryType(4326), Some(GeometryType(4326)))
+    // Geometry with different fixed SRIDs.
+    widenTest(GeometryType(0), GeometryType(3857), Some(GeometryType("ANY")))
+    widenTest(GeometryType(3857), GeometryType(4326), Some(GeometryType("ANY")))
+    widenTest(GeometryType(4326), GeometryType(0), Some(GeometryType("ANY")))
+    // Geometry with mixed SRIDs.
+    widenTest(GeometryType("ANY"), GeometryType("ANY"), Some(GeometryType("ANY")))
+    widenTest(GeometryType("ANY"), GeometryType(4326), Some(GeometryType("ANY")))
+    widenTest(GeometryType(4326), GeometryType("ANY"), Some(GeometryType("ANY")))
+
     // Integral mixed with floating point.
     widenTest(IntegerType, FloatType, Some(DoubleType))
     widenTest(IntegerType, DoubleType, Some(DoubleType))
@@ -198,6 +230,40 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     widenTest(DateType, TimestampType, Some(TimestampType))
     widenTest(IntegerType, TimestampType, None)
     widenTest(StringType, TimestampType, None)
+
+    // Nanosecond-precision timestamp types (SPARK-57454). Kept in sync with the same block in
+    // TypeCoercionSuite, since both findTightestCommonType impls share findWiderDateTimeType.
+    // nanos(p1) <-> nanos(p2) within the same family widen to the max precision (incl. self-pair).
+    widenTest(TimestampLTZNanosType(7), TimestampLTZNanosType(9), Some(TimestampLTZNanosType(9)))
+    widenTest(TimestampLTZNanosType(8), TimestampLTZNanosType(8), Some(TimestampLTZNanosType(8)))
+    widenTest(TimestampNTZNanosType(7), TimestampNTZNanosType(9), Some(TimestampNTZNanosType(9)))
+    // micro <-> nanos within the same family widen to the nanos type.
+    widenTest(TimestampType, TimestampLTZNanosType(7), Some(TimestampLTZNanosType(7)))
+    widenTest(TimestampNTZType, TimestampNTZNanosType(8), Some(TimestampNTZNanosType(8)))
+    // Mixed time-zone families widen to the LTZ family (mirrors TIMESTAMP + TIMESTAMP_NTZ).
+    widenTest(TimestampLTZNanosType(7), TimestampNTZNanosType(9), Some(TimestampLTZNanosType(9)))
+    widenTest(TimestampLTZNanosType(7), TimestampNTZType, Some(TimestampLTZNanosType(7)))
+    widenTest(TimestampType, TimestampNTZNanosType(9), Some(TimestampLTZNanosType(9)))
+    // nanos <-> date widen to the nanos type of the same family.
+    widenTest(DateType, TimestampLTZNanosType(8), Some(TimestampLTZNanosType(8)))
+    widenTest(DateType, TimestampNTZNanosType(7), Some(TimestampNTZNanosType(7)))
+    // nanos <-> TIME has no common datetime type.
+    widenTest(TimestampLTZNanosType(9), TimeType(6), None)
+    widenTest(TimestampNTZNanosType(9), TimeType(6), None)
+
+    // TIME(p) types (SPARK-57585).
+    // Two TIME operands widen to the larger fractional-seconds precision.
+    widenTest(TimeType(3), TimeType(6), Some(TimeType(6)))
+    widenTest(TimeType(6), TimeType(3), Some(TimeType(6)))
+    widenTest(TimeType(0), TimeType(9), Some(TimeType(9)))
+    widenTest(TimeType(6), TimeType(6), Some(TimeType(6)))
+    // TIME has no common datetime type with DATE or the TIMESTAMP families.
+    widenTest(TimeType(6), DateType, None)
+    widenTest(TimeType(6), TimestampType, None)
+    widenTest(TimeType(6), TimestampNTZType, None)
+    // No common type with non-datetime types.
+    widenTest(IntegerType, TimestampLTZNanosType(9), None)
+    widenTest(StringType, TimestampNTZNanosType(9), None)
 
     // ComplexType
     widenTest(NullType,
@@ -1083,5 +1149,38 @@ class AnsiTypeCoercionSuite extends TypeCoercionSuiteBase {
     shouldNotCast(ArrayType(ArrayType(StringType)), AbstractArrayType(IntegerType))
     shouldNotCast(ArrayType(ArrayType(IntegerType)),
       AbstractArrayType(StringTypeWithCollation(supportsTrimCollation = true)))
+  }
+
+  test("SPARK-57811: ANSI string to nanosecond timestamp coercion in comparisons and predicates") {
+    // PromoteStrings has no standalone rule id (it only runs inside AnsiCombinedTypeCoercionRule in
+    // production), so wrap it the same way to get a runnable, id-registered rule for ruleTest.
+    val rule =
+      new AnsiTypeCoercion.AnsiCombinedTypeCoercionRule(Seq(AnsiTypeCoercion.PromoteStrings))
+    // In ANSI mode the string operand is coerced to the nanosecond timestamp type for both the LTZ
+    // and NTZ families, via AnsiStringPromotionTypeCoercion.findWiderTypeForString (the atomic-type
+    // fall-through). This is config-blind: ANSI coercion never reads castDatetimeToString, so
+    // unlike the non-ANSI range path there is no legacy string-promotion branch. Both families
+    // behave exactly like their micros counterparts (TimestampType / TimestampNTZType) in ANSI
+    // mode, and the concrete operand type (family + precision) is preserved. Assert under both
+    // flag values to lock in that ANSI ignores it.
+    Seq("false", "true").foreach { legacy =>
+      withSQLConf(SQLConf.LEGACY_CAST_DATETIME_TO_STRING.key -> legacy) {
+        Seq(7, 8, 9).foreach { p =>
+          Seq(TimestampLTZNanosType(p), TimestampNTZNanosType(p)).foreach { nt =>
+            val tsn = AttributeReference("tsn", nt)()
+            val strLit = Literal("2020-01-02 03:04:05.123456789")
+            // Equality (covers both 3VL EqualTo and null-safe EqualNullSafe).
+            ruleTest(rule, EqualTo(tsn, strLit), EqualTo(tsn, Cast(strLit, nt)))
+            ruleTest(rule, EqualTo(strLit, tsn), EqualTo(Cast(strLit, nt), tsn))
+            ruleTest(rule, EqualNullSafe(tsn, strLit), EqualNullSafe(tsn, Cast(strLit, nt)))
+            ruleTest(rule, EqualNullSafe(strLit, tsn), EqualNullSafe(Cast(strLit, nt), tsn))
+            // Range comparisons.
+            ruleTest(rule, LessThan(tsn, strLit), LessThan(tsn, Cast(strLit, nt)))
+            ruleTest(rule, GreaterThanOrEqual(strLit, tsn),
+              GreaterThanOrEqual(Cast(strLit, nt), tsn))
+          }
+        }
+      }
+    }
   }
 }

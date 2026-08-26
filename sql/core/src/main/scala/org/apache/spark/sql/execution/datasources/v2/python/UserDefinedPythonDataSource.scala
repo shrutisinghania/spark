@@ -81,13 +81,47 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
     val runner = new UserDefinedPythonDataSourceFilterPushdownRunner(
       createPythonFunction(pythonResult.dataSource),
       outputSchema,
-      filters
+      filters,
+      limit = None,
+      // Defer planning while limit pushdown is enabled: a later limit pass, or build(), plans
+      // once it is known whether a limit is pushed. Plan here only when limit pushdown is off.
+      planReadInfo = !SQLConf.get.pythonLimitPushDown
     )
     if (runner.isAnyFilterSupported) {
       Some(runner.runInPython())
     } else {
       None
     }
+  }
+
+  /**
+   * (Driver-side) Run Python process to plan the read while optionally pushing down a limit, and
+   * return a [[PythonFilterPushdownResult]] carrying which filters were pushed, whether the limit
+   * was pushed, and the planned read info. The worker plans the read function and partitions in
+   * this pass, except when a pushed `limit` is rejected: the reader may have mutated itself while
+   * rejecting it, so the result's `readInfo` is then `None` and the caller plans the filters-only
+   * read from a fresh reader instead.
+   *
+   * `limit` is the limit to push, or `None` to plan the read from the filters only -- the
+   * build-time path uses `None` when the filter-pushdown pass deferred planning and no limit was
+   * ultimately pushed.
+   *
+   * `filters` must be the filters that were previously pushed via [[pushdownFiltersInPython]] --
+   * empty for a limit-only scan, where no filter pushdown ran -- so that replaying them brings
+   * the reader to the same state it had during filter pushdown before `pushLimit` is called.
+   */
+  def pushdownLimitInPython(
+      pythonResult: PythonDataSourceCreationResult,
+      outputSchema: StructType,
+      filters: Array[Filter],
+      limit: Option[Int]): PythonFilterPushdownResult = {
+    new UserDefinedPythonDataSourceFilterPushdownRunner(
+      createPythonFunction(pythonResult.dataSource),
+      outputSchema,
+      filters,
+      limit = limit,
+      planReadInfo = true
+    ).runInPython()
   }
 
   /**
@@ -143,7 +177,8 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
       inputSchema: StructType,
       outputSchema: StructType,
       metrics: Map[String, SQLMetric],
-      jobArtifactUUID: Option[String]): MapInBatchEvaluatorFactory = {
+      jobArtifactUUID: Option[String],
+      sessionUUID: Option[String]): MapInBatchEvaluatorFactory = {
     val pythonFunc = createPythonFunction(pickledFunc)
 
     val pythonEvalType = PythonEvalType.SQL_MAP_ARROW_ITER_UDF
@@ -170,7 +205,8 @@ case class UserDefinedPythonDataSource(dataSourceCls: PythonFunction) {
       conf.arrowUseLargeVarTypes,
       pythonRunnerConf,
       metrics,
-      jobArtifactUUID)
+      jobArtifactUUID,
+      sessionUUID)
   }
 
   def createPythonMetrics(): Array[CustomMetric] = {
@@ -230,6 +266,12 @@ private class UserDefinedPythonDataSourceLookupRunner(lookupSources: PythonFunct
 
   override val workerModule = "pyspark.sql.worker.lookup_data_sources"
 
+  override protected def runnerConf: Map[String, String] = {
+    super.runnerConf ++ SQLConf.get.pythonDataSourceProfiler.map(p =>
+      Map(SQLConf.PYTHON_DATA_SOURCE_PROFILER.key -> p)
+    ).getOrElse(Map.empty)
+  }
+
   override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
     // No input needed.
   }
@@ -279,6 +321,12 @@ private class UserDefinedPythonDataSourceRunner(
   extends PythonPlannerRunner[PythonDataSourceCreationResult](dataSourceCls) {
 
   override val workerModule = "pyspark.sql.worker.create_data_source"
+
+  override protected def runnerConf: Map[String, String] = {
+    super.runnerConf ++ SQLConf.get.pythonDataSourceProfiler.map(p =>
+      Map(SQLConf.PYTHON_DATA_SOURCE_PROFILER.key -> p)
+    ).getOrElse(Map.empty)
+  }
 
   override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
     // Send python data source
@@ -331,15 +379,22 @@ private class UserDefinedPythonDataSourceRunner(
 }
 
 /**
+ * @param readInfo The read function and partitions, when the worker planned them. Empty in two
+ *                 cases: the filter-pushdown pass deferred planning (limit pushdown enabled), or a
+ *                 pushed limit was rejected (the rejecting reader may be mutated). Planning then
+ *                 happens on a later limit pass or at build time, from a fresh reader.
  * @param isFilterPushed A sequence of bools indicating whether each filter is pushed down.
+ * @param isLimitPushed Whether the limit is pushed down. False when no limit was sent, and also
+ *                      when a limit was sent but the reader rejected it.
  */
 case class PythonFilterPushdownResult(
-    readInfo: PythonDataSourceReadInfo,
-    isFilterPushed: collection.Seq[Boolean]
+    readInfo: Option[PythonDataSourceReadInfo],
+    isFilterPushed: collection.Seq[Boolean],
+    isLimitPushed: Boolean = false
 )
 
 /**
- * Push down filters to a Python data source.
+ * Push down filters and optionally a limit to a Python data source.
  *
  * @param dataSource
  *   a Python data source instance
@@ -347,11 +402,19 @@ case class PythonFilterPushdownResult(
  *   output schema of the Python data source
  * @param filters
  *   all filters to be pushed down
+ * @param limit
+ *   the limit to be pushed down, if any
  */
 private class UserDefinedPythonDataSourceFilterPushdownRunner(
     dataSource: PythonFunction,
     schema: StructType,
-    filters: collection.Seq[Filter])
+    filters: collection.Seq[Filter],
+    limit: Option[Int],
+    // Whether the worker should plan (and send back) the read function and partitions in this
+    // pass. Kept separate from `limit` so a build-time, filter-only planning pass can request
+    // planning without a limit -- deriving it from `limit.isDefined` would force such a pass to
+    // smuggle a dummy limit value in just to trigger planning.
+    planReadInfo: Boolean)
     extends PythonPlannerRunner[PythonFilterPushdownResult](dataSource) {
 
   private case class SerializedFilter(
@@ -444,6 +507,12 @@ private class UserDefinedPythonDataSourceFilterPushdownRunner(
   // See the logic in `pyspark.sql.worker.data_source_pushdown_filters.py`.
   override val workerModule = "pyspark.sql.worker.data_source_pushdown_filters"
 
+  override protected def runnerConf: Map[String, String] = {
+    super.runnerConf ++ SQLConf.get.pythonDataSourceProfiler.map(p =>
+      Map(SQLConf.PYTHON_DATA_SOURCE_PROFILER.key -> p)
+    ).getOrElse(Map.empty)
+  }
+
   def isAnyFilterSupported: Boolean = serializedFilters.nonEmpty
 
   override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
@@ -456,13 +525,41 @@ private class UserDefinedPythonDataSourceFilterPushdownRunner(
     // Send the filters
     PythonWorkerUtils.writeUTF(mapper.writeValueAsString(serializedFilters), dataOut)
 
+    // Send the limit, if any. -1 means no limit is pushed down.
+    dataOut.writeInt(limit.getOrElse(-1))
+
     // Send configurations
     dataOut.writeInt(SQLConf.get.arrowMaxRecordsPerBatch)
+    dataOut.writeBoolean(SQLConf.get.pythonFilterPushDown)
+    dataOut.writeBoolean(SQLConf.get.pythonLimitPushDown)
+    dataOut.writeBoolean(SQLConf.get.pysparkBinaryAsBytes)
+    // Whether the worker should plan the read function and partitions. The filter-pushdown pass
+    // sets this false while limit pushdown is enabled, because a later limit pass -- or
+    // build-time planning -- will plan once it is known whether a limit is pushed, so
+    // `partitions()`/`read()` never run on a reader whose plan would be discarded.
+    dataOut.writeBoolean(planReadInfo)
   }
 
   override protected def receiveFromPython(dataIn: DataInputStream): PythonFilterPushdownResult = {
-    // Receive the read function and the partitions. Also check for exceptions.
-    val readInfo = PythonDataSourceReadInfo.receive(dataIn)
+    // Whether a read function + partitions follow. Read first so that an exception raised in the
+    // worker (sent as PYTHON_EXCEPTION_THROWN) is surfaced here instead of being misread as data.
+    val hasReadInfo = dataIn.readInt()
+    if (hasReadInfo == SpecialLengths.PYTHON_EXCEPTION_THROWN) {
+      val msg = PythonWorkerUtils.readUTF(dataIn)
+      throw QueryCompilationErrors.pythonDataSourceError(
+        action = "plan",
+        tpe = "read",
+        msg = msg
+      )
+    }
+    // Receive the read function and partitions, when the worker planned them. None follow when the
+    // filter-pushdown pass defers planning (limit pushdown enabled) or when a pushed limit was
+    // rejected; build() (or a later limit pass) then plans them from a fresh reader instead.
+    val readInfo = if (hasReadInfo != 0) {
+      Some(PythonDataSourceReadInfo.receive(dataIn))
+    } else {
+      None
+    }
 
     // Receive the pushed filters as a list of indices.
     val numFiltersPushed = dataIn.readInt()
@@ -472,9 +569,13 @@ private class UserDefinedPythonDataSourceFilterPushdownRunner(
       isFilterPushed(serializedFilters(i).index) = true
     }
 
+    // Receive whether the limit was pushed down, sent as 1 or 0.
+    val isLimitPushed = dataIn.readInt() != 0
+
     PythonFilterPushdownResult(
       readInfo = readInfo,
-      isFilterPushed = isFilterPushed
+      isFilterPushed = isFilterPushed,
+      isLimitPushed = isLimitPushed
     )
   }
 }
@@ -535,6 +636,12 @@ private class UserDefinedPythonDataSourceReadRunner(
   // See the logic in `pyspark.sql.worker.plan_data_source_read.py`.
   override val workerModule = "pyspark.sql.worker.plan_data_source_read"
 
+  override protected def runnerConf: Map[String, String] = {
+    super.runnerConf ++ SQLConf.get.pythonDataSourceProfiler.map(p =>
+      Map(SQLConf.PYTHON_DATA_SOURCE_PROFILER.key -> p)
+    ).getOrElse(Map.empty)
+  }
+
   override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
     // Send Python data source
     PythonWorkerUtils.writePythonFunction(func, dataOut)
@@ -548,8 +655,10 @@ private class UserDefinedPythonDataSourceReadRunner(
     // Send configurations
     dataOut.writeInt(SQLConf.get.arrowMaxRecordsPerBatch)
     dataOut.writeBoolean(SQLConf.get.pythonFilterPushDown)
+    dataOut.writeBoolean(SQLConf.get.pythonLimitPushDown)
 
     dataOut.writeBoolean(isStreaming)
+    dataOut.writeBoolean(SQLConf.get.pysparkBinaryAsBytes)
   }
 
   override protected def receiveFromPython(dataIn: DataInputStream): PythonDataSourceReadInfo = {
@@ -576,6 +685,12 @@ private class UserDefinedPythonDataSourceWriteRunner(
 
   override val workerModule: String = "pyspark.sql.worker.write_into_data_source"
 
+  override protected def runnerConf: Map[String, String] = {
+    super.runnerConf ++ SQLConf.get.pythonDataSourceProfiler.map(p =>
+      Map(SQLConf.PYTHON_DATA_SOURCE_PROFILER.key -> p)
+    ).getOrElse(Map.empty)
+  }
+
   override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
     // Send the Python data source class.
     PythonWorkerUtils.writePythonFunction(dataSourceCls, dataOut)
@@ -600,6 +715,7 @@ private class UserDefinedPythonDataSourceWriteRunner(
     dataOut.writeBoolean(overwrite)
 
     dataOut.writeBoolean(isStreaming)
+    dataOut.writeBoolean(SQLConf.get.pysparkBinaryAsBytes)
   }
 
   override protected def receiveFromPython(
@@ -633,6 +749,12 @@ private class UserDefinedPythonDataSourceCommitRunner(
     messages: Array[WriterCommitMessage],
     abort: Boolean) extends PythonPlannerRunner[Unit](dataSourceCls) {
   override val workerModule: String = "pyspark.sql.worker.commit_data_source_write"
+
+  override protected def runnerConf: Map[String, String] = {
+    super.runnerConf ++ SQLConf.get.pythonDataSourceProfiler.map(p =>
+      Map(SQLConf.PYTHON_DATA_SOURCE_PROFILER.key -> p)
+    ).getOrElse(Map.empty)
+  }
 
   override protected def writeToPython(dataOut: DataOutputStream, pickler: Pickler): Unit = {
     // Send the Python data source writer.

@@ -25,7 +25,7 @@ import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.analysis.TypeCoercion
 import org.apache.spark.sql.catalyst.expressions.ExprUtils
-import org.apache.spark.sql.catalyst.util.{DateFormatter, TimestampFormatter}
+import org.apache.spark.sql.catalyst.util.{DateFormatter, TimeFormatter, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -52,6 +52,12 @@ class CSVInferSchema(val options: CSVOptions) extends Serializable {
     legacyFormat = FAST_DATE_FORMAT,
     isParsing = true)
 
+  private lazy val timeFormatter = TimeFormatter(
+    options.timeFormatInRead,
+    isParsing = true)
+
+  private val isTimeTypeEnabled = SQLConf.get.isTimeTypeEnabled
+
   private val decimalParser = if (options.locale == Locale.US) {
     // Special handling the default locale for backward compatibility
     s: String => new java.math.BigDecimal(s)
@@ -67,6 +73,14 @@ class CSVInferSchema(val options: CSVOptions) extends Serializable {
     "yyyy-MM-dd", "yyyy-M-d", "yyyy-M-dd", "yyyy-MM-d", "yyyy-MM", "yyyy-M", "yyyy")
 
   private val isDefaultNTZ = SQLConf.get.timestampType == TimestampNTZType
+
+  override def equals(obj: Any): Boolean = obj match {
+    case other: CSVInferSchema =>
+      options == other.options
+    case _ => false
+  }
+
+  override def hashCode(): Int = options.hashCode()
 
   /**
    * Similar to the JSON schema inference
@@ -132,6 +146,7 @@ class CSVInferSchema(val options: CSVOptions) extends Serializable {
         case LongType => tryParseLong(field)
         case _: DecimalType => tryParseDecimal(field)
         case DoubleType => tryParseDouble(field)
+        case _: TimeType => tryParseTime(field)
         case DateType => tryParseDate(field)
         case TimestampNTZType => tryParseTimestampNTZ(field)
         case TimestampType => tryParseTimestamp(field)
@@ -186,9 +201,17 @@ class CSVInferSchema(val options: CSVOptions) extends Serializable {
     if ((allCatch opt field.toDouble).isDefined || isInfOrNan(field)) {
       DoubleType
     } else if (options.preferDate) {
-      tryParseDate(field)
+      tryParseTime(field)
     } else {
       tryParseTimestampNTZ(field)
+    }
+  }
+
+  private def tryParseTime(field: String): DataType = {
+    if (isTimeTypeEnabled && (allCatch opt timeFormatter.parse(field)).isDefined) {
+      TimeType(TimeType.DEFAULT_PRECISION)
+    } else {
+      tryParseDate(field)
     }
   }
 

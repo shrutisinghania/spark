@@ -34,6 +34,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.SizeEstimator
 import org.apache.spark.util.VersionUtils.majorVersion
 
 /**
@@ -59,8 +60,8 @@ private[feature] trait IDFBase extends Params with HasInputCol with HasOutputCol
    * Validate and transform the input schema.
    */
   protected def validateAndTransformSchema(schema: StructType): StructType = {
-    SchemaUtils.checkColumnType(schema, $(inputCol), new VectorUDT)
-    SchemaUtils.appendColumn(schema, $(outputCol), new VectorUDT)
+    SchemaUtils.checkColumnType(schema, $(inputCol), SQLDataTypes.VectorType)
+    SchemaUtils.appendColumn(schema, $(outputCol), SQLDataTypes.VectorType)
   }
 }
 
@@ -126,6 +127,19 @@ class IDFModel private[ml] (
   // For ml connect only
   private[ml] def this() = this("", null)
 
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    if (idfModel != null) {
+      if (idfModel.idf != null) {
+        size += idfModel.idf.asML.getSizeInBytes
+      }
+      if (idfModel.docFreq != null) {
+        size += SizeEstimator.estimate(idfModel.docFreq)
+      }
+    }
+    size
+  }
+
   /** @group setParam */
   @Since("1.4.0")
   def setInputCol(value: String): this.type = set(inputCol, value)
@@ -138,20 +152,8 @@ class IDFModel private[ml] (
   override def transform(dataset: Dataset[_]): DataFrame = {
     val outputSchema = transformSchema(dataset.schema, logging = true)
 
-    val func = { vector: Vector =>
-      vector match {
-        case SparseVector(size, indices, values) =>
-          val (newIndices, newValues) = feature.IDFModel.transformSparse(idfModel.idf,
-            indices, values)
-          Vectors.sparse(size, newIndices, newValues)
-        case DenseVector(values) =>
-          val newValues = feature.IDFModel.transformDense(idfModel.idf, values)
-          Vectors.dense(newValues)
-        case other =>
-          throw new UnsupportedOperationException(
-            s"Only sparse and dense vectors are supported but got ${other.getClass}.")
-      }
-    }
+    val localIdf = idfModel.idf.toArray
+    val func = (vector: Vector) => IDFModel.predict(localIdf, vector)
 
     val transformer = udf(func)
     dataset.withColumn($(outputCol), transformer(col($(inputCol))),
@@ -199,6 +201,45 @@ class IDFModel private[ml] (
 object IDFModel extends MLReadable[IDFModel] {
   private[ml] case class Data(idf: Vector, docFreq: Array[Long], numDocs: Long)
 
+  private def predict(idf: Array[Double], v: Vector): Vector = {
+    v match {
+      case SparseVector(size, indices, values) =>
+        val (newIndices, newValues) = predictSparse(idf, indices, values)
+        Vectors.sparse(size, newIndices, newValues)
+      case DenseVector(values) =>
+        val newValues = predictDense(idf, values)
+        Vectors.dense(newValues)
+      case other =>
+        throw new UnsupportedOperationException(
+          s"Only sparse and dense vectors are supported but got ${other.getClass}.")
+    }
+  }
+
+  private[spark] def predictDense(idf: Array[Double], values: Array[Double]): Array[Double] = {
+    val n = values.length
+    val newValues = new Array[Double](n)
+    var j = 0
+    while (j < n) {
+      newValues(j) = values(j) * idf(j)
+      j += 1
+    }
+    newValues
+  }
+
+  private[spark] def predictSparse(
+      idf: Array[Double],
+      indices: Array[Int],
+      values: Array[Double]): (Array[Int], Array[Double]) = {
+    val nnz = indices.length
+    val newValues = new Array[Double](nnz)
+    var k = 0
+    while (k < nnz) {
+      newValues(k) = values(k) * idf(indices(k))
+      k += 1
+    }
+    (indices, newValues)
+  }
+
   private[ml] def serializeData(data: Data, dos: DataOutputStream): Unit = {
     import ReadWriteUtils._
     serializeVector(data.idf, dos)
@@ -231,7 +272,6 @@ object IDFModel extends MLReadable[IDFModel] {
     override def load(path: String): IDFModel = {
       val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val dataPath = new Path(path, "data").toString
-      val data = sparkSession.read.parquet(dataPath)
 
       val model = if (majorVersion(metadata.sparkVersion) >= 3) {
         val data = ReadWriteUtils.loadObject[Data](dataPath, sparkSession, deserializeData)
@@ -240,6 +280,7 @@ object IDFModel extends MLReadable[IDFModel] {
           new feature.IDFModel(OldVectors.fromML(data.idf), data.docFreq, data.numDocs)
         )
       } else {
+        val data = sparkSession.read.parquet(dataPath)
         val Row(idf: Vector) = MLUtils.convertVectorColumnsToML(data, "idf")
           .select("idf")
           .head()

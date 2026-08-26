@@ -18,7 +18,7 @@
 package org.apache.spark.sql.catalyst
 
 import java.sql.{Date, Timestamp}
-import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period}
+import java.time.{Duration, Instant, LocalDate, LocalDateTime, LocalTime, Period}
 
 import scala.language.implicitConversions
 
@@ -34,7 +34,7 @@ import org.apache.spark.sql.catalyst.trees.CurrentOrigin
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.CollationFactory
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 /**
  * A collection of implicit conversions that create a DSL for constructing catalyst data structures.
@@ -176,6 +176,7 @@ package object dsl extends SQLConfHelper {
     implicit def decimalToLiteral(d: Decimal): Literal = Literal(d)
     implicit def timestampToLiteral(t: Timestamp): Literal = Literal(t)
     implicit def timestampNTZToLiteral(l: LocalDateTime): Literal = Literal(l)
+    implicit def localTimeToLiteral(t: LocalTime): Literal = Literal(t)
     implicit def instantToLiteral(i: Instant): Literal = Literal(i)
     implicit def binaryToLiteral(a: Array[Byte]): Literal = Literal(a)
     implicit def periodToLiteral(p: Period): Literal = Literal(p)
@@ -405,6 +406,8 @@ package object dsl extends SQLConfHelper {
 
       def globalLimit(limitExpr: Expression): LogicalPlan = GlobalLimit(limitExpr, logicalPlan)
 
+      def limitAll(): LogicalPlan = LimitAll(logicalPlan)
+
       def offset(offsetExpr: Expression): LogicalPlan = Offset(offsetExpr, logicalPlan)
 
       def join(
@@ -521,6 +524,18 @@ package object dsl extends SQLConfHelper {
         Generate(generator, unrequiredChildIndex, outer,
           alias, outputNames.map(UnresolvedAttribute(_)), logicalPlan)
 
+      def binBy(
+        rangeStart: Attribute,
+        rangeEnd: Attribute,
+        distributeColumns: Seq[Attribute],
+        scaledDistributeColumns: Seq[Attribute],
+        appendedAttributes: Seq[Attribute],
+        binWidthMicros: Long = 300000000L,
+        originMicros: Long = 0L,
+        timeZoneId: Option[String] = Some("UTC")): LogicalPlan =
+        BinBy(binWidthMicros, rangeStart, rangeEnd, originMicros, distributeColumns,
+          scaledDistributeColumns, appendedAttributes, logicalPlan, timeZoneId)
+
       def insertInto(tableName: String): LogicalPlan = insertInto(table(tableName))
 
       def insertInto(
@@ -564,6 +579,19 @@ package object dsl extends SQLConfHelper {
       }
 
       def deduplicate(colNames: Attribute*): LogicalPlan = Deduplicate(colNames, logicalPlan)
+
+      def withWatermark(
+          uuid: java.util.UUID,
+          expr: NamedExpression,
+          delayThreshold: CalendarInterval): LogicalPlan = {
+        EventTimeWatermark(uuid, expr.toAttribute, delayThreshold, logicalPlan)
+      }
+
+      def unresolvedWithWatermark(
+          expr: NamedExpression,
+          delayThreshold: CalendarInterval): LogicalPlan = {
+        UnresolvedEventTimeWatermark(expr, delayThreshold, logicalPlan)
+      }
     }
   }
 }

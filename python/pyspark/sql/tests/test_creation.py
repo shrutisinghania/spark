@@ -15,30 +15,31 @@
 # limitations under the License.
 #
 
-from decimal import Decimal
 import os
 import time
 import unittest
-from typing import cast
+from decimal import Decimal
 
-from pyspark.sql import Row
 import pyspark.sql.functions as F
-from pyspark.sql.types import (
-    DecimalType,
-    StructType,
-    StructField,
-    StringType,
-    DateType,
-    TimestampType,
-    TimestampNTZType,
-)
 from pyspark.errors import (
     PySparkTypeError,
     PySparkValueError,
 )
+from pyspark.sql import Row
+from pyspark.sql.types import (
+    DateType,
+    DecimalType,
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampNTZType,
+    TimestampType,
+    TimeType,
+)
 from pyspark.testing import assertDataFrameEqual
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
@@ -69,10 +70,25 @@ class DataFrameCreationTestsMixin:
         df = self.spark.createDataFrame(data)
         self.assertEqual(df.first(), Row(longarray=[-9223372036854775808, 0, 9223372036854775807]))
 
-    @unittest.skipIf(not have_pandas, pandas_requirement_message)  # type: ignore
+    def test_create_dataframe_from_datetime_time(self):
+        import datetime
+
+        df = self.spark.createDataFrame(
+            [
+                (datetime.time(1, 2, 3),),
+                (datetime.time(4, 5, 6),),
+                (datetime.time(7, 8, 9),),
+            ],
+            ["t"],
+        )
+        self.assertIsInstance(df.schema["t"].dataType, TimeType)
+        self.assertEqual(df.count(), 3)
+
+    @unittest.skipIf(not have_pandas, pandas_requirement_message)
     def test_create_dataframe_from_pandas_with_timestamp(self):
-        import pandas as pd
         from datetime import datetime
+
+        import pandas as pd
 
         pdf = pd.DataFrame(
             {"ts": [datetime(2017, 10, 31, 1, 1, 1)], "d": [pd.Timestamp.now().date()]},
@@ -96,8 +112,9 @@ class DataFrameCreationTestsMixin:
             with self.assertRaisesRegex(
                 ImportError, "(Pandas >= .* must be installed|No module named '?pandas'?)"
             ):
-                import pandas as pd
                 from datetime import datetime
+
+                import pandas as pd
 
                 pdf = pd.DataFrame(
                     {"ts": [datetime(2017, 10, 31, 1, 1, 1)], "d": [pd.Timestamp.now().date()]}
@@ -105,11 +122,12 @@ class DataFrameCreationTestsMixin:
                 self.spark.createDataFrame(pdf)
 
     # Regression test for SPARK-23360
-    @unittest.skipIf(not have_pandas, pandas_requirement_message)  # type: ignore
+    @unittest.skipIf(not have_pandas, pandas_requirement_message)
     def test_create_dataframe_from_pandas_with_dst(self):
+        from datetime import datetime
+
         import pandas as pd
         from pandas.testing import assert_frame_equal
-        from datetime import datetime
 
         pdf = pd.DataFrame({"time": [datetime(2015, 10, 31, 22, 30)]})
 
@@ -130,11 +148,12 @@ class DataFrameCreationTestsMixin:
                 os.environ["TZ"] = orig_env_tz
             time.tzset()
 
-    @unittest.skipIf(not have_pandas, pandas_requirement_message)  # type: ignore
+    @unittest.skipIf(not have_pandas, pandas_requirement_message)
     def test_create_dataframe_from_pandas_with_day_time_interval(self):
         # SPARK-37277: Test DayTimeIntervalType in createDataFrame without Arrow.
-        import pandas as pd
         from datetime import timedelta
+
+        import pandas as pd
 
         df = self.spark.createDataFrame(pd.DataFrame({"a": [timedelta(microseconds=123)]}))
         self.assertEqual(df.toPandas().a.iloc[0], timedelta(microseconds=123))
@@ -152,14 +171,23 @@ class DataFrameCreationTestsMixin:
         with self.assertRaises(PySparkValueError):
             self.spark.createDataFrame(data=data, schema=schema)
 
+    def test_decimal_round(self):
+        df = self.spark.createDataFrame([(Decimal(1.234),)], ["d"])
+        rounded = df.first().d
+        self.assertEqual(rounded, Decimal("1.233999999999999986"))
+
     def test_invalid_argument_create_dataframe(self):
         with self.assertRaises(PySparkTypeError) as pe:
             self.spark.createDataFrame([(1, 2)], schema=123)
 
         self.check_error(
             exception=pe.exception,
-            errorClass="NOT_LIST_OR_NONE_OR_STRUCT",
-            messageParameters={"arg_name": "schema", "arg_type": "int"},
+            errorClass="NOT_EXPECTED_TYPE",
+            messageParameters={
+                "expected_type": "list, None or StructType",
+                "arg_name": "schema",
+                "arg_type": "int",
+            },
         )
 
         with self.assertRaises(PySparkTypeError) as pe:
@@ -183,7 +211,7 @@ class DataFrameCreationTestsMixin:
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_schema_inference_from_pandas_with_dict(self):
         # SPARK-47543: test for verifying if inferring `dict` as `MapType` work properly.
@@ -236,12 +264,66 @@ class DataFrameCreationTestsMixin:
                 [Row(str_col="second", dict_col={"first": 0.7, "second": 0.3}, test=0.3)],
             )
 
+    def test_empty_dataframe_with_struct_type(self):
+        schema = StructType(
+            [
+                StructField("name", StringType(), True),
+                StructField("age", IntegerType(), True),
+            ]
+        )
+        df = self.spark.emptyDataFrame(schema)
+        self.assertEqual(df.schema, schema)
+        self.assertEqual(df.count(), 0)
+        self.assertEqual(df.collect(), [])
+
+    def test_empty_dataframe_with_ddl_string(self):
+        df = self.spark.emptyDataFrame("name STRING, age INT")
+        self.assertEqual(len(df.schema.fields), 2)
+        self.assertEqual(df.schema.fields[0].name, "name")
+        self.assertIsInstance(df.schema.fields[0].dataType, StringType)
+        self.assertEqual(df.schema.fields[1].name, "age")
+        self.assertIsInstance(df.schema.fields[1].dataType, IntegerType)
+        self.assertEqual(df.count(), 0)
+        self.assertEqual(df.collect(), [])
+
     def test_empty_schema(self):
         schema = StructType()
         for data in [[], [Row()]]:
             with self.subTest(data=data):
                 sdf = self.spark.createDataFrame(data, schema)
                 assertDataFrameEqual(sdf, data)
+
+    @unittest.skipIf(
+        not have_pandas or not have_pyarrow,
+        pandas_requirement_message or pyarrow_requirement_message,
+    )
+    def test_from_pandas_dataframe_with_zero_columns(self):
+        """SPARK-55600: Test that row count is preserved when creating DataFrame from
+        pandas with 0 columns but with explicit schema in classic Spark."""
+        import pandas as pd
+
+        # Create a pandas DataFrame with 5 rows but 0 columns
+        pdf = pd.DataFrame(index=range(5))
+        schema = StructType([])
+
+        # Test with Arrow optimization enabled
+        with self.sql_conf(
+            {
+                "spark.sql.execution.arrow.pyspark.enabled": True,
+                "spark.sql.execution.arrow.pyspark.fallback.enabled": False,
+            }
+        ):
+            df = self.spark.createDataFrame(pdf, schema=schema)
+            self.assertEqual(df.schema, schema)
+            self.assertEqual(df.count(), 5)
+            self.assertEqual(len(df.collect()), 5)
+
+        # Test with Arrow optimization disabled
+        with self.sql_conf({"spark.sql.execution.arrow.pyspark.enabled": False}):
+            df = self.spark.createDataFrame(pdf, schema=schema)
+            self.assertEqual(df.schema, schema)
+            self.assertEqual(df.count(), 5)
+            self.assertEqual(len(df.collect()), 5)
 
 
 class DataFrameCreationTests(
@@ -252,12 +334,6 @@ class DataFrameCreationTests(
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_creation import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

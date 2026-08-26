@@ -26,16 +26,17 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FILTER
+import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{spy, times, verify}
-import org.scalatest.BeforeAndAfterEach
 
 import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
-import org.apache.spark.sql.{AnalysisException, Row, SaveMode}
+import org.apache.spark.sql.{AnalysisException, QueryTest, Row, SaveMode}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParseException}
+import org.apache.spark.sql.classic.SparkSession
 import org.apache.spark.sql.connector.catalog.{CatalogManager, CatalogV2Util, Identifier, TableChange, TableInfo}
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces.PROP_OWNER
@@ -46,18 +47,17 @@ import org.apache.spark.sql.execution.datasources.v2.V2SessionCatalog
 import org.apache.spark.sql.hive.{HiveExternalCatalog, HiveUtils}
 import org.apache.spark.sql.hive.HiveUtils.{CONVERT_METASTORE_ORC, CONVERT_METASTORE_PARQUET}
 import org.apache.spark.sql.hive.orc.OrcFileOperator
-import org.apache.spark.sql.hive.test.{TestHive, TestHiveSingleton, TestHiveSparkSession}
+import org.apache.spark.sql.hive.test.{TestHive, TestHiveSingleton, TestUDTFJar}
 import org.apache.spark.sql.internal.{HiveSerDe, SQLConf}
 import org.apache.spark.sql.internal.SQLConf.ORC_IMPLEMENTATION
 import org.apache.spark.sql.internal.StaticSQLConf.CATALOG_IMPLEMENTATION
-import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types._
 import org.apache.spark.tags.SlowHiveTest
 import org.apache.spark.util.Utils
 
 @SlowHiveTest
 class HiveDDLSuite
-  extends DDLSuite with SQLTestUtils with TestHiveSingleton with BeforeAndAfterEach {
+  extends DDLSuite with QueryTest with TestHiveSingleton {
   import testImplicits._
   val hiveFormats = Seq("PARQUET", "ORC", "TEXTFILE", "SEQUENCEFILE", "RCFILE", "AVRO")
 
@@ -610,7 +610,7 @@ class HiveDDLSuite
       exception = intercept[AnalysisException] {
         sql(sql1)
       },
-      condition = "_LEGACY_ERROR_TEMP_1076",
+      condition = "INVALID_PARTITION_SPEC",
       parameters = Map(
         "details" -> "The spec ([partCol1=]) contains an empty partition column value")
     )
@@ -1141,7 +1141,7 @@ class HiveDDLSuite
           "alternative" -> "DROP TABLE",
           "operation" -> "DROP VIEW",
           "foundType" -> "MANAGED",
-          "requiredType" -> "VIEW",
+          "requiredType" -> "VIEW or METRIC_VIEW",
           "objectName" -> s"$SESSION_CATALOG_NAME.default.tab1"
         )
       )
@@ -1153,17 +1153,16 @@ class HiveDDLSuite
       spark.range(10).write.saveAsTable("tab1")
       withView("view1") {
         sql("CREATE VIEW view1 AS SELECT * FROM tab1")
-        assertAnalysisErrorCondition(
-          sqlText = "DROP TABLE view1",
-          condition = "WRONG_COMMAND_FOR_OBJECT_TYPE",
-          parameters = Map(
-            "alternative" -> "DROP VIEW",
-            "operation" -> "DROP TABLE",
-            "foundType" -> "VIEW",
-            "requiredType" -> "EXTERNAL or MANAGED",
-            "objectName" -> "spark_catalog.default.view1"
-          )
-        )
+        // Dropping a VIEW using DROP TABLE is allowed.
+        sql("DROP TABLE view1")
+        // Verify that the VIEW has been dropped.
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(s"SELECT * FROM view1")
+          },
+          condition = "TABLE_OR_VIEW_NOT_FOUND",
+          parameters = Map("relationName" -> s"`view1`"),
+          ExpectedContext("view1", 14, 18))
       }
     }
   }
@@ -2586,16 +2585,8 @@ class HiveDDLSuite
   test("SPARK-36241: support creating tables with void datatype") {
     // CTAS with void type
     withTable("t1", "t2", "t3") {
-      checkError(
-        exception = intercept[AnalysisException] {
-          sql("CREATE TABLE t1 USING PARQUET AS SELECT NULL AS null_col")
-        },
-        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
-        parameters = Map(
-          "columnName" -> "`null_col`",
-          "columnType" -> "\"VOID\"",
-          "format" -> "Parquet")
-      )
+      sql("CREATE TABLE t1 USING PARQUET AS SELECT NULL AS null_col")
+      checkAnswer(sql("SELECT * FROM t1"), Row(null))
 
       checkError(
         exception = intercept[AnalysisException] {
@@ -2613,15 +2604,8 @@ class HiveDDLSuite
 
     // Create table with void type
     withTable("t1", "t2", "t3", "t4") {
-      checkError(
-        exception = intercept[AnalysisException] {
-          sql("CREATE TABLE t1 (v VOID) USING PARQUET")
-        },
-        condition = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
-        parameters = Map(
-          "columnName" -> "`v`",
-          "columnType" -> "\"VOID\"",
-          "format" -> "Parquet"))
+      sql("CREATE TABLE t1 (v VOID) USING PARQUET")
+      checkAnswer(sql("SELECT * FROM t1"), Seq.empty)
 
       checkError(
         exception = intercept[AnalysisException] {
@@ -2653,7 +2637,7 @@ class HiveDDLSuite
     import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
     import testImplicits._
 
-    implicit val _sqlContext = spark.sqlContext
+    implicit val sparkSession: SparkSession = spark
 
     withTempView("t1") {
       Seq((1, "one"), (2, "two"), (4, "four")).toDF("number", "word").createOrReplaceTempView("t1")
@@ -2668,7 +2652,7 @@ class HiveDDLSuite
           |SELECT word, number from t1
         """.stripMargin)
 
-      val inputData = MemoryStream[Int]
+      val inputData = MemoryStream[Int](spark)
       val joined = inputData.toDS().toDF()
         .join(spark.table("smallTable"), $"value" === $"number")
 
@@ -2710,8 +2694,9 @@ class HiveDDLSuite
         OrcFileOperator.getFileReader(maybeFile.get.toPath.toString).get.getCompression.name
 
       case "parquet" =>
+        val hadoopConf = sparkContext.hadoopConfiguration
         val footer = ParquetFooterReader.readFooter(
-          sparkContext.hadoopConfiguration, new Path(maybeFile.get.getPath), NO_FILTER)
+          HadoopInputFile.fromPath(new Path(maybeFile.get.getPath), hadoopConf), NO_FILTER)
         footer.getBlocks.get(0).getColumns.get(0).getCodec.toString
     }
 
@@ -3260,12 +3245,12 @@ class HiveDDLSuite
   }
 
   test("SPARK-34261: Avoid side effect if create exists temporary function") {
-    assume(Thread.currentThread().getContextClassLoader.getResource("TestUDTF.jar") != null)
     withUserDefinedFunction("f1" -> true) {
       sql("CREATE TEMPORARY FUNCTION f1 AS 'org.apache.hadoop.hive.ql.udf.UDFUUID'")
 
-      val jarName = "TestUDTF.jar"
-      val jar = spark.asInstanceOf[TestHiveSparkSession].getHiveFile(jarName).toURI.toString
+      val udtfJar = TestUDTFJar.jar
+      val jarName = udtfJar.getName
+      val jar = udtfJar.toURI.toString
       spark.sparkContext.allAddedJars.keys.find(_.contains(jarName))
         .foreach(k => spark.sparkContext.addedJars.get("default").foreach(_.remove(k)))
       assert(!spark.sparkContext.listJars().exists(_.contains(jarName)))
@@ -3430,6 +3415,96 @@ class HiveDDLSuite
       verify(spyCatalog, times(1)).alterTable(any[CatalogTable])
       verify(spyCatalog, times(1)).alterTableSchema(
         any[String], any[String], any[StructType])
+    }
+  }
+
+  test("SPARK-57835: read persisted nanos-typed tables when the preview flag is off") {
+    withTable("nanos_ddl_tbl") {
+      // Create the table with the preview flag on (the test default via Utils.isTesting).
+      sql(
+        """CREATE TABLE nanos_ddl_tbl (id INT, ntz TIMESTAMP_NTZ(9), ltz TIMESTAMP_LTZ(7))
+          |USING parquet""".stripMargin)
+
+      withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "false") {
+        // Read-through policy (SPARK-57835): metadata reads succeed and render the nanos columns
+        // with their precision, even though the preview flag is off. Before this change these
+        // commands failed at getTable time with FEATURE_NOT_ENABLED.
+        val describeRows = sql("DESCRIBE TABLE nanos_ddl_tbl").collect()
+          .map(r => r.getString(0) -> r.getString(1)).toMap
+        assert(describeRows("ntz") === "timestamp_ntz(9)")
+        assert(describeRows("ltz") === "timestamp_ltz(7)")
+
+        val showCreate = sql("SHOW CREATE TABLE nanos_ddl_tbl").head().getString(0)
+        assert(showCreate.contains("TIMESTAMP_NTZ(9)"))
+        assert(showCreate.contains("TIMESTAMP_LTZ(7)"))
+
+        // But actually reading the data still fails with an actionable, feature-flag error.
+        checkError(
+          exception = intercept[SparkException] {
+            sql("SELECT * FROM nanos_ddl_tbl").collect()
+          },
+          condition = "FEATURE_NOT_ENABLED",
+          parameters = Map(
+            "featureName" -> "Nanosecond-precision timestamp types",
+            "configKey" -> "spark.sql.timestampNanosTypes.enabled",
+            "configValue" -> "true"))
+
+        // The table remains droppable with the flag off (a key reason for read-through: a table
+        // written with the flag on must never become un-manageable once it is off).
+        sql("DROP TABLE nanos_ddl_tbl")
+        assert(!spark.sessionState.catalog.tableExists(TableIdentifier("nanos_ddl_tbl")))
+      }
+    }
+  }
+
+  test("SPARK-57835: read a persisted view over a nanos column when the preview flag is off") {
+    withTable("nanos_view_base") {
+      withView("nanos_view") {
+        sql("CREATE TABLE nanos_view_base (id INT, ntz TIMESTAMP_NTZ(9)) USING parquet")
+        // The view persists its analyzed output schema (which includes the nanos column) into
+        // table properties; this is created with the flag on.
+        sql("CREATE VIEW nanos_view AS SELECT id, ntz FROM nanos_view_base")
+
+        withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "false") {
+          // Restoring the view schema from properties (DataType.fromJson) succeeds, so DESCRIBE
+          // renders the nanos column.
+          val describeRows = sql("DESCRIBE TABLE nanos_view").collect()
+            .map(r => r.getString(0) -> r.getString(1)).toMap
+          assert(describeRows("ntz") === "timestamp_ntz(9)")
+
+          // The view can still be dropped with the flag off.
+          sql("DROP VIEW nanos_view")
+          assert(!spark.sessionState.catalog.tableExists(TableIdentifier("nanos_view")))
+        }
+      }
+    }
+  }
+
+  test("SPARK-56822: DESCRIBE TABLE and SHOW CREATE TABLE render nanos columns with the flag on") {
+    withTable("nanos_basic_render", "nanos_basic_render_rt") {
+      // The preview flag is on by default in tests (via Utils.isTesting), so this exercises the
+      // normal happy path: create a table with nanos columns and introspect it with the flag on.
+      // SPARK-57835 covers the flag-off read-through path; this covers the basic flag-on case.
+      sql(
+        """CREATE TABLE nanos_basic_render (id INT, ntz TIMESTAMP_NTZ(9), ltz TIMESTAMP_LTZ(7))
+          |USING parquet""".stripMargin)
+
+      // DESCRIBE TABLE renders each column's type name (lowercase, with precision).
+      val describeRows = sql("DESCRIBE TABLE nanos_basic_render").collect()
+        .map(r => r.getString(0) -> r.getString(1)).toMap
+      assert(describeRows("ntz") === "timestamp_ntz(9)")
+      assert(describeRows("ltz") === "timestamp_ltz(7)")
+
+      // SHOW CREATE TABLE renders the parseable, uppercased DDL type for each column.
+      val showCreate = sql("SHOW CREATE TABLE nanos_basic_render").head().getString(0)
+      assert(showCreate.contains("TIMESTAMP_NTZ(9)"))
+      assert(showCreate.contains("TIMESTAMP_LTZ(7)"))
+
+      // Round-trip: the emitted DDL re-parses and re-creates an identical nanos schema.
+      sql(showCreate.replace("nanos_basic_render", "nanos_basic_render_rt"))
+      val rtSchema = spark.table("nanos_basic_render_rt").schema
+      assert(rtSchema("ntz").dataType === TimestampNTZNanosType(9))
+      assert(rtSchema("ltz").dataType === TimestampLTZNanosType(7))
     }
   }
 }

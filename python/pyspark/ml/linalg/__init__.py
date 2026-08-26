@@ -23,38 +23,38 @@ object from MLlib or pass SciPy `scipy.sparse` column vectors if
 SciPy is available in their environment.
 """
 
-import sys
 import array
 import struct
+import sys
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
-    cast,
     Dict,
     Iterable,
     List,
     Optional,
-    overload,
     Sequence,
     Tuple,
     Type,
-    TYPE_CHECKING,
     Union,
+    cast,
+    overload,
 )
 
 import numpy as np
 
 from pyspark.sql.types import (
-    UserDefinedType,
-    StructField,
-    StructType,
     ArrayType,
+    BooleanType,
+    ByteType,
+    DataTypeSingleton,
     DoubleType,
     IntegerType,
-    ByteType,
-    BooleanType,
+    StructField,
+    StructType,
+    UserDefinedType,
 )
-
 
 __all__ = [
     "Vector",
@@ -68,9 +68,8 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from pyspark.mllib._typing import NormType
     from pyspark.ml._typing import VectorLike
-    from scipy.sparse import spmatrix
+    from pyspark.mllib._typing import NormType
 
 
 # Check whether we have SciPy. MLlib works without it too, but if we have it, some methods,
@@ -85,23 +84,25 @@ except BaseException:
     _have_scipy = False
 
 
-def _convert_to_vector(d: Union["VectorLike", "spmatrix", range]) -> "Vector":
+def _convert_to_vector(d: "VectorLike") -> "Vector":
     if isinstance(d, Vector):
         return d
-    elif type(d) in (array.array, np.array, np.ndarray, list, tuple, range):
+    elif isinstance(d, (array.array, np.ndarray, list, tuple, range)):
         return DenseVector(d)
     elif _have_scipy and scipy.sparse.issparse(d):
-        assert cast("spmatrix", d).shape[1] == 1, "Expected column vector"
+        assert hasattr(d, "shape")
+        assert d.shape[1] == 1, "Expected column vector"
         # Make sure the converted csc_matrix has sorted indices.
-        csc = cast("spmatrix", d).tocsc()
+        assert hasattr(d, "tocsc")
+        csc = d.tocsc()
         if not csc.has_sorted_indices:
             csc.sort_indices()
-        return SparseVector(cast("spmatrix", d).shape[0], csc.indices, csc.data)
+        return SparseVector(d.shape[0], csc.indices, csc.data)
     else:
         raise TypeError("Cannot convert type %s into Vector" % type(d))
 
 
-def _vector_size(v: Union["VectorLike", "spmatrix", range]) -> int:
+def _vector_size(v: "VectorLike") -> int:
     """
     Returns the size of the vector.
 
@@ -124,16 +125,17 @@ def _vector_size(v: Union["VectorLike", "spmatrix", range]) -> int:
     """
     if isinstance(v, Vector):
         return len(v)
-    elif type(v) in (array.array, list, tuple, range):
+    elif isinstance(v, (array.array, list, tuple, range)):
         return len(v)
-    elif type(v) == np.ndarray:
+    elif isinstance(v, np.ndarray):
         if v.ndim == 1 or (v.ndim == 2 and v.shape[1] == 1):
             return len(v)
         else:
             raise ValueError("Cannot treat an ndarray of shape %s as a vector" % str(v.shape))
     elif _have_scipy and scipy.sparse.issparse(v):
-        assert cast("spmatrix", v).shape[1] == 1, "Expected column vector"
-        return cast("spmatrix", v).shape[0]
+        assert hasattr(v, "shape")
+        assert v.shape[1] == 1, "Expected column vector"
+        return v.shape[0]
     else:
         raise TypeError("Cannot treat type %s as a vector" % type(v))
 
@@ -156,7 +158,7 @@ def _double_to_long_bits(value: float) -> int:
     return struct.unpack("Q", struct.pack("d", value))[0]
 
 
-class VectorUDT(UserDefinedType):
+class VectorUDT(UserDefinedType, metaclass=DataTypeSingleton):
     """
     SQL user-defined type (UDT) for Vector.
     """
@@ -196,9 +198,9 @@ class VectorUDT(UserDefinedType):
     def deserialize(
         self, datum: Tuple[int, Optional[int], Optional[List[int]], List[float]]
     ) -> "Vector":
-        assert (
-            len(datum) == 4
-        ), "VectorUDT.deserialize given row with length %d but requires 4" % len(datum)
+        assert len(datum) == 4, (
+            "VectorUDT.deserialize given row with length %d but requires 4" % len(datum)
+        )
         tpe = datum[0]
         if tpe == 0:
             return SparseVector(cast(int, datum[1]), cast(List[int], datum[2]), datum[3])
@@ -211,7 +213,7 @@ class VectorUDT(UserDefinedType):
         return "vector"
 
 
-class MatrixUDT(UserDefinedType):
+class MatrixUDT(UserDefinedType, metaclass=DataTypeSingleton):
     """
     SQL user-defined type (UDT) for Matrix.
     """
@@ -264,9 +266,9 @@ class MatrixUDT(UserDefinedType):
         self,
         datum: Tuple[int, int, int, Optional[List[int]], Optional[List[int]], List[float], bool],
     ) -> "Matrix":
-        assert (
-            len(datum) == 7
-        ), "MatrixUDT.deserialize given row with length %d but requires 7" % len(datum)
+        assert len(datum) == 7, (
+            "MatrixUDT.deserialize given row with length %d but requires 7" % len(datum)
+        )
         tpe = datum[0]
         if tpe == 0:
             return SparseMatrix(*datum[1:])  # type: ignore[arg-type]
@@ -337,13 +339,13 @@ class DenseVector(Vector):
     def __reduce__(self) -> Tuple[Type["DenseVector"], Tuple[bytes]]:
         return DenseVector, (self.array.tobytes(),)
 
-    def numNonzeros(self) -> int:
+    def numNonzeros(self) -> Union[int, np.intp]:
         """
         Number of nonzero elements. This scans all active values and count non zeros
         """
         return np.count_nonzero(self.array)
 
-    def norm(self, p: "NormType") -> np.float64:
+    def norm(self, p: "NormType") -> np.floating[Any]:
         """
         Calculates the norm of a DenseVector.
 
@@ -386,15 +388,17 @@ class DenseVector(Vector):
             ...
         AssertionError: dimension mismatch
         """
-        if type(other) == np.ndarray:
+        if isinstance(other, np.ndarray):
             if other.ndim > 1:
                 assert len(self) == other.shape[0], "dimension mismatch"
             return np.dot(self.array, other)
         elif _have_scipy and scipy.sparse.issparse(other):
-            assert len(self) == cast("spmatrix", other).shape[0], "dimension mismatch"
-            return cast("spmatrix", other).transpose().dot(self.toArray())
+            assert hasattr(other, "shape")
+            assert len(self) == other.shape[0], "dimension mismatch"
+            assert hasattr(other, "transpose")
+            return other.transpose().dot(self.toArray())
         else:
-            assert len(self) == _vector_size(other), "dimension mismatch"
+            assert len(self) == _vector_size(other), "dimension mismatch"  # type: ignore[arg-type]
             if isinstance(other, SparseVector):
                 return other.dot(self)
             elif isinstance(other, Vector):
@@ -429,10 +433,11 @@ class DenseVector(Vector):
             ...
         AssertionError: dimension mismatch
         """
-        assert len(self) == _vector_size(other), "dimension mismatch"
+        assert len(self) == _vector_size(other), "dimension mismatch"  # type: ignore[arg-type]
         if isinstance(other, SparseVector):
             return other.squared_distance(self)
         elif _have_scipy and scipy.sparse.issparse(other):
+            assert isinstance(other, scipy.sparse.spmatrix), "other must be a scipy.sparse.spmatrix"
             return _convert_to_vector(other).squared_distance(self)  # type: ignore[attr-defined]
 
         if isinstance(other, Vector):
@@ -456,12 +461,10 @@ class DenseVector(Vector):
         return self.array
 
     @overload
-    def __getitem__(self, item: int) -> np.float64:
-        ...
+    def __getitem__(self, item: int) -> np.float64: ...
 
     @overload
-    def __getitem__(self, item: slice) -> np.ndarray:
-        ...
+    def __getitem__(self, item: slice) -> np.ndarray: ...
 
     def __getitem__(self, item: Union[int, slice]) -> Union[np.float64, np.ndarray]:
         return self.array[item]
@@ -536,24 +539,19 @@ class SparseVector(Vector):
     """
 
     @overload
-    def __init__(self, size: int, __indices: bytes, __values: bytes):
-        ...
+    def __init__(self, size: int, __indices: bytes, __values: bytes): ...
 
     @overload
-    def __init__(self, size: int, *args: Tuple[int, float]):
-        ...
+    def __init__(self, size: int, *args: Tuple[int, float]): ...
 
     @overload
-    def __init__(self, size: int, __indices: Iterable[int], __values: Iterable[float]):
-        ...
+    def __init__(self, size: int, __indices: Iterable[int], __values: Iterable[float]): ...
 
     @overload
-    def __init__(self, size: int, __pairs: Iterable[Tuple[int, float]]):
-        ...
+    def __init__(self, size: int, __pairs: Iterable[Tuple[int, float]]): ...
 
     @overload
-    def __init__(self, size: int, __map: Dict[int, float]):
-        ...
+    def __init__(self, size: int, __map: Dict[int, float]): ...
 
     def __init__(
         self,
@@ -599,7 +597,7 @@ class SparseVector(Vector):
         assert 1 <= len(args) <= 2, "must pass either 2 or 3 arguments"
         if len(args) == 1:
             pairs = args[0]
-            if type(pairs) == dict:
+            if isinstance(pairs, dict):
                 pairs = pairs.items()
             pairs = cast(Iterable[Tuple[int, float]], sorted(pairs))
             self.indices = np.array([p[0] for p in pairs], dtype=np.int32)
@@ -628,21 +626,22 @@ class SparseVector(Vector):
                     )
 
         if self.indices.size > 0:
-            assert (
-                np.max(self.indices) < self.size
-            ), "Index %d is out of the size of vector with size=%d" % (
-                np.max(self.indices),
-                self.size,
+            assert np.max(self.indices) < self.size, (
+                "Index %d is out of the size of vector with size=%d"
+                % (
+                    np.max(self.indices),
+                    self.size,
+                )
             )
             assert np.min(self.indices) >= 0, "Contains negative index %d" % (np.min(self.indices))
 
-    def numNonzeros(self) -> int:
+    def numNonzeros(self) -> Union[int, np.intp]:
         """
         Number of nonzero elements. This scans all active values and count non zeros.
         """
         return np.count_nonzero(self.values)
 
-    def norm(self, p: "NormType") -> np.float64:
+    def norm(self, p: "NormType") -> np.floating[Any]:
         """
         Calculates the norm of a SparseVector.
 
@@ -699,7 +698,7 @@ class SparseVector(Vector):
             assert len(self) == other.shape[0], "dimension mismatch"
             return np.dot(self.values, other[self.indices])
 
-        assert len(self) == _vector_size(other), "dimension mismatch"
+        assert len(self) == _vector_size(other), "dimension mismatch"  # type: ignore[arg-type]
 
         if isinstance(other, DenseVector):
             return np.dot(other.array[self.indices], self.values)
@@ -717,7 +716,7 @@ class SparseVector(Vector):
         else:
             return self.dot(_convert_to_vector(other))  # type: ignore[arg-type]
 
-    def squared_distance(self, other: Iterable[float]) -> np.float64:
+    def squared_distance(self, other: "VectorLike") -> np.float64:
         """
         Squared distance from a SparseVector or 1-dimensional NumPy array.
 
@@ -785,7 +784,7 @@ class SparseVector(Vector):
                 j += 1
             return result
         else:
-            return self.squared_distance(_convert_to_vector(other))  # type: ignore[arg-type]
+            return self.squared_distance(_convert_to_vector(other))
 
     def toArray(self) -> np.ndarray:
         """
@@ -862,7 +861,6 @@ class SparseVector(Vector):
 
 
 class Vectors:
-
     """
     Factory methods for working with vectors.
 
@@ -876,28 +874,23 @@ class Vectors:
 
     @staticmethod
     @overload
-    def sparse(size: int, __indices: bytes, __values: bytes) -> SparseVector:
-        ...
+    def sparse(size: int, __indices: bytes, __values: bytes) -> SparseVector: ...
 
     @staticmethod
     @overload
-    def sparse(size: int, *args: Tuple[int, float]) -> SparseVector:
-        ...
+    def sparse(size: int, *args: Tuple[int, float]) -> SparseVector: ...
 
     @staticmethod
     @overload
-    def sparse(size: int, __indices: Iterable[int], __values: Iterable[float]) -> SparseVector:
-        ...
+    def sparse(size: int, __indices: Iterable[int], __values: Iterable[float]) -> SparseVector: ...
 
     @staticmethod
     @overload
-    def sparse(size: int, __pairs: Iterable[Tuple[int, float]]) -> SparseVector:
-        ...
+    def sparse(size: int, __pairs: Iterable[Tuple[int, float]]) -> SparseVector: ...
 
     @staticmethod
     @overload
-    def sparse(size: int, __map: Dict[int, float]) -> SparseVector:
-        ...
+    def sparse(size: int, __map: Dict[int, float]) -> SparseVector: ...
 
     @staticmethod
     def sparse(
@@ -932,18 +925,15 @@ class Vectors:
 
     @overload
     @staticmethod
-    def dense(*elements: float) -> DenseVector:
-        ...
+    def dense(*elements: float) -> DenseVector: ...
 
     @overload
     @staticmethod
-    def dense(__arr: bytes) -> DenseVector:
-        ...
+    def dense(__arr: bytes) -> DenseVector: ...
 
     @overload
     @staticmethod
-    def dense(__arr: Iterable[float]) -> DenseVector:
-        ...
+    def dense(__arr: Iterable[float]) -> DenseVector: ...
 
     @staticmethod
     def dense(*elements: Union[float, bytes, np.ndarray, Iterable[float]]) -> DenseVector:
@@ -1370,7 +1360,7 @@ def _test() -> None:
         np.set_printoptions(legacy="1.13")
     except TypeError:
         pass
-    (failure_count, test_count) = doctest.testmod(optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(optionflags=doctest.ELLIPSIS)
     if failure_count:
         sys.exit(-1)
 

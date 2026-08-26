@@ -21,6 +21,7 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.spark.{JobArtifactSet, SparkException, TaskContext}
 import org.apache.spark.api.python.{ChainedPythonFunctions, PythonEvalType}
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.errors.QueryExecutionErrors
@@ -29,6 +30,7 @@ import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.python.EvalPythonExec.ArgumentMetadata
 import org.apache.spark.sql.types.{StructType, UserDefinedType}
 import org.apache.spark.sql.types.DataType.equalsIgnoreCompatibleCollation
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /**
  * Grouped a iterator into batches.
@@ -69,6 +71,12 @@ private[spark] class BatchIterator[T](iter: Iterator[T], batchSize: Int)
  *   <li> SQL_SCALAR_ARROW_ITER_UDF for Scalar Iterator Arrow UDF
  *   <li> SQL_SCALAR_PANDAS_UDF for Scalar Pandas UDF
  *   <li> SQL_SCALAR_PANDAS_ITER_UDF for Scalar Iterator Pandas UDF
+ *   <li> SQL_ARROW_ELEMENTWISE_UDF for a row-at-a-time UDF lifted out of a higher-order function's
+ *        lambda (see ExtractPythonUDFFromLambda)
+ *   <li> SQL_SCALAR_PANDAS_ELEMENTWISE_UDF for a Scalar Pandas UDF lifted out of such a lambda
+ *   <li> SQL_SCALAR_PANDAS_ITER_ELEMENTWISE_UDF for a Scalar Iterator Pandas UDF lifted out of one
+ *   <li> SQL_SCALAR_ARROW_ELEMENTWISE_UDF for a Scalar Arrow UDF lifted out of such a lambda
+ *   <li> SQL_SCALAR_ARROW_ITER_ELEMENTWISE_UDF for a Scalar Iterator Arrow UDF lifted out of one
  * </ul>
  *
  */
@@ -82,6 +90,62 @@ case class ArrowEvalPythonExec(
   }
 
   private[this] val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
+  private[this] val sessionUUID = {
+    Option(session).collect {
+      case session if session.sessionState.conf.pythonWorkerLoggingEnabled =>
+        session.sessionUUID
+    }
+  }
+
+  // When the child supports columnar output (e.g., Arrow-backed DSv2 connectors),
+  // accept columnar input to avoid the ColumnarToRow -> ArrowWriter round-trip.
+  // The Arrow FieldVectors are extracted directly from ArrowColumnVector and
+  // serialized to IPC, bypassing the row-based ArrowWriter conversion.
+  override def supportsColumnar: Boolean =
+    child.supportsColumnar && conf.arrowPySparkUDFColumnarInputEnabled
+  override def supportsRowBased: Boolean = true
+
+  override protected def doExecute(): RDD[InternalRow] = {
+    if (child.supportsColumnar) {
+      // Columnar path: delegate to doExecuteColumnar, flatten to
+      // UnsafeRow. ColumnarBatchRow from rowIterator() is NOT
+      // UnsafeRow, and downstream operators (e.g., outer
+      // EvalPythonExec) may cast to UnsafeRow.
+      doExecuteColumnar().mapPartitionsInternal { batchIter =>
+        val toUnsafe = UnsafeProjection.create(schema)
+        batchIter.flatMap(_.rowIterator().asScala.map(toUnsafe))
+      }
+    } else {
+      // Row-based path: unchanged.
+      super.doExecute()
+    }
+  }
+
+  override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
+    val inputRDD = child.executeColumnar()
+    if (conf.usePartitionEvaluator) {
+      inputRDD.mapPartitionsWithEvaluator(columnarEvaluatorFactory)
+    } else {
+      inputRDD.mapPartitionsWithIndexInternal { (index, iter) =>
+        columnarEvaluatorFactory.createEvaluator().eval(index, iter)
+      }
+    }
+  }
+
+  private lazy val columnarEvaluatorFactory =
+    new ColumnarArrowEvalPythonEvaluatorFactory(
+      child.output,
+      udfs,
+      output,
+      output.toStructType,
+      conf.arrowMaxRecordsPerBatch,
+      evalType,
+      conf.sessionLocalTimeZone,
+      conf.arrowUseLargeVarTypes,
+      ArrowPythonRunner.getPythonRunnerConfMap(conf),
+      pythonMetrics,
+      jobArtifactUUID,
+      sessionUUID)
 
   override protected def evaluatorFactory: EvalPythonEvaluatorFactory = {
     new ArrowEvalPythonEvaluatorFactory(
@@ -95,7 +159,7 @@ case class ArrowEvalPythonExec(
       ArrowPythonRunner.getPythonRunnerConfMap(conf),
       pythonMetrics,
       jobArtifactUUID,
-      conf.pythonUDFProfiler)
+      sessionUUID)
   }
 
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
@@ -104,6 +168,11 @@ case class ArrowEvalPythonExec(
   private def supportedPythonEvalTypes: Array[Int] =
     Array(
       PythonEvalType.SQL_ARROW_BATCHED_UDF,
+      PythonEvalType.SQL_ARROW_ELEMENTWISE_UDF,
+      PythonEvalType.SQL_SCALAR_PANDAS_ELEMENTWISE_UDF,
+      PythonEvalType.SQL_SCALAR_PANDAS_ITER_ELEMENTWISE_UDF,
+      PythonEvalType.SQL_SCALAR_ARROW_ELEMENTWISE_UDF,
+      PythonEvalType.SQL_SCALAR_ARROW_ITER_ELEMENTWISE_UDF,
       PythonEvalType.SQL_SCALAR_ARROW_UDF,
       PythonEvalType.SQL_SCALAR_ARROW_ITER_UDF,
       PythonEvalType.SQL_SCALAR_PANDAS_UDF,
@@ -121,7 +190,7 @@ class ArrowEvalPythonEvaluatorFactory(
     pythonRunnerConf: Map[String, String],
     pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
-    profiler: Option[String])
+    sessionUUID: Option[String])
   extends EvalPythonEvaluatorFactory(childOutput, udfs, output) {
 
   override def evaluate(
@@ -147,7 +216,10 @@ class ArrowEvalPythonEvaluatorFactory(
       pythonRunnerConf,
       pythonMetrics,
       jobArtifactUUID,
-      profiler) with BatchedPythonArrowInput
+      sessionUUID,
+      // Parallel to `funcs` (both come from `udfs` in order); tells the worker how many `array`
+      // levels each element-wise UDF flattens/re-nests (see `PythonUDF.elementwiseNestingDepth`).
+      udfs.map(_.elementwiseNestingDepth)) with BatchedPythonArrowInput
     val columnarBatchIter = pyRunner.compute(batchIter, context.partitionId(), context)
 
     columnarBatchIter.flatMap { batch =>

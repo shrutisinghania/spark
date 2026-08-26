@@ -17,17 +17,15 @@
 
 import os
 
-
 __all__ = ["SparkFiles"]
 
-from typing import cast, ClassVar, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, Optional, cast
 
 if TYPE_CHECKING:
     from pyspark import SparkContext
 
 
 class SparkFiles:
-
     """
     Resolves paths to files added through :meth:`SparkContext.addFile`.
 
@@ -151,11 +149,12 @@ class SparkFiles:
 def _test() -> None:
     import doctest
     import sys
+
     from pyspark import SparkContext
 
     globs = globals().copy()
     globs["sc"] = SparkContext("local[2]", "files tests")
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     globs["sc"].stop()
     if failure_count:
         sys.exit(-1)

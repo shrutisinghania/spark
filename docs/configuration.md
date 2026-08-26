@@ -282,7 +282,8 @@ of the most common options to set are:
   <td>1g</td>
   <td>
     Amount of memory to use per executor process, in the same format as JVM memory strings with
-    a size unit suffix ("k", "m", "g" or "t") (e.g. <code>512m</code>, <code>2g</code>).
+    a size unit suffix ("k", "m", "g" or "t") (e.g. <code>512m</code>, <code>2g</code>),
+    and with minimum value <code>450m</code>.
   </td>
   <td>0.7.0</td>
 </tr>
@@ -522,6 +523,16 @@ of the most common options to set are:
     file to use erasure coding, it will simply use file system defaults.
   </td>
   <td>3.0.0</td>
+</tr>
+<tr>
+  <td><code>spark.driver.log.redirectConsoleOutputs</code></td>
+  <td>stdout,stderr</td>
+  <td>
+    Comma-separated list of the console output kind for driver that needs to redirect
+    to logging system. Supported values are `stdout`, `stderr`. It only takes affect when
+    `spark.plugins` is configured with `org.apache.spark.deploy.RedirectConsolePlugin`.
+  </td>
+  <td>4.1.0</td>
 </tr>
 <tr>
   <td><code>spark.decommission.enabled</code></td>
@@ -773,6 +784,16 @@ Apart from these, the following properties are also available, and may be useful
   <td>1.1.0</td>
 </tr>
 <tr>
+  <td><code>spark.executor.logs.redirectConsoleOutputs</code></td>
+  <td>stdout,stderr</td>
+  <td>
+    Comma-separated list of the console output kind for executor that needs to redirect
+    to logging system. Supported values are `stdout`, `stderr`. It only takes affect when
+    `spark.plugins` is configured with `org.apache.spark.deploy.RedirectConsolePlugin`.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
   <td><code>spark.executor.userClassPathFirst</code></td>
   <td>false</td>
   <td>
@@ -858,6 +879,47 @@ Apart from these, the following properties are also available, and may be useful
   <td>1.2.0</td>
 </tr>
 <tr>
+  <td><code>spark.python.factory.idleWorkerMaxPoolSize</code></td>
+  <td>(none)</td>
+  <td>
+    Maximum number of idle Python workers to keep. If unset, the number is unbounded.
+    If set to a positive integer N, at most N idle workers are retained;
+    least-recently used workers are evicted first.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.python.worker.killOnIdleTimeout</code></td>
+  <td>false</td>
+  <td>
+    Whether Spark should terminate the Python worker process when the idle timeout
+    (as defined by <code>spark.python.worker.idleTimeoutSeconds</code>) is reached. If enabled,
+    Spark will terminate the Python worker process in addition to logging the status.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.python.worker.tracebackDumpIntervalSeconds</code></td>
+  <td>0</td>
+  <td>
+    The interval (in seconds) for Python workers to dump their tracebacks.
+    If it's positive, the Python worker will periodically dump the traceback into
+    its `stderr`. The default is `0` that means it is disabled.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.python.unix.domain.socket.enabled</code></td>
+  <td>false</td>
+  <td>
+    When set to true, the Python driver uses a Unix domain socket for operations like
+    creating or collecting a DataFrame from local data, using accumulators, and executing
+    Python functions with PySpark such as Python UDFs. This configuration only applies
+    to Spark Classic and Spark Connect server.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
   <td><code>spark.files</code></td>
   <td></td>
   <td>
@@ -872,6 +934,16 @@ Apart from these, the following properties are also available, and may be useful
     Comma-separated list of .zip, .egg, or .py files to place on the PYTHONPATH for Python apps. Globs are allowed.
   </td>
   <td>1.0.1</td>
+</tr>
+<tr>
+  <td><code>spark.submit.callSystemExitOnMainExit</code></td>
+  <td>false</td>
+  <td>
+    If true, SparkSubmit will call System.exit() to initiate JVM shutdown once the
+    user's main method has exited. This can be useful in cases where non-daemon JVM
+    threads might otherwise prevent the JVM from shutting down on its own.
+  </td>
+  <td>4.1.0</td>
 </tr>
 <tr>
   <td><code>spark.jars</code></td>
@@ -1432,6 +1504,14 @@ Apart from these, the following properties are also available, and may be useful
   <td>3.0.0</td>
 </tr>
 <tr>
+  <td><code>spark.eventLog.excludedPatterns</code></td>
+  <td>(none)</td>
+  <td>
+    Specifies comma-separated event names to be excluded from the event logs.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
   <td><code>spark.eventLog.dir</code></td>
   <td>file:///tmp/spark-events</td>
   <td>
@@ -1469,7 +1549,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.eventLog.rolling.enabled</code></td>
-  <td>false</td>
+  <td>true</td>
   <td>
     Whether rolling over event log files is enabled. If set to true, it cuts down each event
     log file to the configured size.
@@ -1524,6 +1604,21 @@ Apart from these, the following properties are also available, and may be useful
     Allows jobs and stages to be killed from the web UI.
   </td>
   <td>1.0.0</td>
+</tr>
+<tr>
+  <td><code>spark.ui.holdEnabled</code></td>
+  <td>true</td>
+  <td>
+    Allows the whole application to be held and resumed from the web UI. Holding gracefully
+    decommissions all executors and stops requesting new ones. Cached blocks are not preserved
+    and are recomputed after resuming. This takes effect only when
+    <code>spark.decommission.enabled</code> is true, the shuffle data is kept outside the
+    executors (through either <code>spark.shuffle.service.enabled</code> or a
+    <code>ShuffleDataIO</code> with reliable storage), and the cluster manager can hold
+    executors: Standalone, YARN, and Kubernetes with
+    <code>spark.kubernetes.allocation.pods.allocator=direct</code>.
+  </td>
+  <td>4.4.0</td>
 </tr>
 <tr>
   <td><code>spark.ui.threadDumpsEnabled</code></td>
@@ -1806,14 +1901,6 @@ Apart from these, the following properties are also available, and may be useful
   </td>
   <td>1.4.0</td>
 </tr>
-<tr>
-  <td><code>spark.appStatusStore.diskStoreDir</code></td>
-  <td>None</td>
-  <td>
-    Local directory where to store diagnostic information of SQL executions. This configuration is only for live UI.
-  </td>
-  <td>3.4.0</td>
-</tr>
 </table>
 
 ### Compression and Serialization
@@ -1914,6 +2001,15 @@ Apart from these, the following properties are also available, and may be useful
   <td>3.2.0</td>
 </tr>
 <tr>
+  <td><code>spark.io.compression.zstd.strategy</code></td>
+  <td>(none)</td>
+  <td>
+    Compression strategy for Zstd compression codec. The higher the value is, the more
+    complex it becomes, usually resulting stronger but slower compression or higher CPU cost.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
   <td><code>spark.io.compression.zstd.workers</code></td>
   <td>0</td>
   <td>
@@ -1926,7 +2022,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.io.compression.lzf.parallel.enabled</code></td>
-  <td>false</td>
+  <td>true</td>
   <td>
     When true, LZF compression will use multiple threads to compress data in parallel.
   </td>
@@ -2010,7 +2106,7 @@ Apart from these, the following properties are also available, and may be useful
 </tr>
 <tr>
   <td><code>spark.rdd.compress</code></td>
-  <td>false</td>
+  <td>true</td>
   <td>
     Whether to compress serialized RDD partitions (e.g. for
     <code>StorageLevel.MEMORY_ONLY_SER</code> in Java
@@ -2101,6 +2197,17 @@ Apart from these, the following properties are also available, and may be useful
   <td>1.6.0</td>
 </tr>
 <tr>
+  <td><code>spark.memory.unmanagedMemoryPollingInterval</code></td>
+  <td>0s</td>
+  <td>
+    Interval for polling unmanaged memory users to track their memory usage.
+    Unmanaged memory users are components that manage their own memory outside of
+    Spark's core memory management, such as RocksDB for Streaming State Store.
+    Setting this to 0 disables unmanaged memory polling.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
   <td><code>spark.storage.unrollMemoryThreshold</code></td>
   <td>1024 * 1024</td>
   <td>
@@ -2132,7 +2239,8 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.cleaner.periodicGC.interval</code></td>
   <td>30min</td>
   <td>
-    Controls how often to trigger a garbage collection.<br><br>
+    Controls how often to trigger a garbage collection. Setting this to 0 or a negative
+    value disables the periodic garbage collection.<br><br>
     This context cleaner triggers cleanups only when weak references are garbage collected.
     In long-running applications with large driver JVMs, where there is little memory pressure
     on the driver, this may happen very occasionally or not at all. Not cleaning at all may
@@ -2550,6 +2658,28 @@ Apart from these, the following properties are also available, and may be useful
     This is used for communicating with the executors and the standalone Master.
   </td>
   <td>0.7.0</td>
+</tr>
+<tr>
+  <td><code>spark.driver.metrics.pollingInterval</code></td>
+  <td>10s</td>
+  <td>
+    How often to collect driver metrics (in milliseconds).
+    If unset, the polling is done at the executor heartbeat interval.
+    If set, the polling is done at this interval.
+  </td>
+  <td>4.1.0</td>
+</tr>
+<tr>
+  <td><code>spark.io.mode.default</code></td>
+  <td>AUTO</td>
+  <td>
+    The default IO mode for Netty transports.
+    One of <code>NIO</code>, <code>EPOLL</code>, <code>KQUEUE</code>, or <code>AUTO</code>.
+    The default value is <code>AUTO</code> which means to use native Netty libraries if available.
+    In other words, for Linux environments, <code>EPOLL</code> is used if available before using <code>NIO</code>.
+    For MacOS/BSD environments, <code>KQUEUE</code> is used if available before using <code>NIO</code>.
+  </td>
+  <td>4.1.0</td>
 </tr>
 <tr>
   <td><code>spark.rpc.io.backLog</code></td>
@@ -3017,9 +3147,11 @@ Apart from these, the following properties are also available, and may be useful
     slots on a single executor and the task is taking longer time than the threshold. This config
     helps speculate stage with very few tasks. Regular speculation configs may also apply if the
     executor slots are large enough. E.g. tasks might be re-launched if there are enough successful
-    runs even though the threshold hasn't been reached. The number of slots is computed based on
-    the conf values of spark.executor.cores and spark.task.cpus minimum 1.
-    Default unit is bytes, unless otherwise specified.
+    runs even though the threshold hasn't been reached. The number of slots is the maximum
+    number of concurrent tasks per executor for the stage's resource profile, computed from
+    the executor cores and the task cpus amount (which may be fractional), or 1 when the
+    executor cores are not known.
+    Default unit is milliseconds, unless otherwise specified.
   </td>
   <td>3.0.0</td>
 </tr>
@@ -3027,7 +3159,7 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.speculation.efficiency.processRateMultiplier</code></td>
   <td>0.75</td>
   <td>
-    A multiplier that used when evaluating inefficient tasks. The higher the multiplier
+    A multiplier that is used when evaluating inefficient tasks. The higher the multiplier
     is, the more tasks will be possibly considered as inefficient.
   </td>
   <td>3.4.0</td>
@@ -3062,7 +3194,10 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.task.cpus</code></td>
   <td>1</td>
   <td>
-    Number of cores to allocate for each task.
+    Number of cores to allocate for each task. This can also be set to a fractional value,
+    either below 1 (e.g. <code>0.2</code>) to allow multiple tasks to share a CPU core, or
+    above 1 (e.g. <code>1.5</code>). In either case the number of tasks that can run
+    concurrently on an executor is <code>floor(executor cores / spark.task.cpus)</code>.
   </td>
   <td>0.5.0</td>
 </tr>
@@ -3445,6 +3580,30 @@ They are typically set via the config file and command-line options with `--conf
   </td>
   <td>Sets the maximum inbound message size for the gRPC requests. Requests with a larger payload will fail.</td>
   <td>3.4.0</td>
+</tr>
+<tr>
+  <td><code>spark.connect.grpc.keepAlive.enabled</code></td>
+  <td>
+    true
+  </td>
+  <td>Whether the server sends gRPC/HTTP2 keepalive PINGs to detect and terminate silently-dead client connections. Can be turned off as an escape hatch, e.g. if it interacts badly with a particular network path, or a server environment is prone to stalls (long GC pauses, etc.) long enough to trip false-positive disconnects.</td>
+  <td>4.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.connect.grpc.keepAlive.time</code></td>
+  <td>
+    60s
+  </td>
+  <td>Sets the time the server waits for the connection to be idle before sending a gRPC/HTTP2 keepalive PING, to detect and terminate a silently-dead connection (e.g. after a NAT gateway or load balancer drops an idle connection mapping without closing the socket). The server separately tolerates client-sent keepalive PINGs no more often than every 10s regardless of this setting; a client configured with <code>grpc_keepalive_time_ms</code> below that floor will have its connection torn down as "too_many_pings".</td>
+  <td>4.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.connect.grpc.keepAlive.timeout</code></td>
+  <td>
+    20s
+  </td>
+  <td>Sets how long the server waits for a keepalive PING ack before considering the connection dead.</td>
+  <td>4.3.0</td>
 </tr>
 <tr>
   <td><code>spark.connect.extensions.relation.classes</code></td>

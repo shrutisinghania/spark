@@ -52,7 +52,7 @@ private[sql] class YearUDT extends UserDefinedType[Year] {
   private[spark] override def asNullable: YearUDT = this
 }
 
-class UserDefinedTypeSuite extends QueryTest with SharedSparkSession with ParquetTest
+class UserDefinedTypeSuite extends SharedSparkSession with ParquetTest
     with ExpressionEvalHelper {
   import testImplicits._
 
@@ -293,8 +293,33 @@ class UserDefinedTypeSuite extends QueryTest with SharedSparkSession with Parque
     val unwrappedFeaturesArrays: Array[Array[Double]] = unwrappedFeatures.collect()
     assert(unwrappedFeaturesArrays.length === 2)
 
-    java.util.Arrays.equals(unwrappedFeaturesArrays(0), Array(0.1, 1.0))
-    java.util.Arrays.equals(unwrappedFeaturesArrays(1), Array(0.2, 2.0))
+    assert(Arrays.equals(unwrappedFeaturesArrays(0), Array(0.1, 1.0)))
+    assert(Arrays.equals(unwrappedFeaturesArrays(1), Array(0.2, 2.0)))
+  }
+
+  test("Test wrap_udt function") {
+    val udt = new TestUDT.MyDenseVectorUDT()
+    val df = Seq(Array(0.1, 1.0), Array(0.2, 2.0)).toDF("features")
+    val wrappedFeatures = df.select(wrap_udt(col("features"), udt).as("features"))
+
+    assert(wrappedFeatures.schema("features").dataType === udt)
+    checkAnswer(
+      wrappedFeatures,
+      Seq(
+        Row(new TestUDT.MyDenseVector(Array(0.1, 1.0))),
+        Row(new TestUDT.MyDenseVector(Array(0.2, 2.0)))))
+  }
+
+  test("Test unwrap_udt and wrap_udt round trip") {
+    val udt = new TestUDT.MyDenseVectorUDT()
+    val roundTrip = pointsRDD.select(wrap_udt(unwrap_udt(col("features")), udt).as("features"))
+
+    assert(roundTrip.schema("features").dataType === udt)
+    checkAnswer(
+      roundTrip,
+      Seq(
+        Row(new TestUDT.MyDenseVector(Array(0.1, 1.0))),
+        Row(new TestUDT.MyDenseVector(Array(0.2, 2.0)))))
   }
 
   test("SPARK-46289: UDT ordering") {
@@ -329,5 +354,12 @@ class UserDefinedTypeSuite extends QueryTest with SharedSparkSession with Parque
     checkDataset(
       spark.range(10).map(i => Year.of(i.toInt + 2018)),
       (0 to 9).map(i => Year.of(i + 2018)): _*)
+  }
+
+  test("SPARK-53518: No truncation for catalogString of User Defined Type") {
+    withSQLConf(SQLConf.MAX_TO_STRING_FIELDS.key -> "3") {
+      val string = new ExampleIntRowUDT(4).catalogString
+      assert(string == "struct<col0:int,col1:int,col2:int,col3:int>")
+    }
   }
 }

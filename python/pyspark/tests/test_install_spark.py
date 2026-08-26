@@ -14,25 +14,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import io
 import os
+import re
+import tarfile
 import tempfile
 import unittest
+import urllib.request
 
 from pyspark.install import (
-    install_spark,
     DEFAULT_HADOOP,
     DEFAULT_HIVE,
     UNSUPPORTED_COMBINATIONS,
-    checked_versions,
+    _extract_tar,
     checked_package_name,
+    checked_versions,
+    get_preferred_mirrors,
+    install_spark,
 )
 
 
 class SparkInstallationTestCase(unittest.TestCase):
+    def get_latest_spark_version(self):
+        if "PYSPARK_RELEASE_MIRROR" in os.environ:
+            sites = [os.environ["PYSPARK_RELEASE_MIRROR"]]
+        else:
+            sites = get_preferred_mirrors()
+        # Filter out the archive sites
+        sites = [site for site in sites if "archive.apache.org" not in site]
+        for site in sites:
+            url = site + "/spark/"
+            try:
+                with urllib.request.urlopen(url) as response:
+                    html = response.read().decode("utf-8")
+                    versions = re.findall(r"spark-(\d+[\.-]\d+[\.-]\d+)/", html)
+                    versions = [v.replace("-", ".") for v in versions]
+                    return max(versions)
+            except Exception:
+                continue
+        return None
+
     def test_install_spark(self):
         # Test only one case. Testing this is expensive because it needs to download
-        # the Spark distribution, ensure it is available at https://dlcdn.apache.org/spark/
-        spark_version, hadoop_version, hive_version = checked_versions("3.5.6", "3", "2.3")
+        # the Spark distribution. We try to get the latest version, but if we can't,
+        # we just use a hard-coded version.
+        spark_version = self.get_latest_spark_version() or "4.1.1"
+        spark_version, hadoop_version, hive_version = checked_versions(spark_version, "3", "2.3")
 
         with tempfile.TemporaryDirectory(prefix="test_install_spark") as tmp_dir:
             install_spark(
@@ -45,6 +72,40 @@ class SparkInstallationTestCase(unittest.TestCase):
             self.assertTrue(os.path.isdir("%s/jars" % tmp_dir))
             self.assertTrue(os.path.exists("%s/bin/spark-submit" % tmp_dir))
             self.assertTrue(os.path.exists("%s/RELEASE" % tmp_dir))
+
+    def test_extract_tar(self):
+        # A benign member is extracted with the top-level package directory
+        # stripped, while a member whose path escapes the destination
+        # directory (zip slip) is rejected rather than extracted.
+        package_name = "spark-4.1.1-bin-hadoop3"
+
+        def make_tar(path, member_name):
+            with tarfile.open(path, "w") as tar:
+                data = b"content"
+                info = tarfile.TarInfo(name=member_name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+        with tempfile.TemporaryDirectory(prefix="test_install_spark") as tmp_dir:
+            # Benign archive extracts into dest with the package prefix removed.
+            safe_tar = os.path.join(tmp_dir, "safe.tar")
+            make_tar(safe_tar, "%s/bin/spark-submit" % package_name)
+            safe_dest = os.path.join(tmp_dir, "safe_dest")
+            os.makedirs(safe_dest)
+            with tarfile.open(safe_tar, "r") as tar:
+                _extract_tar(tar, package_name, safe_dest)
+            self.assertTrue(os.path.exists(os.path.join(safe_dest, "bin", "spark-submit")))
+
+            # Malicious archive member escaping dest is rejected, and nothing
+            # is written into the destination directory.
+            evil_tar = os.path.join(tmp_dir, "evil.tar")
+            make_tar(evil_tar, "%s/../../evil" % package_name)
+            evil_dest = os.path.join(tmp_dir, "evil_dest")
+            os.makedirs(evil_dest)
+            with tarfile.open(evil_tar, "r") as tar:
+                with self.assertRaisesRegex(ValueError, "outside of the destination"):
+                    _extract_tar(tar, package_name, evil_dest)
+            self.assertEqual([], os.listdir(evil_dest))
 
     def test_package_name(self):
         self.assertEqual(
@@ -82,6 +143,17 @@ class SparkInstallationTestCase(unittest.TestCase):
             checked_versions("spark-3.3.0", "hadoop3", "hive2.3"),
         )
 
+        # Prerelease version (e.g. pip dev builds)
+        self.assertEqual(
+            ("spark-4.2.0.dev4", "hadoop3", "hive2.3"),
+            checked_versions("4.2.0.dev4", "3", "2.3"),
+        )
+
+        self.assertEqual(
+            ("spark-4.2.0.dev4", "hadoop3", "hive2.3"),
+            checked_versions("spark-4.2.0.dev4", "hadoop3", "hive2.3"),
+        )
+
         # Negative test cases
         for hadoop_version, hive_version in UNSUPPORTED_COMBINATIONS:
             with self.assertRaisesRegex(RuntimeError, "Hive.*should.*Hadoop"):
@@ -113,12 +185,6 @@ class SparkInstallationTestCase(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_install_spark import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

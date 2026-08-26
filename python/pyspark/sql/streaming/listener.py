@@ -14,13 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import uuid
 import json
-from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
+import uuid
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
-from pyspark.sql import Row
 from pyspark import cloudpickle
+from pyspark.sql.types import Row
 
 __all__ = ["StreamingQueryListener"]
 
@@ -64,7 +64,8 @@ class StreamingQueryListener(ABC):
     """
 
     def _set_spark_session(
-        self, session: "SparkSession"  # type: ignore[name-defined] # noqa: F821
+        self,
+        session: "SparkSession",  # type: ignore[name-defined] # noqa: F821
     ) -> None:
         if self.spark is None:
             self.spark = session
@@ -134,10 +135,8 @@ class StreamingQueryListener(ABC):
         if hasattr(self, "_jlistenerobj"):
             return self._jlistenerobj
 
-        self._jlistenerobj: "JavaObject" = (
-            SparkContext._jvm.PythonStreamingQueryListenerWrapper(  # type: ignore[union-attr]
-                JStreamingQueryListener(self)
-            )
+        self._jlistenerobj: "JavaObject" = SparkContext._jvm.PythonStreamingQueryListenerWrapper(  # type: ignore[union-attr]
+            JStreamingQueryListener(self)
         )
         return self._jlistenerobj
 
@@ -444,9 +443,9 @@ class StreamingQueryProgress(dict):
         stateOperators: List["StateOperatorProgress"],
         sources: List["SourceProgress"],
         sink: "SinkProgress",
-        numInputRows: int,
-        inputRowsPerSecond: float,
-        processedRowsPerSecond: float,
+        numInputRows: Optional[int],
+        inputRowsPerSecond: Optional[float],
+        processedRowsPerSecond: Optional[float],
         observedMetrics: Dict[str, Row],
         jprogress: Optional["JavaObject"] = None,
         jdict: Optional[Dict[str, Any]] = None,
@@ -518,15 +517,17 @@ class StreamingQueryProgress(dict):
             sink=SinkProgress.fromJson(j["sink"]),
             numInputRows=j["numInputRows"] if "numInputRows" in j else None,
             inputRowsPerSecond=j["inputRowsPerSecond"] if "inputRowsPerSecond" in j else None,
-            processedRowsPerSecond=j["processedRowsPerSecond"]
-            if "processedRowsPerSecond" in j
-            else None,
-            observedMetrics={
-                k: Row(*row_dict.keys())(*row_dict.values())  # Assume no nested rows
-                for k, row_dict in j["observedMetrics"].items()
-            }
-            if "observedMetrics" in j
-            else {},
+            processedRowsPerSecond=(
+                j["processedRowsPerSecond"] if "processedRowsPerSecond" in j else None
+            ),
+            observedMetrics=(
+                {
+                    k: Row(*row_dict.keys())(*row_dict.values())  # Assume no nested rows
+                    for k, row_dict in j["observedMetrics"].items()
+                }
+                if "observedMetrics" in j
+                else {}
+            ),
         )
 
     @property
@@ -914,12 +915,20 @@ class SourceProgress(dict):
 
     @classmethod
     def fromJson(cls, j: Dict[str, Any]) -> "SourceProgress":
+        def _to_json_string(value: Any) -> str:
+            """Convert offset value to JSON string. If already a string, return as-is.
+            If a dict/list, JSON-encode it."""
+            if isinstance(value, str):
+                return value
+            else:
+                return json.dumps(value)
+
         return cls(
             jdict=j,
             description=j["description"],
-            startOffset=str(j["startOffset"]),
-            endOffset=str(j["endOffset"]),
-            latestOffset=str(j["latestOffset"]),
+            startOffset=_to_json_string(j["startOffset"]),
+            endOffset=_to_json_string(j["endOffset"]),
+            latestOffset=_to_json_string(j["latestOffset"]),
             numInputRows=j["numInputRows"],
             inputRowsPerSecond=j["inputRowsPerSecond"],
             processedRowsPerSecond=j["processedRowsPerSecond"],
@@ -1103,24 +1112,28 @@ class SinkProgress(dict):
 
 
 def _test() -> None:
-    import sys
     import doctest
     import os
-    from pyspark.sql import SparkSession
-    import pyspark.sql.streaming.listener
+    import sys
+
     from py4j.protocol import Py4JError
+
+    import pyspark.sql.streaming.listener
+    from pyspark.core.context import SparkContext
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
     globs = pyspark.sql.streaming.listener.__dict__.copy()
+    sc = SparkContext("local[4]", "PythonTest")
     try:
         spark = SparkSession._getActiveSessionOrCreate()
-    except Py4JError:  # noqa: F821
-        spark = SparkSession(sc)  # type: ignore[name-defined] # noqa: F821
+    except Py4JError:
+        spark = SparkSession(sc)
 
     globs["spark"] = spark
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.streaming.listener,
         globs=globs,
     )

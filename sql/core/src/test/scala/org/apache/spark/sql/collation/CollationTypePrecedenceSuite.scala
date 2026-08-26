@@ -18,12 +18,12 @@
 package org.apache.spark.sql.collation
 
 import org.apache.spark.SparkThrowable
-import org.apache.spark.sql.{DataFrame, QueryTest, Row}
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
-class CollationTypePrecedenceSuite extends QueryTest with SharedSparkSession {
+class CollationTypePrecedenceSuite extends SharedSparkSession {
 
   val dataSource: String = "parquet"
   val UNICODE_COLLATION_NAME = "SYSTEM.BUILTIN.UNICODE"
@@ -51,6 +51,22 @@ class CollationTypePrecedenceSuite extends QueryTest with SharedSparkSession {
   private def assertQuerySchema(df: => DataFrame, expectedSchema: DataType): Unit = {
     val querySchema = df.schema.fields.head.dataType
     assert(DataType.equalsIgnoreNullability(querySchema, expectedSchema))
+  }
+
+  private def testFixedPointAndSinglePass(testName: String)(testBody: => Unit): Unit = {
+    test(s"$testName (fixed-point analyzer)") {
+      withSQLConf(SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false") {
+        testBody
+      }
+    }
+
+    test(s"$testName (single-pass analyzer)") {
+      withSQLConf(
+        SQLConf.ANALYZER_SINGLE_PASS_RESOLVER_ENABLED_TENTATIVELY.key -> "true",
+        SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false") {
+        testBody
+      }
+    }
   }
 
   test("explicit collation propagates up") {
@@ -165,27 +181,28 @@ class CollationTypePrecedenceSuite extends QueryTest with SharedSparkSession {
   test("variables have implicit collation") {
     val v1Collation = UTF8_BINARY_COLLATION_NAME
     val v2Collation = UTF8_LCASE_COLLATION_NAME
-    sql(s"DECLARE v1 = 'a'")
-    sql(s"DECLARE v2 = 'b' collate $v2Collation")
+    withSessionVariable("v1", "a", collation = None) {
+      withSessionVariable("v2", "b", collation = Some(v2Collation)) {
+        checkAnswer(
+          sql(s"SELECT COLLATION(v1 || 'a')"),
+          Row(v1Collation))
 
-    checkAnswer(
-      sql(s"SELECT COLLATION(v1 || 'a')"),
-      Row(v1Collation))
+        checkAnswer(
+          sql(s"SELECT COLLATION(v2 || 'a')"),
+          Row(v2Collation))
 
-    checkAnswer(
-      sql(s"SELECT COLLATION(v2 || 'a')"),
-      Row(v2Collation))
+        checkAnswer(
+          sql(s"SELECT COLLATION(v2 || 'a' COLLATE UTF8_BINARY)"),
+          Row(UTF8_BINARY_COLLATION_NAME))
 
-    checkAnswer(
-      sql(s"SELECT COLLATION(v2 || 'a' COLLATE UTF8_BINARY)"),
-      Row(UTF8_BINARY_COLLATION_NAME))
+        checkAnswer(
+          sql(s"SELECT COLLATION(SUBSTRING(v2, 0, 1) || 'a')"),
+          Row(v2Collation))
 
-    checkAnswer(
-      sql(s"SELECT COLLATION(SUBSTRING(v2, 0, 1) || 'a')"),
-      Row(v2Collation))
-
-    assertIndeterminateCollation(sql(s"SELECT v1 = v2"))
-    assertIndeterminateCollation(sql(s"SELECT SUBSTRING(v1, 0, 1) = v2"))
+        assertIndeterminateCollation(sql(s"SELECT v1 = v2"))
+        assertIndeterminateCollation(sql(s"SELECT SUBSTRING(v1, 0, 1) = v2"))
+      }
+    }
   }
 
   test("subqueries have implicit collation strength") {
@@ -227,7 +244,7 @@ class CollationTypePrecedenceSuite extends QueryTest with SharedSparkSession {
     )
   }
 
-  test("in subquery expression") {
+  testFixedPointAndSinglePass("in subquery expression") {
     val tableName = "subquery_tbl"
     withTable(tableName) {
       sql(s"""
@@ -283,7 +300,7 @@ class CollationTypePrecedenceSuite extends QueryTest with SharedSparkSession {
     }
   }
 
-  test("scalar subquery") {
+  testFixedPointAndSinglePass("scalar subquery") {
     val tableName = "scalar_subquery_tbl"
     withTable(tableName) {
       sql(s"""
@@ -780,6 +797,16 @@ class CollationTypePrecedenceSuite extends QueryTest with SharedSparkSession {
           assertThrowsError(selectQuery(condition), "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE")
         }
       }
+    }
+  }
+
+  private def withSessionVariable(name: String, value: String, collation: Option[String] = None)(
+      body: => Unit): Unit = {
+    sql(s"DECLARE $name = '$value'" + collation.map(c => s" COLLATE $c").getOrElse(""))
+    try {
+      body
+    } finally {
+      sql(s"DROP TEMPORARY VARIABLE $name")
     }
   }
 }

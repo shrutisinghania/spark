@@ -17,11 +17,10 @@
 
 package org.apache.spark.sql.execution.streaming.state
 
-import java.io.{ByteArrayInputStream, ByteArrayOutputStream, File, IOException, ObjectInputStream, ObjectOutputStream}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, File, IOException, ObjectInputStream, ObjectOutputStream, PrintWriter}
 import java.net.URI
 import java.util
 import java.util.UUID
-import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.mutable
@@ -38,147 +37,20 @@ import org.scalatest.time.SpanSugar._
 
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext._
-import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.util.quietly
 import org.apache.spark.sql.execution.streaming._
+import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamExecution}
 import org.apache.spark.sql.execution.streaming.state.StateStoreCoordinatorSuite.withCoordinatorRef
 import org.apache.spark.sql.functions.count
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 import org.apache.spark.tags.ExtendedSQLTest
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
-
-/**
- * A test StateStoreProvider implementation that controls maintenance execution
- * timing using a CountDownLatch to simulate concurrent maintenance scenarios.
- *
- * This provider is used to test the scenario where a task thread attempts to
- * unload a provider via maintenance while it's already being processed by a
- * maintenance thread. This tests the awaitProcessThisPartition functionality
- * that ensures proper synchronization in StateStore's maintenance thread pool.
- */
-class SignalingStateStoreProvider extends StateStoreProvider with Logging {
-  import SignalingStateStoreProvider._
-  private var id: StateStoreId = null
-
-  override def init(
-      stateStoreId: StateStoreId,
-      keySchema: StructType,
-      valueSchema: StructType,
-      keyStateEncoderSpec: KeyStateEncoderSpec,
-      useColumnFamilies: Boolean,
-      storeConfs: StateStoreConf,
-      hadoopConf: Configuration,
-      useMultipleValuesPerKey: Boolean = false,
-      stateSchemaProvider: Option[StateSchemaProvider] = None): Unit = {
-    id = stateStoreId
-  }
-
-  override def stateStoreId: StateStoreId = id
-
-  /**
-   * Records which thread called close() to verify that only maintenance threads close providers
-   */
-  override def close(): Unit = {
-    closeThreadName = Thread.currentThread.getName
-  }
-
-  /**
-   * This test implementation doesn't need to provide an actual store
-   */
-  override def getStore(
-      version: Long,
-      uniqueId: Option[String]): StateStore = null
-
-  /**
-   * Simulates a maintenance operation that blocks until a signal is received.
-   * This allows testing the scenario where a provider is already under maintenance
-   * when a task thread tries to trigger another maintenance operation on it.
-   */
-  override def doMaintenance(): Unit = {
-    maintenanceStarted = true
-    logInfo(s"Maintenance started on thread: ${Thread.currentThread().getName}")
-
-    // Block until the test signals to continue
-    continueSignal.await()
-
-    logInfo(s"Maintenance continuing after signal on thread: ${Thread.currentThread().getName}")
-  }
-}
-
-/**
- * Companion object that tracks state and provides synchronization primitives
- * for testing concurrent maintenance scenarios
- */
-object SignalingStateStoreProvider extends Logging {
-  // For tracking state across threads
-  var maintenanceStarted: Boolean = false
-  var taskSubmittedMaintenance: Boolean = false
-  var closeThreadName: String = ""
-
-  // Added for queue testing
-  var providerWasQueued: Boolean = false
-
-  // For coordination between threads
-  var continueSignal = new CountDownLatch(1)
-  val maintenanceStartedLatch = new CountDownLatch(1)
-  val taskAttemptCompletedLatch = new CountDownLatch(1)
-
-  /**
-   * Resets all test state between test runs
-   */
-  def reset(): Unit = {
-    maintenanceStarted = false
-    taskSubmittedMaintenance = false
-    closeThreadName = ""
-
-    // Reset the latch to ensure maintenance will block again
-    try {
-      continueSignal = new CountDownLatch(1)
-    } catch {
-      case e: Exception =>
-        logError(s"Error resetting latch: ${e.getMessage}")
-    }
-  }
-}
-
-class FakeStateStoreProviderTracksCloseThread extends StateStoreProvider {
-  import FakeStateStoreProviderTracksCloseThread._
-  private var id: StateStoreId = null
-
-  override def init(
-      stateStoreId: StateStoreId,
-      keySchema: StructType,
-      valueSchema: StructType,
-      keyStateEncoderSpec: KeyStateEncoderSpec,
-      useColumnFamilies: Boolean,
-      storeConfs: StateStoreConf,
-      hadoopConf: Configuration,
-      useMultipleValuesPerKey: Boolean = false,
-      stateSchemaProvider: Option[StateSchemaProvider] = None): Unit = {
-    id = stateStoreId
-  }
-
-  override def stateStoreId: StateStoreId = id
-
-  override def close(): Unit = {
-    closeThreadNames = Thread.currentThread.getName :: closeThreadNames
-  }
-
-  override def getStore(
-      version: Long,
-      uniqueId: Option[String]): StateStore = null
-
-  override def doMaintenance(): Unit = {}
-}
-
-private object FakeStateStoreProviderTracksCloseThread {
-  var closeThreadNames: List[String] = Nil
-}
 
 // MaintenanceErrorOnCertainPartitionsProvider is a test-only provider that throws an
 // exception during maintenance for partitions 0 and 1 (these are arbitrary choices). It is
@@ -205,11 +77,20 @@ class MaintenanceErrorOnCertainPartitionsProvider extends HDFSBackedStateStorePr
       storeConfs, hadoopConf, useMultipleValuesPerKey)
   }
 
-  override def doMaintenance(): Unit = {
+  private def maybeThrow(): Unit = {
     if (id.partitionId == 0 || id.partitionId == 1) {
       throw new RuntimeException("Intentional maintenance failure")
     }
-    super.doMaintenance()
+  }
+
+  override def doSnapshotMaintenance(): Unit = {
+    maybeThrow()
+    super.doSnapshotMaintenance()
+  }
+
+  override def doCleanupMaintenance(): Unit = {
+    maybeThrow()
+    super.doCleanupMaintenance()
   }
 }
 
@@ -240,7 +121,11 @@ class FakeStateStoreProviderWithMaintenanceError extends StateStoreProvider {
 
   override def close(): Unit = {}
 
-  override def getStore(version: Long, uniqueId: Option[String]): StateStore = null
+  override def getStore(
+    version: Long,
+    uniqueId: Option[String],
+    forceSnapshotOnCommit: Boolean = false,
+    loadEmpty: Boolean = false): StateStore = null
 
   override def doMaintenance(): Unit = {
     Thread.currentThread.setUncaughtExceptionHandler(exceptionHandler)
@@ -252,8 +137,38 @@ private object FakeStateStoreProviderWithMaintenanceError {
   val errorOnMaintenance = new AtomicBoolean(false)
 }
 
+/**
+ * A fake StateStoreProvider for testing maintenance before unload.
+ * Extends HDFSBackedStateStoreProvider to get actual store functionality,
+ * but tracks the number of times doMaintenance is called.
+ */
+class MaintenanceCountingStateStoreProvider extends HDFSBackedStateStoreProvider {
+  import MaintenanceCountingStateStoreProvider._
+
+  override def doSnapshotMaintenance(): Unit = {
+    snapshotMaintenanceCallCount.incrementAndGet()
+    super.doSnapshotMaintenance()
+  }
+
+  override def doCleanupMaintenance(): Unit = {
+    cleanupMaintenanceCallCount.incrementAndGet()
+    super.doCleanupMaintenance()
+  }
+}
+
+private object MaintenanceCountingStateStoreProvider {
+  val snapshotMaintenanceCallCount = new java.util.concurrent.atomic.AtomicInteger(0)
+  val cleanupMaintenanceCallCount = new java.util.concurrent.atomic.AtomicInteger(0)
+
+  def reset(): Unit = {
+    snapshotMaintenanceCallCount.set(0)
+    cleanupMaintenanceCallCount.set(0)
+  }
+}
+
 @ExtendedSQLTest
 class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
+  with SharedSparkSession
   with BeforeAndAfter {
   import StateStoreTestsHelper._
   import StateStoreCoordinatorSuite._
@@ -261,268 +176,13 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
   before {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
+    spark.streams.stateStoreCoordinator // initialize the lazy coordinator
   }
 
   after {
     StateStore.stop()
     require(!StateStore.isMaintenanceRunning)
   }
-
-  test("SPARK-51596: submitMaintenanceWorkForProvider from task thread adds" +
-    " to queue when timeout occurs") {
-    // Reset tracking variables for a clean test
-    SignalingStateStoreProvider.reset()
-
-    val sqlConf = getDefaultSQLConf(
-      SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.defaultValue.get,
-      SQLConf.MAX_BATCHES_TO_RETAIN_IN_MEMORY.defaultValue.get
-    )
-
-    // Critical: Set a very short timeout to ensure awaitProcessThisPartition fails quickly
-    sqlConf.setConf(SQLConf.STATE_STORE_MAINTENANCE_PROCESSING_TIMEOUT, 1L) // 1 second
-
-    // Maintenance interval large enough that we control timing manually
-    sqlConf.setConf(SQLConf.STREAMING_MAINTENANCE_INTERVAL, 30000L)
-    sqlConf.setConf(SQLConf.NUM_STATE_STORE_MAINTENANCE_THREADS, 4)
-
-    // Use our test provider
-    sqlConf.setConf(
-      SQLConf.STATE_STORE_PROVIDER_CLASS,
-      classOf[SignalingStateStoreProvider].getName
-    )
-
-    val conf = new SparkConf().setMaster("local").setAppName("test")
-
-    withSpark(SparkContext.getOrCreate(conf)) { sc =>
-      withCoordinatorRef(sc) { _ =>
-        val rootLocation = s"${Utils.createTempDir().getAbsolutePath}/spark-51596-timeout-queue"
-        val providerId = StateStoreProviderId(StateStoreId(rootLocation, 0, 0), UUID.randomUUID)
-
-        // Load the provider to start the maintenance system
-        StateStore.get(
-          providerId,
-          keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
-          0, None, None, useColumnFamilies = false,
-          new StateStoreConf(sqlConf), new Configuration()
-        )
-
-        // Access the queue via reflection for verification
-        val queueField = PrivateMethod[ConcurrentLinkedQueue[
-          (StateStoreProviderId, StateStoreProvider)]](
-          Symbol("unloadedProvidersToClose"))
-        val queue = StateStore invokePrivate queueField()
-        assert(queue.isEmpty, "Queue should start empty")
-
-        // Manually trigger maintenance which will block
-        val maintenanceMethod = PrivateMethod[Unit](Symbol("doMaintenance"))
-        StateStore invokePrivate maintenanceMethod()
-
-        // Wait for maintenance to start
-        eventually(timeout(5.seconds)) {
-          assert(SignalingStateStoreProvider.maintenanceStarted)
-          assert(StateStore.isLoaded(providerId))
-        }
-
-        // Now get access to the provider to simulate a task thread
-        val loadedProvidersField = PrivateMethod[
-          mutable.HashMap[StateStoreProviderId, StateStoreProvider]](
-          Symbol("loadedProviders"))
-        val loadedProviders = StateStore invokePrivate loadedProvidersField()
-        val provider = loadedProviders.synchronized { loadedProviders.get(providerId).get }
-        val maintenancePartitionsField = PrivateMethod[
-          mutable.HashSet[StateStoreProviderId]](
-          Symbol("maintenancePartitions"))
-        val maintenancePartitions = StateStore invokePrivate maintenancePartitionsField()
-
-        // Create a task thread that will attempt to submit maintenance
-        val taskThread = new Thread(() => {
-          try {
-            // Call submitMaintenanceWorkForProvider directly since that's what we're testing
-            val submitMaintenanceMethod = PrivateMethod[Unit](
-              Symbol("submitMaintenanceWorkForProvider"))
-            StateStore invokePrivate submitMaintenanceMethod(
-              providerId, provider, new StateStoreConf(sqlConf),
-              MaintenanceTaskType.FromTaskThread)
-
-            SignalingStateStoreProvider.taskSubmittedMaintenance = true
-            SignalingStateStoreProvider.taskAttemptCompletedLatch.countDown()
-          } catch {
-            case e: Exception =>
-              logError(s"Error in task thread: ${e.getMessage}", e)
-          }
-        })
-
-        // Start the task thread - it should timeout and add provider to queue
-        taskThread.start()
-
-        // Wait for task attempt to complete
-        assert(SignalingStateStoreProvider
-          .taskAttemptCompletedLatch.await(10, TimeUnit.SECONDS),
-          "Task thread didn't complete")
-
-        // Critical verification: After timeout, the provider should be in the queue
-        eventually(timeout(5.seconds)) {
-          assert(queue.size() == 1, "Provider should be queued after timeout")
-        }
-        val (queuedId, _) = queue.peek()
-        assert(queuedId == providerId, "Queued provider has wrong ID")
-
-        // Now allow the first maintenance to complete
-        SignalingStateStoreProvider.continueSignal.countDown()
-
-        eventually(timeout(5.seconds)) {
-          assert(maintenancePartitions.isEmpty,
-            "Maintenance partitions should be removed from")
-        }
-        // Manually trigger another maintenance to process the queue
-        StateStore invokePrivate maintenanceMethod()
-
-        // Verify the queue eventually gets processed
-        eventually(timeout(5.seconds)) {
-          assert(queue.isEmpty, "Queue should be emptied after maintenance")
-        }
-      }
-    }
-  }
-
-  test("SPARK-51596: queued maintenance tasks get processed when lock is available") {
-    // Reset tracking variables for a clean test
-    SignalingStateStoreProvider.reset()
-
-    val sqlConf = getDefaultSQLConf(
-      SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.defaultValue.get,
-      SQLConf.MAX_BATCHES_TO_RETAIN_IN_MEMORY.defaultValue.get
-    )
-    // Use a maintenance interval large enough that we control timing explicitly
-    sqlConf.setConf(SQLConf.STREAMING_MAINTENANCE_INTERVAL, 30000L)
-    // Set our special provider class that lets us control maintenance timing
-    sqlConf.setConf(
-      SQLConf.STATE_STORE_PROVIDER_CLASS,
-      classOf[SignalingStateStoreProvider].getName
-    )
-
-    val conf = new SparkConf().setMaster("local").setAppName("test")
-
-    withSpark(SparkContext.getOrCreate(conf)) { sc =>
-      withCoordinatorRef(sc) { coordinatorRef =>
-        val rootLocation = s"${Utils.createTempDir().getAbsolutePath}/spark-51596-queue"
-
-        // Create two providers that we'll use for the test
-        val provider1Id =
-          StateStoreProviderId(StateStoreId(rootLocation, 0, 0), UUID.randomUUID)
-        val provider2Id =
-          StateStoreProviderId(StateStoreId(rootLocation, 0, 1), UUID.randomUUID)
-
-        // Get the first provider to load it
-        StateStore.get(
-          provider1Id,
-          keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
-          0, None, None, useColumnFamilies = false,
-          new StateStoreConf(sqlConf), new Configuration()
-        )
-
-        // Manually trigger maintenance for provider1, which will block in doMaintenance()
-        val maintenanceMethod = PrivateMethod[Unit](Symbol("doMaintenance"))
-        StateStore invokePrivate maintenanceMethod()
-
-        // Wait for maintenance to start before continuing
-        eventually(timeout(5.seconds)) {
-          assert(SignalingStateStoreProvider.maintenanceStarted)
-          assert(StateStore.isLoaded(provider1Id))
-        }
-
-        // Now make the first provider "stale" by reporting it active on another executor
-        coordinatorRef.reportActiveInstance(provider1Id, "otherhost", "otherexec", Seq.empty)
-
-        // Get provider2 which will cause a maintenance task for provider1 to be queued
-        // (since provider1 is already under maintenance and can't be processed immediately)
-        StateStore.get(
-          provider2Id,
-          keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
-          0, None, None, useColumnFamilies = false,
-          new StateStoreConf(sqlConf), new Configuration()
-        )
-
-        // Mark that task submitted maintenance
-        SignalingStateStoreProvider.taskSubmittedMaintenance = true
-
-        // Unblock the first maintenance operation
-        SignalingStateStoreProvider.continueSignal.countDown()
-
-        // Verify that provider1 is eventually unloaded by the maintenance thread
-        // after the first maintenance completes and the queued maintenance runs
-        eventually(timeout(5.seconds)) {
-          // Provider1 should be unloaded
-          assert(!StateStore.isLoaded(provider1Id))
-          // Provider2 should still be loaded
-          assert(StateStore.isLoaded(provider2Id))
-          // Close should have been called on a maintenance thread
-          assert(SignalingStateStoreProvider.closeThreadName.contains("maintenance"))
-        }
-
-        // Get the partitionsForMaintenance field to check the queue is empty
-        val partitionsField = PrivateMethod[
-          ConcurrentLinkedQueue[StateStoreProviderId]](Symbol("unloadedProvidersToClose"))
-        val queue = StateStore invokePrivate partitionsField()
-        assert(queue.isEmpty, "Maintenance queue should be empty after processing queued tasks")
-      }
-    }
-  }
-
-  test("SPARK-51596: unloading only occurs on maintenance thread but occurs promptly") {
-    // Reset closeThreadNames
-    FakeStateStoreProviderTracksCloseThread.closeThreadNames = Nil
-
-    val sqlConf = getDefaultSQLConf(
-      SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.defaultValue.get,
-      SQLConf.MAX_BATCHES_TO_RETAIN_IN_MEMORY.defaultValue.get
-    )
-    // Make maintenance interval very large (30s) so that task thread runs before maintenance.
-    sqlConf.setConf(SQLConf.STREAMING_MAINTENANCE_INTERVAL, 30000L)
-    // Use the `FakeStateStoreProviderTracksCloseThread` to run the test
-    sqlConf.setConf(
-      SQLConf.STATE_STORE_PROVIDER_CLASS,
-      classOf[FakeStateStoreProviderTracksCloseThread].getName
-    )
-
-    val conf = new SparkConf().setMaster("local").setAppName("test")
-
-    withSpark(SparkContext.getOrCreate(conf)) { sc =>
-      withCoordinatorRef(sc) { coordinatorRef =>
-        val rootLocation = s"${Utils.createTempDir().getAbsolutePath}/spark-51596"
-        val providerId =
-          StateStoreProviderId(StateStoreId(rootLocation, 0, 0), UUID.randomUUID)
-        val providerId2 =
-          StateStoreProviderId(StateStoreId(rootLocation, 0, 1), UUID.randomUUID)
-
-        // Create provider to start the maintenance task + pool
-        StateStore.get(
-          providerId,
-          keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
-          0, None, None, useColumnFamilies = false, new StateStoreConf(sqlConf), new Configuration()
-        )
-
-        // Report instance active on another executor
-        coordinatorRef.reportActiveInstance(providerId, "otherhost", "otherexec", Seq.empty)
-
-        // Load another provider to trigger task unload
-        StateStore.get(
-          providerId2,
-          keySchema, valueSchema, NoPrefixKeyStateEncoderSpec(keySchema),
-          0, None, None, useColumnFamilies = false, new StateStoreConf(sqlConf), new Configuration()
-        )
-
-        // Wait for close to occur. Timeout is less than maintenance interval,
-        // so should only close by task triggering.
-        eventually(timeout(5.seconds)) {
-          assert(FakeStateStoreProviderTracksCloseThread.closeThreadNames.size == 1)
-          FakeStateStoreProviderTracksCloseThread.closeThreadNames.foreach { name =>
-            assert(name.contains("state-store-maintenance-thread"))}
-        }
-      }
-    }
-  }
-
 
   test("retaining only two latest versions when MAX_BATCHES_TO_RETAIN_IN_MEMORY set to 2") {
     tryWithProviderResource(
@@ -583,6 +243,31 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
         matchPVals = true
       )
 
+    }
+  }
+
+  test("HDFS: split maintenance methods upload snapshots and clean up old files separately") {
+    tryWithProviderResource(newStoreProvider(opId = Random.nextInt(), partition = 0,
+      minDeltasForSnapshot = 5)) { provider =>
+      for (i <- 1 to 21) {
+        val store = provider.getStore(i - 1)
+        put(store, "a", 0, i)
+        store.commit()
+        // Snapshot and cleanup run as independent operations.
+        provider.doSnapshotMaintenance()
+        provider.doCleanupMaintenance()
+      }
+
+      // Snapshots are uploaded by doSnapshotMaintenance (at versions 6, 12, 18 given
+      // minDeltasForSnapshot = 5) and doCleanupMaintenance removes old files, retaining only
+      // the last numVersionsToRetain (default 2) versions anchored on the latest snapshot (18).
+      val basePath = provider.stateStoreId.storeCheckpointLocation()
+      val remainingFiles = new File(basePath.toString)
+        .listFiles().filter(f => f.isFile && !f.getName.startsWith("."))
+        .map(_.getName).filterNot(_.endsWith(".crc")).toSet
+      assert(remainingFiles ===
+        Set("18.snapshot", "18.delta", "19.delta", "20.delta", "21.delta"),
+        s"Unexpected remaining files: $remainingFiles")
     }
   }
 
@@ -921,7 +606,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
       }
     }
 
-    val timeoutDuration = 1.minute
+    val timeoutDuration = 2.minutes
 
     quietly {
       withSpark(SparkContext.getOrCreate(conf)) { sc =>
@@ -1007,33 +692,26 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
     }
   }
 
+  // Ensure that maintenance is called before unloading
   test("SPARK-40492: maintenance before unload") {
+    // Reset the maintenance call counter
+    MaintenanceCountingStateStoreProvider.reset()
+
     val conf = new SparkConf()
       .setMaster("local")
       .setAppName("SPARK-40492")
     val opId = 0
     val dir1 = newDir()
     val storeProviderId1 = StateStoreProviderId(StateStoreId(dir1, opId, 0), UUID.randomUUID)
-    val sqlConf = getDefaultSQLConf(SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.defaultValue.get,
-      SQLConf.MAX_BATCHES_TO_RETAIN_IN_MEMORY.defaultValue.get)
-    sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, 2)
-    // Make maintenance interval large so that maintenance is called after deactivating instances.
-    sqlConf.setConf(SQLConf.STREAMING_MAINTENANCE_INTERVAL, 1.minute.toMillis)
+    val sqlConf = getDefaultSQLConf(
+      SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.defaultValue.get,
+      SQLConf.MAX_BATCHES_TO_RETAIN_IN_MEMORY.defaultValue.get
+    )
+    sqlConf.setConf(SQLConf.STREAMING_MAINTENANCE_INTERVAL, 5.seconds.toMillis)
+    sqlConf.setConf(SQLConf.STATE_STORE_PROVIDER_CLASS,
+      classOf[MaintenanceCountingStateStoreProvider].getName)
     val storeConf = StateStoreConf(sqlConf)
     val hadoopConf = new Configuration()
-
-    var latestStoreVersion = 0
-
-    def generateStoreVersions(): Unit = {
-      for (i <- 1 to 20) {
-        val store = StateStore.get(storeProviderId1, keySchema, valueSchema,
-          NoPrefixKeyStateEncoderSpec(keySchema),
-          latestStoreVersion, None, None, useColumnFamilies = false, storeConf, hadoopConf)
-        put(store, "a", 0, i)
-        store.commit()
-        latestStoreVersion += 1
-      }
-    }
 
     val timeoutDuration = 1.minute
 
@@ -1042,37 +720,41 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
         withCoordinatorRef(sc) { coordinatorRef =>
           require(!StateStore.isMaintenanceRunning, "StateStore is unexpectedly running")
 
-          // Generate sufficient versions of store for snapshots
-          generateStoreVersions()
+          // Load the store
+          StateStore.get(storeProviderId1, keySchema, valueSchema,
+            NoPrefixKeyStateEncoderSpec(keySchema),
+            0, None, None, useColumnFamilies = false, storeConf, hadoopConf)
+
+          // Ensure the store is loaded
           eventually(timeout(timeoutDuration)) {
-            // Store should have been reported to the coordinator
             assert(coordinatorRef.getLocation(storeProviderId1).nonEmpty,
               "active instance was not reported")
-            // Background maintenance should clean up and generate snapshots
-            assert(StateStore.isMaintenanceRunning, "Maintenance task is not running")
-            // Some snapshots should have been generated
-            tryWithProviderResource(newStoreProvider(storeProviderId1.storeId)) { provider =>
-              val snapshotVersions = (1 to latestStoreVersion).filter { version =>
-                fileExists(provider, version, isSnapshot = true)
-              }
-              assert(snapshotVersions.nonEmpty, "no snapshot file found")
-            }
+            assert(StateStore.isLoaded(storeProviderId1), "Store is not loaded")
           }
-          // Generate more versions such that there is another snapshot.
-          generateStoreVersions()
 
-          // If driver decides to deactivate all stores related to a query run,
-          // then this instance should be unloaded.
+          // Record the current maintenance call counts before deactivation
+          val snapshotCountBefore =
+            MaintenanceCountingStateStoreProvider.snapshotMaintenanceCallCount.get()
+          val cleanupCountBefore =
+            MaintenanceCountingStateStoreProvider.cleanupMaintenanceCallCount.get()
+
+          // Deactivate the store instance - this should trigger maintenance before close. In the
+          // decoupled design, the provider is removed from loadedProviders before close completes
+          // (removal and close are separate events), so we wait for all conditions together.
           coordinatorRef.deactivateInstances(storeProviderId1.queryRunId)
-          eventually(timeout(timeoutDuration)) {
-            assert(!StateStore.isLoaded(storeProviderId1))
-          }
 
-          // Earliest delta file should be scheduled a cleanup during unload.
-          tryWithProviderResource(newStoreProvider(storeProviderId1.storeId)) { provider =>
-            eventually(timeout(timeoutDuration)) {
-              assert(!fileExists(provider, 1, isSnapshot = false), "earliest file not deleted")
-            }
+          eventually(timeout(timeoutDuration)) {
+            assert(!StateStore.isLoaded(storeProviderId1), "Store was not unloaded")
+            val snapshotCountAfter =
+              MaintenanceCountingStateStoreProvider.snapshotMaintenanceCallCount.get()
+            val cleanupCountAfter =
+              MaintenanceCountingStateStoreProvider.cleanupMaintenanceCallCount.get()
+            assert(snapshotCountAfter > snapshotCountBefore,
+              s"Snapshot maintenance should run before close. " +
+                s"Before: $snapshotCountBefore, After: $snapshotCountAfter")
+            assert(cleanupCountAfter > cleanupCountBefore,
+              s"Cleanup maintenance should run before close. " +
+                s"Before: $cleanupCountBefore, After: $cleanupCountAfter")
           }
         }
       }
@@ -1206,12 +888,11 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
   test("SPARK-21145: Restarted queries create new provider instances") {
     try {
       val checkpointLocation = Utils.createTempDir().getAbsoluteFile
-      val spark = SparkSession.builder().master("local[2]").getOrCreate()
+      val spark: SparkSession = SparkSession.builder().master("local[2]").getOrCreate()
       SparkSession.setActiveSession(spark)
-      implicit val sqlContext = spark.sqlContext
       spark.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, "1")
       import spark.implicits._
-      val inputData = MemoryStream[Int]
+      val inputData = MemoryStream[Int](spark)
 
       def runQueryAndGetLoadedProviders(): Seq[StateStoreProvider] = {
         val aggregated = inputData.toDF().groupBy("value").agg(count("*"))
@@ -1400,7 +1081,7 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
     val hadoopConf = new Configuration()
     hadoopConf.set(StreamExecution.RUN_ID_KEY, UUID.randomUUID().toString)
 
-    val e = intercept[AssertionError] {
+    val e = intercept[StateStoreCheckpointIdsNotSupported] {
       provider.init(
         StateStoreId(newDir(), Random.nextInt(), 0),
         keySchema,
@@ -1411,7 +1092,112 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
         hadoopConf)
     }
     assert(e.getMessage.contains(
-      "HDFS State Store Provider doesn't support checkpointFormatVersion >= 2"))
+      "HDFSBackedStateStoreProvider does not support checkpointFormatVersion > 1"))
+  }
+
+  test("SPARK-54420: HDFSBackedStateStoreProvider does not support loading empty store") {
+    val provider = new HDFSBackedStateStoreProvider()
+    val hadoopConf = new Configuration()
+    hadoopConf.set(StreamExecution.RUN_ID_KEY, UUID.randomUUID().toString)
+    provider.init(
+      StateStoreId(newDir(), Random.nextInt(), 0),
+      keySchema,
+      valueSchema,
+      NoPrefixKeyStateEncoderSpec(keySchema),
+      useColumnFamilies = false,
+      new StateStoreConf(),
+      hadoopConf)
+
+    val e = intercept[StateStoreUnsupportedOperationException] {
+      provider.getStore(0, loadEmpty = true)
+    }
+    assert(e.getMessage.contains(
+      "Internal Error: HDFSBackedStateStoreProvider doesn't support loadEmpty"))
+  }
+
+  test("Auto snapshot repair") {
+    withSQLConf(
+      SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "1" // for hdfs means every 2 versions
+    ) {
+      val storeId = StateStoreId(newDir(), 0L, 1)
+      val remoteDir = storeId.storeCheckpointLocation().toString
+
+      def numSnapshotsAutoRepaired(store: StateStore): Long = {
+        store.metrics.customMetrics
+          .find(m => m._1.name == "numSnapshotsAutoRepaired").get._2
+      }
+
+      tryWithProviderResource(newStoreProviderWithClonedConf(storeId)) { provider =>
+        var store = provider.getStore(0)
+        put(store, "a", 0, 0)
+        store.commit()
+        assert(numSnapshotsAutoRepaired(store) == 0)
+
+        store = provider.getStore(1)
+        put(store, "b", 1, 1)
+        store.commit()
+        assert(numSnapshotsAutoRepaired(store) == 0)
+        provider.doMaintenance() // upload snapshot 2.snapshot
+
+        store = provider.getStore(2)
+        put(store, "c", 2, 2)
+        store.commit()
+        assert(numSnapshotsAutoRepaired(store) == 0)
+
+        store = provider.getStore(3)
+        put(store, "d", 3, 3)
+        store.commit()
+        assert(numSnapshotsAutoRepaired(store) == 0)
+        provider.doMaintenance() // upload snapshot 4.snapshot
+      }
+
+      def corruptFile(file: File): Unit =
+        // overwrite the file content to become empty
+        new PrintWriter(file) { close() }
+
+      // corrupt 4.snapshot
+      corruptFile(new File(remoteDir, "4.snapshot"))
+
+      tryWithProviderResource(newStoreProviderWithClonedConf(storeId)) { provider =>
+        // this should fail when trying to load from remote
+        val ex = intercept[SparkException] {
+          provider.getStore(4)
+        }
+        assert(ex.getCause.isInstanceOf[java.io.EOFException])
+      }
+
+      // Enable auto snapshot repair
+      withSQLConf(SQLConf.STATE_STORE_AUTO_SNAPSHOT_REPAIR_ENABLED.key -> true.toString,
+        SQLConf.STATE_STORE_AUTO_SNAPSHOT_REPAIR_NUM_FAILURES_BEFORE_ACTIVATING.key -> "1",
+        SQLConf.STATE_STORE_AUTO_SNAPSHOT_REPAIR_MAX_CHANGE_FILE_REPLAY.key -> "6"
+      ) {
+        tryWithProviderResource(newStoreProviderWithClonedConf(storeId)) { provider =>
+          // this should now succeed
+          var store = provider.getStore(4)
+          assert(get(store, "a", 0).contains(0))
+          put(store, "e", 4, 4)
+          store.commit()
+          assert(numSnapshotsAutoRepaired(store) == 1)
+
+          store = provider.getStore(5)
+          put(store, "f", 5, 5)
+          store.commit()
+          assert(numSnapshotsAutoRepaired(store) == 0)
+          provider.doMaintenance() // upload snapshot 6.snapshot
+        }
+
+        // corrupt all snapshot files
+        Seq(2, 6).foreach { v => corruptFile(new File(remoteDir, s"$v.snapshot"))}
+
+        tryWithProviderResource(newStoreProviderWithClonedConf(storeId)) { provider =>
+          // this load should succeed due to auto repair, even though all snapshots are bad
+          val store = provider.getStore(6)
+          assert(get(store, "b", 1).contains(1))
+          store.commit()
+          assert(numSnapshotsAutoRepaired(store) == 1)
+        }
+      }
+    }
   }
 
   override def newStoreProvider(): HDFSBackedStateStoreProvider = {
@@ -1446,6 +1232,18 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
       numOfVersToRetainInMemory = numOfVersToRetainInMemory)
   }
 
+  override def newStoreProviderWithClonedConf(
+      storeId: StateStoreId): HDFSBackedStateStoreProvider = {
+    newStoreProvider(
+      storeId.operatorId,
+      storeId.partitionId,
+      dir = storeId.checkpointRootLocation,
+      sqlConfOpt = Some(cloneSQLConf()))
+  }
+
+  override def newStoreProviderNoInit(): HDFSBackedStateStoreProvider =
+    new HDFSBackedStateStoreProvider
+
   override def getLatestData(
       storeProvider: HDFSBackedStateStoreProvider,
       useColumnFamilies: Boolean = false): Set[((String, Int), Int)] = {
@@ -1479,6 +1277,10 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
     sqlConf.setConf(SQLConf.MAX_BATCHES_TO_RETAIN_IN_MEMORY, numOfVersToRetainInMemory)
     sqlConf.setConf(SQLConf.MIN_BATCHES_TO_RETAIN, 2)
     sqlConf.setConf(SQLConf.STATE_STORE_COMPRESSION_CODEC, SQLConf.get.stateStoreCompressionCodec)
+    sqlConf.setConf(
+      SQLConf.STREAMING_CHECKPOINT_FILE_CHECKSUM_ENABLED, SQLConf.get.checkpointFileChecksumEnabled)
+    sqlConf.setConf(
+      SQLConf.STATE_STORE_ROW_CHECKSUM_ENABLED, SQLConf.get.stateStoreRowChecksumEnabled)
     sqlConf
   }
 
@@ -1488,11 +1290,13 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
       keyStateEncoderSpec: KeyStateEncoderSpec = NoPrefixKeyStateEncoderSpec(keySchema),
       keySchema: StructType = keySchema,
       dir: String = newDir(),
+      sqlConfOpt: Option[SQLConf] = None,
       minDeltasForSnapshot: Int = SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.defaultValue.get,
       numOfVersToRetainInMemory: Int = SQLConf.MAX_BATCHES_TO_RETAIN_IN_MEMORY.defaultValue.get,
       hadoopConf: Configuration = new Configuration): HDFSBackedStateStoreProvider = {
     hadoopConf.set(StreamExecution.RUN_ID_KEY, UUID.randomUUID().toString)
-    val sqlConf = getDefaultSQLConf(minDeltasForSnapshot, numOfVersToRetainInMemory)
+    val sqlConf = sqlConfOpt.getOrElse(
+      getDefaultSQLConf(minDeltasForSnapshot, numOfVersToRetainInMemory))
     val provider = new HDFSBackedStateStoreProvider()
     provider.init(
       StateStoreId(dir, opId, partition),
@@ -1548,8 +1352,44 @@ class StateStoreSuite extends StateStoreSuiteBase[HDFSBackedStateStoreProvider]
     val basePath = provider invokePrivate method()
     val fileName = if (isSnapshot) s"$version.snapshot" else s"$version.delta"
     val filePath = new File(basePath.toString, fileName)
-    filePath.delete()
+
+    // deleting the file with fm, incase file checksum is enabled
+    val fileManagerMethod = PrivateMethod[CheckpointFileManager](Symbol("fm"))
+    val fm = provider invokePrivate fileManagerMethod()
+    fm.delete(new Path(filePath.toURI))
+
     filePath.createNewFile()
+  }
+
+  // The trait return type of replayStateFromSnapshot is the writable StateStore. On
+  // HDFS, the writable and read-only stores are separate classes, so a readOnly=true
+  // call cannot honor the flag through this method. The provider rejects it and directs
+  // callers to replayReadStateFromSnapshot. (RocksDB's StateStore class is unified and
+  // respects the flag internally, so RocksDB still implements both paths via this entry
+  // point.)
+  test("replayStateFromSnapshot rejects readOnly=true (use replayReadStateFromSnapshot)") {
+    tryWithProviderResource(newStoreProvider(opId = Random.nextInt(), partition = 0,
+        minDeltasForSnapshot = 1)) { provider =>
+      val s1 = provider.getStore(0)
+      put(s1, "a", 1, 1)
+      s1.commit()
+      val s2 = provider.getStore(1)
+      put(s2, "a", 2, 2)
+      s2.commit()
+      provider.doMaintenance()
+
+      val ex = intercept[IllegalArgumentException] {
+        provider.asInstanceOf[SupportsFineGrainedReplay]
+          .replayStateFromSnapshot(1, 2, readOnly = true)
+      }
+      assert(ex.getMessage.contains("replayReadStateFromSnapshot"))
+    }
+  }
+
+  override protected def testQuietly(name: String)(f: => Unit): Unit = {
+    // Use the implementation from StateStoreSuiteBase.
+    // There is another in QueryTest. Doing this to avoid conflict error.
+    super[StateStoreSuiteBase].testQuietly(name)(f)
   }
 }
 
@@ -1583,6 +1423,9 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
       put(store, "b", 0, 2)
       put(store, "aa", 0, 3)
       remove(store, _._1.startsWith("a"))
+      if (colFamiliesEnabled) {
+        assert(store.allColumnFamilyNames == Set(StateStore.DEFAULT_COL_FAMILY_NAME))
+      }
       assert(store.commit() === 1)
 
       assert(store.hasCommitted)
@@ -1699,6 +1542,41 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
           Set(("a", 0) -> 1, ("c", 0) -> 3, ("d", 0) -> 4, ("e", 0) -> 5))
         assert(reloadedStore.commit() === 2)
         assert(reloadedStore.metrics.numKeys === 4)
+      }
+    }
+  }
+
+  testWithAllCodec("multiGet - batch retrieval of multiple keys") { colFamiliesEnabled =>
+    tryWithProviderResource(newStoreProvider(colFamiliesEnabled)) { provider =>
+      val store = provider.getStore(0)
+      try {
+        // Put multiple key-value pairs
+        put(store, "a", 1, 10)
+        put(store, "b", 2, 20)
+        put(store, "c", 3, 30)
+        put(store, "d", 4, 40)
+
+        // Create keys array for multiGet
+        val keys = Array(
+          dataToKeyRow("a", 1),
+          dataToKeyRow("b", 2),
+          dataToKeyRow("c", 3),
+          dataToKeyRow("nonexistent", 999) // Key that doesn't exist
+        )
+
+        // Perform multiGet
+        // Note: multiGet returns an iterator, we copy rows when collecting
+        val results = store.multiGet(keys, StateStore.DEFAULT_COL_FAMILY_NAME)
+          .map(row => if (row != null) row.copy() else null).toArray
+
+        // Verify results
+        assert(results.length === 4)
+        assert(valueRowToData(results(0)) === 10)
+        assert(valueRowToData(results(1)) === 20)
+        assert(valueRowToData(results(2)) === 30)
+        assert(results(3) === null) // Non-existent key should return null
+      } finally {
+        if (!store.hasCommitted) store.abort()
       }
     }
   }
@@ -2350,6 +2228,21 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
     assert(encoderSpec == deserializedEncoderSpec)
   }
 
+  test("SPARK-54063: forceSnapshot metric populated when shouldForceSnapshotOnCommit is true") {
+    tryWithProviderResource(newStoreProvider()) { provider =>
+      val store = provider.getStore(0, forceSnapshotOnCommit = true)
+      put(store, "a", 0, 1)
+      store.commit()
+      // Verify that a snapshot file was created for version 1
+      val metricPair = store.metrics.customMetrics.find { case (metric, _) =>
+        metric.name.contains("rocksdbForceSnapshotCount") ||
+        metric.name.contains("forceSnapshotCount")
+      }
+      assert(metricPair.isDefined)
+      assert(metricPair.get._2 == 1L, s"forceSnapshot should be 1 but was ${metricPair.get._2}")
+    }
+  }
+
   /** Return a new provider with a random id */
   def newStoreProvider(): ProviderClass
 
@@ -2373,6 +2266,12 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
 
   /** Return a new provider with useColumnFamilies set to true */
   def newStoreProvider(useColumnFamilies: Boolean): ProviderClass
+
+  /** Create a new store provider with cloned SQLConf */
+  def newStoreProviderWithClonedConf(storeId: StateStoreId): ProviderClass
+
+  /** Return a new provider without initializing it */
+  def newStoreProviderNoInit(): ProviderClass
 
   /** Get the latest data referred to by the given provider but not using this provider */
   def getLatestData(storeProvider: ProviderClass,
@@ -2404,6 +2303,8 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
   /** Get the `SQLConf` by the given minimum delta and version to retain in memory */
   def getDefaultSQLConf(minDeltasForSnapshot: Int, numOfVersToRetainInMemory: Int): SQLConf
 
+  def cloneSQLConf(): SQLConf = SQLConf.get.clone()
+
   /** Get the `StateStoreConf` used by the tests with default setting */
   def getDefaultStoreConf(): StateStoreConf = StateStoreConf.empty
 
@@ -2413,9 +2314,11 @@ abstract class StateStoreSuiteBase[ProviderClass <: StateStoreProvider]
       isSnapshot: Boolean): Boolean = {
     val method = PrivateMethod[Path](Symbol("baseDir"))
     val basePath = provider invokePrivate method()
-    val fileName = if (isSnapshot) s"$version.snapshot" else s"$version.delta"
-    val filePath = new File(basePath.toString, fileName)
-    filePath.exists
+    val fileNameHDFS = if (isSnapshot) s"$version.snapshot" else s"$version.delta"
+    val filePathHDFS = new File(basePath.toString, fileNameHDFS)
+    val fileNameRocks = if (isSnapshot) s"$version.zip" else s"$version.changelog"
+    val filePathRocks = new File(basePath.toString, fileNameRocks)
+    filePathHDFS.exists || filePathRocks.exists
   }
 
   def updateVersionTo(
@@ -2560,4 +2463,17 @@ class RenameReturnsFalseFileSystem extends RawLocalFileSystem {
 
 object RenameReturnsFalseFileSystem {
   val scheme = s"StateStoreSuite${math.abs(Random.nextInt())}fs"
+}
+
+/**
+ * Test suite that runs all StateStoreSuite tests with row checksum enabled.
+ */
+@ExtendedSQLTest
+class StateStoreSuiteWithRowChecksum
+  extends StateStoreSuite with EnableStateStoreRowChecksum {
+  override protected def testQuietly(name: String)(f: => Unit): Unit = {
+    // Use the implementation from StateStoreSuiteBase.
+    // There is another in QueryTest. Doing this to avoid conflict error.
+    super[StateStoreSuite].testQuietly(name)(f)
+  }
 }

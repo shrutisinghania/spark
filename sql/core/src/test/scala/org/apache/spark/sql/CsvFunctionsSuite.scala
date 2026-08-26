@@ -19,13 +19,15 @@ package org.apache.spark.sql
 
 import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
-import java.time.{Duration, LocalDateTime, Period}
+import java.time.{Duration, LocalDateTime, Period, ZoneOffset}
 import java.util.Locale
 
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark.{SparkException, SparkRuntimeException,
   SparkUnsupportedOperationException, SparkUpgradeException}
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils
+import org.apache.spark.sql.catalyst.util.TimestampNanosTestUtils.foreachNanosPrecision
 import org.apache.spark.sql.errors.DataTypeErrors.toSQLType
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
@@ -35,7 +37,7 @@ import org.apache.spark.sql.types.DayTimeIntervalType.{DAY, HOUR, MINUTE, SECOND
 import org.apache.spark.sql.types.YearMonthIntervalType.{MONTH, YEAR}
 import org.apache.spark.unsafe.types._
 
-class CsvFunctionsSuite extends QueryTest with SharedSparkSession {
+class CsvFunctionsSuite extends SharedSparkSession {
   import testImplicits._
 
   test("from_csv with empty options") {
@@ -45,6 +47,37 @@ class CsvFunctionsSuite extends QueryTest with SharedSparkSession {
     checkAnswer(
       df.select(from_csv($"value", lit(schema), Map[String, String]().asJava)),
       Row(Row(1)) :: Nil)
+  }
+
+  test("SPARK-57164: from_csv with a nanos timestamp DDL schema string") {
+    val df = Seq("2020-01-01T00:00:00.123456789").toDF("value")
+    // Fix the session timezone so the TIMESTAMP_LTZ expected value is deterministic.
+    withSQLConf(
+        SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true",
+        SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+      foreachNanosPrecision { p =>
+        val nano = TimestampNanosTestUtils.nanoOfSecTruncator(p)(123456789)
+        Seq(
+          s"TIMESTAMP_NTZ($p)" -> TimestampNTZNanosType(p),
+          s"TIMESTAMP_LTZ($p)" -> TimestampLTZNanosType(p),
+          s"TIMESTAMP($p) WITHOUT TIME ZONE" -> TimestampNTZNanosType(p),
+          s"TIMESTAMP($p) WITH LOCAL TIME ZONE" -> TimestampLTZNanosType(p)).foreach {
+          case (spelling, expected) =>
+            val parsed = df.select(
+              from_csv($"value", lit(s"c $spelling"), Map.empty[String, String].asJava).as("v"))
+            // The schema string resolves to the nanos type ...
+            assert(parsed.schema("v").dataType.asInstanceOf[StructType]("c").dataType === expected)
+            // ... and the CSV datasource correctly parses the nanosecond timestamp, truncating
+            // sub-precision digits toward zero.
+            val expectedValue = expected match {
+              case _: TimestampNTZNanosType => LocalDateTime.of(2020, 1, 1, 0, 0, 0, nano)
+              case _: TimestampLTZNanosType =>
+                LocalDateTime.of(2020, 1, 1, 0, 0, 0, nano).toInstant(ZoneOffset.UTC)
+            }
+            checkAnswer(parsed, Row(Row(expectedValue)))
+        }
+      }
+    }
   }
 
   test("from_csv with non struct schema") {
@@ -836,6 +869,20 @@ class CsvFunctionsSuite extends QueryTest with SharedSparkSession {
       Seq(Row(s"""{null, $largeInput}""")))
   }
 
+  test("from_csv with variant: extreme negative scale decimal does not hang") {
+    // A value like "1E99999" parses to a BigDecimal with scale=-99999.
+    // Calling setScale(0) on it would hang, so it should fall through to string.
+    val df = Seq("1E99999").toDF("value")
+    checkAnswer(
+      df.select(
+        from_csv(
+          $"value",
+          StructType.fromDDL("a variant"),
+          Map.empty[String, String]
+        ).cast("string")),
+      Seq(Row("""{"1E99999"}""")))
+  }
+
   test("SPARK-47497: the input of to_csv must be StructType") {
     val df = Seq(1, 2).toDF("value")
     checkError(
@@ -877,5 +924,65 @@ class CsvFunctionsSuite extends QueryTest with SharedSparkSession {
     checkAnswer(actual2, Row("2,Alice," +
       "\"[{math -> 100, english -> 200, science -> -}, " +
       "{math -> 300, english -> 400, science -> 500}]\""))
+  }
+
+  test("from_csv/to_csv with TIME type - all precisions") {
+    import java.time.LocalTime
+
+    val testData = Seq(
+      (0, LocalTime.of(14, 30, 45), "14:30:45"),
+      (1, LocalTime.of(14, 30, 45, 100000000), "14:30:45.1"),
+      (2, LocalTime.of(14, 30, 45, 120000000), "14:30:45.12"),
+      (3, LocalTime.of(14, 30, 45, 123000000), "14:30:45.123"),
+      (4, LocalTime.of(14, 30, 45, 123400000), "14:30:45.1234"),
+      (5, LocalTime.of(14, 30, 45, 123450000), "14:30:45.12345"),
+      (6, LocalTime.of(14, 30, 45, 123456000), "14:30:45.123456"),
+      (7, LocalTime.of(14, 30, 45, 123456700), "14:30:45.1234567"),
+      (8, LocalTime.of(14, 30, 45, 123456780), "14:30:45.12345678"),
+      (9, LocalTime.of(14, 30, 45, 123456789), "14:30:45.123456789")
+    )
+
+    testData.foreach { case (precision, time, timeStr) =>
+      val schema = new StructType().add("time", TimeType(precision))
+
+      val parseResult = Seq(timeStr).toDF("csv")
+        .select(from_csv($"csv", schema, Map.empty[String, String]))
+        .collect().head.getAs[Row](0).getAs[LocalTime](0)
+      assert(parseResult == time, s"from_csv failed for precision $precision")
+
+      val df = Seq(time).toDF("time").select($"time".cast(TimeType(precision)))
+      val csvResult = df.select(to_csv(struct($"time"))).collect().head.getString(0)
+      assert(csvResult == timeStr, s"to_csv failed for precision $precision")
+
+      val roundtrip = df
+        .select(to_csv(struct($"time")).as("csv"))
+        .select(from_csv($"csv", schema, Map.empty[String, String]).as("struct"))
+        .select($"struct.time").collect().head.getAs[LocalTime](0)
+      assert(roundtrip == time, s"Roundtrip failed for precision $precision")
+    }
+
+    val customFormat = "HH-mm-ss.SSSSSS"
+    val customTime = LocalTime.of(14, 30, 45, 123456000)
+    val customSchema = new StructType().add("time", TimeType(6))
+    val customOptions = Map("timeFormat" -> customFormat)
+
+    val customParse = Seq("14-30-45.123456").toDF("csv")
+      .select(from_csv($"csv", customSchema, customOptions))
+      .collect().head.getAs[Row](0).getAs[LocalTime](0)
+    assert(customParse == customTime, "Custom format from_csv failed")
+
+    val customDF = Seq(customTime).toDF("time").select($"time".cast(TimeType(6)))
+    val customCsv = customDF.select(to_csv(struct($"time"), customOptions.asJava))
+      .collect().head.getString(0)
+    assert(customCsv == "14-30-45.123456", "Custom format to_csv failed")
+  }
+
+  test("TIME type with nulls") {
+    val schema = new StructType().add("time", TimeType(3))
+
+    val parseNull = Seq(null.asInstanceOf[String]).toDF("csv")
+      .select(from_csv($"csv", schema, Map.empty[String, String]))
+      .collect().head
+    assert(parseNull.isNullAt(0), "Null input should parse to null")
   }
 }

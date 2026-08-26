@@ -22,8 +22,13 @@ import scala.jdk.CollectionConverters._
 import org.apache.spark.{SparkConf, SparkThrowable}
 import org.apache.spark.internal.config.ConfigEntry
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, UnresolvedAlias, UnresolvedAttribute, UnresolvedFunction, UnresolvedGenerator, UnresolvedHaving, UnresolvedRelation, UnresolvedStar}
-import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, Cast, Concat, GreaterThan, Literal, NamedExpression, NullsFirst, ShiftRight, SortOrder, UnresolvedWindowExpression, UnspecifiedFrame, WindowSpecDefinition, WindowSpecReference}
+import org.apache.spark.sql.catalyst.analysis.{AnalysisTest, UnresolvedAlias,
+  UnresolvedAttribute, UnresolvedFunction, UnresolvedGenerator, UnresolvedHaving,
+  UnresolvedQualify, UnresolvedRelation, UnresolvedStar}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference,
+  Concat, EqualTo, GreaterThan, Literal, NullsFirst, SortOrder,
+  UnresolvedWindowExpression, UnspecifiedFrame, WindowSpecDefinition,
+  WindowSpecReference}
 import org.apache.spark.sql.catalyst.parser.{AbstractParser, ParseException}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.trees.TreePattern._
@@ -32,7 +37,7 @@ import org.apache.spark.sql.execution.command._
 import org.apache.spark.sql.execution.datasources.{CreateTempViewUsing, RefreshResource}
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.types.{DataType, IntegerType, NullType, StringType}
+import org.apache.spark.sql.types.StringType
 import org.apache.spark.util.ArrayImplicits._
 
 /**
@@ -416,13 +421,11 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     assertEqual("REFRESH \'path with space\'", RefreshResource("path with space"))
     assertEqual("REFRESH \"path with space 2\"", RefreshResource("path with space 2"))
 
-    val errMsg1 =
-      "REFRESH statements cannot contain ' ', '\\n', '\\r', '\\t' inside unquoted resource paths"
     val sql1 = "REFRESH a b"
     checkError(
       exception = parseException(sql1),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg1),
+      condition = "INVALID_SQL_SYNTAX.INVALID_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = sql1,
         start = 0,
@@ -431,8 +434,8 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     val sql2 = "REFRESH a\tb"
     checkError(
       exception = parseException(sql2),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg1),
+      condition = "INVALID_SQL_SYNTAX.INVALID_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = sql2,
         start = 0,
@@ -441,8 +444,8 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     val sql3 = "REFRESH a\nb"
     checkError(
       exception = parseException(sql3),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg1),
+      condition = "INVALID_SQL_SYNTAX.INVALID_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = sql3,
         start = 0,
@@ -451,8 +454,8 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     val sql4 = "REFRESH a\rb"
     checkError(
       exception = parseException(sql4),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg1),
+      condition = "INVALID_SQL_SYNTAX.INVALID_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = sql4,
         start = 0,
@@ -461,8 +464,8 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     val sql5 = "REFRESH a\r\nb"
     checkError(
       exception = parseException(sql5),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg1),
+      condition = "INVALID_SQL_SYNTAX.INVALID_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = sql5,
         start = 0,
@@ -471,19 +474,18 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     val sql6 = "REFRESH @ $a$"
     checkError(
       exception = parseException(sql6),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg1),
+      condition = "INVALID_SQL_SYNTAX.INVALID_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = sql6,
         start = 0,
         stop = 12))
 
-    val errMsg2 = "Resource paths cannot be empty in REFRESH statements. Use / to match everything"
     val sql7 = "REFRESH  "
     checkError(
       exception = parseException(sql7),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg2),
+      condition = "INVALID_SQL_SYNTAX.EMPTY_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = "REFRESH",
         start = 0,
@@ -492,8 +494,8 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     val sql8 = "REFRESH"
     checkError(
       exception = parseException(sql8),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg2),
+      condition = "INVALID_SQL_SYNTAX.EMPTY_REFRESH_RESOURCE_PATH",
+      parameters = Map.empty,
       context = ExpectedContext(
         fragment = sql8,
         start = 0,
@@ -686,8 +688,7 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
                   UnresolvedFunction("max", Seq(UnresolvedAttribute("c")), isDistinct = false),
                   WindowSpecReference("w")), None)
             ),
-            UnresolvedRelation(TableIdentifier("testData"))),
-          forPipeSQL = false
+            UnresolvedRelation(TableIdentifier("testData")))
         ),
         ioSchema))
 
@@ -741,7 +742,6 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
   test("SPARK-32607: Script Transformation ROW FORMAT DELIMITED" +
     " `TOK_TABLEROWFORMATLINES` only support '\\n'") {
 
-    val errMsg = "LINES TERMINATED BY only supports newline '\\n' right now: @"
     // test input format TOK_TABLEROWFORMATLINES
     val sql1 =
       s"""SELECT TRANSFORM(a, b, c, d, e)
@@ -757,8 +757,8 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
          |FROM v""".stripMargin
     checkError(
       exception = parseException(sql1),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg),
+      condition = "INVALID_SQL_SYNTAX.UNSUPPORTED_ROW_FORMAT_LINES_TERMINATED_BY",
+      parameters = Map("value" -> "@"),
       context = ExpectedContext(
         fragment = sql1,
         start = 0,
@@ -779,12 +779,31 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
          |FROM v""".stripMargin
     checkError(
       exception = parseException(sql2),
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> errMsg),
+      condition = "INVALID_SQL_SYNTAX.UNSUPPORTED_ROW_FORMAT_LINES_TERMINATED_BY",
+      parameters = Map("value" -> "@"),
       context = ExpectedContext(
         fragment = sql2,
         start = 0,
         stop = 264))
+  }
+
+  test("QUALIFY clause") {
+    // QUALIFY with alias reference - SELECT list has window function
+    val plan1 = parser.parsePlan(
+      "SELECT a, RANK() OVER (ORDER BY b) AS rank " +
+      "FROM testData2 QUALIFY rank = 1")
+    assert(plan1.isInstanceOf[UnresolvedQualify])
+    val q1 = plan1.asInstanceOf[UnresolvedQualify]
+    assert(q1.child.isInstanceOf[Project])
+
+    // QUALIFY with window function in condition
+    val plan2 = parser.parsePlan(
+      "SELECT a FROM testData2 " +
+      "QUALIFY RANK() OVER (ORDER BY b) = 1")
+    assert(plan2.isInstanceOf[UnresolvedQualify])
+    val q2 = plan2.asInstanceOf[UnresolvedQualify]
+    assert(q2.condition.isInstanceOf[EqualTo])
+    assert(q2.child.isInstanceOf[Project])
   }
 
   test("CLEAR CACHE") {
@@ -1011,7 +1030,7 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     checkAggregate("SELECT a, b FROM t |> AGGREGATE GROUP BY b")
     checkAggregate("SELECT a, b FROM t |> AGGREGATE COUNT(*) AS result GROUP BY b")
     // Window
-    def checkWindow(query: String): Unit = check(query, Seq(WITH_WINDOW_DEFINITION))
+    def checkWindow(query: String): Unit = check(query, Seq(WINDOW_EXPRESSION))
     checkWindow(
       """
         |TABLE windowTestData
@@ -1165,74 +1184,101 @@ class SparkSqlParserSuite extends AnalysisTest with SharedSparkSession {
     }
   }
 
-  test("SPARK-52709: Parsing STRUCT (empty,nested,within complex types) followed by shiftRight") {
+  test("SPARK-52709: STRUCT<> should not corrupt complex_type_level_counter") {
+    // STRUCT<> is tokenized as STRUCT + NEQ by the lexer. The parser must decrement
+    // the complex_type_level_counter so that subsequent >> is recognized as shift-right.
+    // Without the fix, this throws a parse error because >> is not recognized.
+    parser.parsePlan("SELECT CAST(null AS STRUCT<>), 2 >> 1")
 
-    // Test valid complex data types, and their combinations.
-    val typeStringsToTest = Seq(
-      "STRUCT<>",                               // Empty struct
-      "STRUCT<a: STRUCT<b: INT>>",              // Nested struct
-      "STRUCT<c: ARRAY<INT>>",                  // Struct containing an array
-      "MAP<STRING, STRUCT<x: STRING, y: INT>>",  // Map containing a struct
-      "ARRAY<STRUCT<>>",                        // Array containing empty structs
-      "ARRAY<STRUCT<id: INT, name: STRING>>"    // Array containing non-empty structs
-    )
+    // Multiple empty structs should not corrupt the counter
+    parser.parsePlan("SELECT CAST(null AS STRUCT<>), CAST(null AS STRUCT<>), 4 >> 2")
 
-    /**
-    * Helper function to generate a SQL CAST fragment and its corresponding
-    * expected expression for a given type string.
-    */
-    def createCastNullAsTypeExpression(typeString: String): (String, NamedExpression) = {
-      // Use the suite's 'parser' instance to parse the DataType
-      val dataType: DataType = parser.parseDataType(typeString)
-      val castExpr = Cast(Literal(null, NullType), dataType)
-      val expectedExpr = UnresolvedAlias(castExpr) // SparkSqlParserSuite expects UnresolvedAlias
-      val sqlFragment = s"CAST(null AS $typeString)"
-        (sqlFragment, expectedExpr)
+    // Empty struct with unsigned shift right
+    parser.parsePlan("SELECT CAST(null AS STRUCT<>), 8 >>> 2")
+
+    // ARRAY with <> as not-equal operator should still work
+    parser.parsePlan("SELECT ARRAY(1 <> 2)")
+
+    // Nested complex types with >> should still work
+    parser.parsePlan("SELECT CAST(null AS MAP<STRING, ARRAY<INT>>)")
+
+    // Mix of empty struct and nested complex types
+    parser.parsePlan(
+      "SELECT CAST(null AS STRUCT<>), CAST(null AS MAP<STRING, ARRAY<INT>>), 2 >> 1")
+  }
+
+  test("splitStatements preserves ${...} variable references in emitted statements") {
+    // The splitter must NOT pre-expand variable references at split time --
+    // doing so in batch mode would resolve `${x}` against the pre-`SET` value
+    // when an earlier statement in the same batch is `SET x=...`. Per-statement
+    // substitution at execution time (in `parseInternal`) handles that case
+    // correctly. The reference must therefore survive into the emitted
+    // statement text.
+    withSQLConf("spark.x.stmt" -> "abc") {
+      val result = parser.splitStatements("SELECT '${spark.x.stmt}';")
+      assert(result.completeStatements.map(_.statement) === Seq("SELECT '${spark.x.stmt}'"))
+      assert(result.partialStatement.isEmpty)
     }
-
-    // Generate the SQL fragments and their corresponding expected expressions for all CASTs
-    val castExpressionsData = typeStringsToTest.map(createCastNullAsTypeExpression)
-
-    // Extract just the SQL fragments for the SELECT statement
-    val selectClauses = castExpressionsData.map(_._1)
-
-    val sql =
-      s"""
-         |SELECT
-         |  ${selectClauses.mkString(",\n  ")},
-         |  4 >> 1
-      """.stripMargin
-
-    // Construct the list of ALL expected expressions for the Project node.
-    // This includes all the CAST expressions generated above, plus the ShiftRight expression.
-    val allExpectedExprs = castExpressionsData.map(_._2) :+
-      UnresolvedAlias(ShiftRight(Literal(4, IntegerType), Literal(1, IntegerType)))
-
-    // Define the expected logical plan
-    val expectedPlan = Project(
-      allExpectedExprs,
-      OneRowRelation()
-    )
-
-    assertEqual(sql, expectedPlan)
   }
 
-  test("SPARK-52709-Invalid: Parsing should fail for empty ARRAY<> type") {
-    val sql = "SELECT CAST(null AS ARRAY<>)"
-    checkError(
-      exception = parseException(sql),
-      condition = "PARSE_SYNTAX_ERROR",
-      parameters = Map("error" -> "'<'", "hint" -> ": missing ')'")
-    )
+  test("splitStatements: BEGIN..END containing ${...} is confirmed as one statement (C2)") {
+    // The block's body references a pre-set conf variable. The splitter must
+    // confirm the whole `BEGIN..END;` as a single statement -- it does so by
+    // replacing the `${...}` with a placeholder identifier purely for the
+    // parse-validation step, while emitting the original text with `${...}`
+    // intact.
+    withSQLConf("spark.x.t" -> "my_table") {
+      val sql = "BEGIN SELECT 1 FROM ${spark.x.t}; SELECT 2; END;"
+      val result = parser.splitStatements(sql)
+      assert(result.completeStatements.map(_.statement) ===
+        Seq("BEGIN SELECT 1 FROM ${spark.x.t}; SELECT 2; END"))
+      assert(result.partialStatement.isEmpty)
+    }
   }
 
-  test("SPARK-52709-Invalid: Parsing should fail for empty MAP<> type") {
-    val sql = "SELECT CAST(null AS MAP<>)"
-    checkError(
-      exception = parseException(sql),
-      condition = "PARSE_SYNTAX_ERROR",
-      parameters = Map("error" -> "'<'", "hint" -> ": missing ')'")
-    )
+  test("splitStatements: SET-then-${var} across statements (C4)") {
+    // The variable is `SET` by an earlier statement in the same batch. The
+    // splitter must not try to resolve `${x}` against its pre-`SET` value;
+    // it must emit the reference verbatim and let it resolve at execution
+    // time after the `SET` has run.
+    val result = parser.splitStatements("SET x=1; SELECT '${x}';")
+    assert(result.completeStatements.map(_.statement) ===
+      Seq("SET x=1", "SELECT '${x}'"))
+    assert(result.partialStatement.isEmpty)
+  }
+
+  test("splitStatements: SET-in-batch-then-${var}-inside-BEGIN..END (C3)") {
+    // The block's body references `${x}`, whose value comes from the earlier
+    // `SET x=1` in the same batch. Substituting `${x}` up front (before the
+    // `SET` runs) would replace it with the pre-`SET` (default / empty) value
+    // and break the block's parse. The placeholder-validation hybrid leaves
+    // `${x}` in the emitted text but still recognizes the block boundary.
+    val sql = "SET x=1; BEGIN SELECT ${x}; SELECT 1; END;"
+    val result = parser.splitStatements(sql)
+    assert(result.completeStatements.map(_.statement) ===
+      Seq("SET x=1", "BEGIN SELECT ${x}; SELECT 1; END"))
+    assert(result.partialStatement.isEmpty)
+  }
+
+  test("splitStatements: ${...} in a non-block statement preserved (no premature substitute)") {
+    // Same shape as C4 but without the SET -- the variable need not exist.
+    // The reference must still survive into the emitted statement so the
+    // backend substituter can either resolve it from session config or
+    // leave it literal (per the substituter's contract).
+    val result = parser.splitStatements("SELECT '${unset.var}';")
+    assert(result.completeStatements.map(_.statement) === Seq("SELECT '${unset.var}'"))
+    assert(result.partialStatement.isEmpty)
+  }
+
+  test("splitStatements: when variable substitution is disabled, ${...} still passes through") {
+    // Disabling variable substitution should disable the placeholder pass
+    // too -- the parser then sees the literal `${...}` and (typically) bails
+    // non-EOF, so the splitter falls back to a plain delimiter walk. The
+    // emitted text still keeps the `${...}` intact.
+    withSQLConf(SQLConf.VARIABLE_SUBSTITUTE_ENABLED.key -> "false") {
+      val result = parser.splitStatements("SELECT '${spark.x}';")
+      assert(result.completeStatements.map(_.statement) === Seq("SELECT '${spark.x}'"))
+      assert(result.partialStatement.isEmpty)
+    }
   }
 }
-

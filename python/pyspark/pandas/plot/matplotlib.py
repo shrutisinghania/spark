@@ -17,35 +17,35 @@
 
 from typing import final
 
-from pyspark.loose_version import LooseVersion
-
 import matplotlib as mat
 import numpy as np
+import pandas as pd
 from matplotlib.axes._base import _process_plot_format  # type: ignore[attr-defined]
 from matplotlib.figure import Figure
 from pandas.core.dtypes.inference import is_list_like
-from pandas.io.formats.printing import pprint_thing
-from pandas.plotting._matplotlib import (  # type: ignore[attr-defined]
-    BarPlot as PandasBarPlot,
-    BoxPlot as PandasBoxPlot,
-    HistPlot as PandasHistPlot,
-    PiePlot as PandasPiePlot,
-    AreaPlot as PandasAreaPlot,
-    LinePlot as PandasLinePlot,
-    BarhPlot as PandasBarhPlot,
-    ScatterPlot as PandasScatterPlot,
-    KdePlot as PandasKdePlot,
-)
+from pandas.io.formats.printing import pprint_thing  # type: ignore[import-not-found]
 from pandas.plotting._core import PlotAccessor
-from pandas.plotting._matplotlib.core import MPLPlot as PandasMPLPlot
+from pandas.plotting._matplotlib import AreaPlot as PandasAreaPlot  # type: ignore[import-not-found]
+from pandas.plotting._matplotlib import BarhPlot as PandasBarhPlot
+from pandas.plotting._matplotlib import BarPlot as PandasBarPlot
+from pandas.plotting._matplotlib import BoxPlot as PandasBoxPlot
+from pandas.plotting._matplotlib import HistPlot as PandasHistPlot
+from pandas.plotting._matplotlib import KdePlot as PandasKdePlot
+from pandas.plotting._matplotlib import LinePlot as PandasLinePlot
+from pandas.plotting._matplotlib import PiePlot as PandasPiePlot
+from pandas.plotting._matplotlib import ScatterPlot as PandasScatterPlot
+from pandas.plotting._matplotlib.core import (  # type: ignore[import-not-found]
+    MPLPlot as PandasMPLPlot,
+)
 
+from pyspark.loose_version import LooseVersion
 from pyspark.pandas.plot import (
-    TopNPlotBase,
-    SampledPlotBase,
-    HistogramPlotBase,
     BoxPlotBase,
-    unsupported_function,
+    HistogramPlotBase,
     KdePlotBase,
+    SampledPlotBase,
+    TopNPlotBase,
+    unsupported_function,
 )
 from pyspark.pandas.series import Series, first_series
 
@@ -202,7 +202,7 @@ class PandasOnSparkBoxPlot(PandasBoxPlot, BoxPlotBase):
                 for stats, ci in zip(bxpstats, conf_intervals):
                     if ci is not None:
                         if len(ci) != 2:
-                            raise ValueError("each confidence interval must " "have two values")
+                            raise ValueError("each confidence interval must have two values")
                         else:
                             if ci[0] is not None:
                                 stats["cilo"] = ci[0]
@@ -450,9 +450,11 @@ class PandasOnSparkHistPlot(PandasHistPlot, HistogramPlotBase):
             artists = self._plot(ax, y, column_num=i, stacking_id=stacking_id, **kwds)
             # `if hasattr(...)` makes plotting compatible with pandas < 1.3,
             # see pandas-dev/pandas#40078.
-            self._append_legend_handles_labels(artists[0], label) if hasattr(
-                self, "_append_legend_handles_labels"
-            ) else self._add_legend_handle(artists[0], label, index=i)
+            (
+                self._append_legend_handles_labels(artists[0], label)
+                if hasattr(self, "_append_legend_handles_labels")
+                else self._add_legend_handle(artists[0], label, index=i)
+            )
 
     @classmethod
     def _plot(cls, ax, y, style=None, bins=None, bottom=0, column_num=0, stacking_id=None, **kwds):
@@ -569,9 +571,11 @@ class PandasOnSparkKdePlot(PandasKdePlot, KdePlotBase):
             artists = self._plot(ax, y, column_num=i, stacking_id=stacking_id, **kwds)
             # `if hasattr(...)` makes plotting compatible with pandas < 1.3,
             # see pandas-dev/pandas#40078.
-            self._append_legend_handles_labels(artists[0], label) if hasattr(
-                self, "_append_legend_handles_labels"
-            ) else self._add_legend_handle(artists[0], label, index=i)
+            (
+                self._append_legend_handles_labels(artists[0], label)
+                if hasattr(self, "_append_legend_handles_labels")
+                else self._add_legend_handle(artists[0], label, index=i)
+            )
 
     @staticmethod
     def _get_ind(y, ind):
@@ -968,5 +972,10 @@ def _plot(data, x=None, y=None, subplots=False, ax=None, kind="line", **kwds):
 
         plot_obj = klass(data, subplots=subplots, ax=ax, kind=kind, **kwds)
     plot_obj.generate()
-    plot_obj.draw()
+    if LooseVersion(pd.__version__) < "3.0.0":
+        plot_obj.draw()
+    else:
+        import matplotlib.pyplot as plt
+
+        plt.draw_if_interactive()
     return plot_obj.result

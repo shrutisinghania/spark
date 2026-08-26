@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.expressions
 
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, CodeGenerator, ExprCode}
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.util.TypeUtils
 import org.apache.spark.sql.types._
@@ -128,7 +128,7 @@ object SortOrder {
 case class SortPrefix(child: SortOrder) extends UnaryExpression {
 
   val nullValue = child.child.dataType match {
-    case BooleanType | DateType | TimestampType | TimestampNTZType |
+    case BooleanType | DateType | TimestampType | TimestampNTZType | _: TimeType |
          _: IntegralType | _: AnsiIntervalType =>
       if (nullAsSmallest) Long.MinValue else Long.MaxValue
     case dt: DecimalType if dt.precision - dt.scale <= Decimal.MAX_LONG_DIGITS =>
@@ -151,7 +151,7 @@ case class SortPrefix(child: SortOrder) extends UnaryExpression {
   private lazy val calcPrefix: Any => Long = child.child.dataType match {
     case BooleanType => (raw) =>
       if (raw.asInstanceOf[Boolean]) 1 else 0
-    case DateType | TimestampType | TimestampNTZType |
+    case DateType | TimestampType | TimestampNTZType | _: TimeType |
          _: IntegralType | _: AnsiIntervalType => (raw) =>
       raw.asInstanceOf[java.lang.Number].longValue()
     case FloatType | DoubleType => (raw) => {
@@ -194,15 +194,19 @@ case class SortPrefix(child: SortOrder) extends UnaryExpression {
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
     val childCode = child.child.genCode(ctx)
     val input = childCode.value
-    val BinaryPrefixCmp = classOf[BinaryPrefixComparator].getName
-    val DoublePrefixCmp = classOf[DoublePrefixComparator].getName
-    val StringPrefixCmp = classOf[StringPrefixComparator].getName
+    // Use javaSourceName to emit the binary name form (e.g.
+    // `PrefixComparators$DoublePrefixComparator`); Janino loads that name directly,
+    // and the JDK backend's rewriteInnerClassRefs converts it to the dotted source
+    // form javac requires.
+    val BinaryPrefixCmp = CodeGenerator.javaSourceName(classOf[BinaryPrefixComparator])
+    val DoublePrefixCmp = CodeGenerator.javaSourceName(classOf[DoublePrefixComparator])
+    val StringPrefixCmp = CodeGenerator.javaSourceName(classOf[StringPrefixComparator])
     val prefixCode = child.child.dataType match {
       case BooleanType =>
         s"$input ? 1L : 0L"
       case _: IntegralType =>
         s"(long) $input"
-      case DateType | TimestampType | TimestampNTZType | _: AnsiIntervalType =>
+      case DateType | TimestampType | TimestampNTZType | _: TimeType | _: AnsiIntervalType =>
         s"(long) $input"
       case FloatType | DoubleType =>
         s"$DoublePrefixCmp.computePrefix((double)$input)"

@@ -19,8 +19,7 @@
 A collections of builtin avro functions
 """
 
-
-from typing import Dict, Optional, TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Dict, Optional, cast
 
 from pyspark.errors import PySparkTypeError
 from pyspark.sql.column import Column
@@ -69,7 +68,7 @@ def from_avro(
     >>> df = spark.createDataFrame(data, ("key", "value"))
     >>> avroDf = df.select(to_avro(df.value).alias("avro"))
     >>> avroDf.collect()
-    [Row(avro=bytearray(b'\\x00\\x00\\x04\\x00\\nAlice'))]
+    [Row(avro=b'\\x00\\x00\\x04\\x00\\nAlice')]
 
     >>> jsonFormatSchema = '''{"type":"record","name":"topLevelRecord","fields":
     ...     [{"name":"avro","type":[{"type":"record","name":"value","namespace":"topLevelRecord",
@@ -79,6 +78,7 @@ def from_avro(
     [Row(value=Row(avro=Row(age=2, name='Alice')))]
     """
     from py4j.java_gateway import JVMView
+
     from pyspark.sql.classic.column import _to_java_column
 
     if not isinstance(data, (Column, str)):
@@ -141,14 +141,15 @@ def to_avro(data: "ColumnOrName", jsonFormatSchema: str = "") -> Column:
     >>> data = ['SPADES']
     >>> df = spark.createDataFrame(data, "string")
     >>> df.select(to_avro(df.value).alias("suite")).collect()
-    [Row(suite=bytearray(b'\\x00\\x0cSPADES'))]
+    [Row(suite=b'\\x00\\x0cSPADES')]
 
     >>> jsonFormatSchema = '''["null", {"type": "enum", "name": "value",
     ...     "symbols": ["SPADES", "HEARTS", "DIAMONDS", "CLUBS"]}]'''
     >>> df.select(to_avro(df.value, jsonFormatSchema).alias("suite")).collect()
-    [Row(suite=bytearray(b'\\x02\\x00'))]
+    [Row(suite=b'\\x02\\x00')]
     """
     from py4j.java_gateway import JVMView
+
     from pyspark.sql.classic.column import _to_java_column
 
     if not isinstance(data, (Column, str)):
@@ -185,6 +186,7 @@ def to_avro(data: "ColumnOrName", jsonFormatSchema: str = "") -> Column:
 def _test() -> None:
     import os
     import sys
+
     from pyspark.testing.sqlutils import search_jar
 
     avro_jar = search_jar("connector/avro", "spark-avro", "spark-avro")
@@ -202,15 +204,16 @@ def _test() -> None:
         os.environ["PYSPARK_SUBMIT_ARGS"] = " ".join([jars_args, existing_args])
 
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.sql.avro.functions
+    from pyspark.sql import SparkSession
 
     globs = pyspark.sql.avro.functions.__dict__.copy()
     spark = (
         SparkSession.builder.master("local[4]").appName("sql.avro.functions tests").getOrCreate()
     )
     globs["spark"] = spark
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.avro.functions,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

@@ -25,7 +25,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.Try
 import scala.util.control.NonFatal
 
-import org.apache.spark.internal.{LogKeys}
+import org.apache.spark.internal.LogKeys
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.pipelines.graph.TriggeredGraphExecution._
 import org.apache.spark.sql.pipelines.util.ExponentialBackoffStrategy
@@ -33,7 +33,7 @@ import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
 
 /**
- * Executes all of the flows in the given graph in topological order. Each flow processes
+ * Executes all the flows in the given graph in topological order. Each flow processes
  * all available data before downstream flows are triggered.
  *
  * @param graphForExecution the graph to execute.
@@ -124,7 +124,7 @@ class TriggeredGraphExecution(
       }
     )
     thread.start()
-    topologicalExecutionThread = Option(thread)
+    topologicalExecutionThread = Some(thread)
   }
 
   /** Used to control how many flows are executing at once. */
@@ -211,7 +211,7 @@ class TriggeredGraphExecution(
           }
       }
 
-      // collect flow that are ready to start
+      // collect flows that are ready to start
       val flowsToStart = mutable.ArrayBuffer[ResolvedFlow]()
       while (runnableFlows.nonEmpty && concurrencyLimit.tryAcquire()) {
         val flowIdentifier = runnableFlows.head
@@ -237,8 +237,8 @@ class TriggeredGraphExecution(
               concurrencyLimit.release()
             } else {
               env.flowProgressEventLogger.recordSkipped(flow)
-              concurrencyLimit.release()
               pipelineState.put(flowIdentifier, StreamState.SKIPPED)
+              concurrencyLimit.release()
             }
           }
         } catch {
@@ -418,21 +418,9 @@ class TriggeredGraphExecution(
       return RunCompletion()
     }
 
-    val executionFailureOpt = failureTracker.iterator
-      .map {
-        case (flowIdentifier, failureInfo) =>
-          (
-            graphForExecution.flow(flowIdentifier),
-            failureInfo.lastException,
-            failureInfo.lastExceptionAction
-          )
-      }
-      .collectFirst {
-        case (_, _, GraphExecution.StopFlowExecution(reason)) =>
-          reason.runTerminationReason
-      }
-
-    executionFailureOpt.getOrElse(UnexpectedRunFailure())
+    TriggeredGraphExecution
+      .chooseRunTerminationReason(failureTracker.iterator)
+      .getOrElse(UnexpectedRunFailure())
   }
 }
 
@@ -449,6 +437,23 @@ case class TriggeredFailureInfo(
 }
 
 object TriggeredGraphExecution {
+
+  /**
+   * Picks the run-termination reason from the flows whose execution was stopped because they
+   * exhausted their retries. Several flows can stop a run and `failures` comes from an unordered
+   * map, so the earliest failure is chosen - ties broken by flow name - to keep the reported
+   * reason stable across otherwise-identical runs.
+   */
+  private[graph] def chooseRunTerminationReason(
+      failures: Iterator[(TableIdentifier, TriggeredFailureInfo)]): Option[RunTerminationReason] = {
+    failures
+      .collect {
+        case (id, TriggeredFailureInfo(ts, _, _, GraphExecution.StopFlowExecution(r))) =>
+          (ts, id.unquotedString, r.runTerminationReason)
+      }
+      .minByOption { case (ts, flowName, _) => (ts, flowName) }
+      .map { case (_, _, reason) => reason }
+  }
 
   // All possible states of a data stream for a flow
   sealed trait StreamState

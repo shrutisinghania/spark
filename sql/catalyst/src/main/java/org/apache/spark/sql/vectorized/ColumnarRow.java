@@ -23,8 +23,10 @@ import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.catalyst.types.*;
 import org.apache.spark.sql.types.*;
 import org.apache.spark.unsafe.types.CalendarInterval;
+import org.apache.spark.unsafe.types.TimestampNanosVal;
 import org.apache.spark.unsafe.types.UTF8String;
 import org.apache.spark.unsafe.types.VariantVal;
+import org.apache.spark.unsafe.types.BinaryView;
 
 /**
  * Row abstraction in {@link ColumnVector}.
@@ -77,6 +79,8 @@ public final class ColumnarRow extends InternalRow {
           row.update(i, getUTF8String(i).copy());
         } else if (pdt instanceof PhysicalBinaryType) {
           row.update(i, getBinary(i));
+        } else if (pdt instanceof PhysicalBinaryViewType) {
+          row.update(i, getBinaryView(i).copy());
         } else if (pdt instanceof PhysicalDecimalType t) {
           row.setDecimal(i, getDecimal(i, t.precision(), t.scale()), t.precision());
         } else if (pdt instanceof PhysicalStructType t) {
@@ -85,6 +89,13 @@ public final class ColumnarRow extends InternalRow {
           row.update(i, getArray(i).copy());
         } else if (pdt instanceof PhysicalMapType) {
           row.update(i, getMap(i).copy());
+        } else if (pdt instanceof PhysicalVariantType) {
+          row.update(i, getVariant(i));
+        } else if (pdt instanceof PhysicalTimestampNTZNanosType) {
+          // TimestampNanosVal is immutable, so it can be shared without copying.
+          row.update(i, getTimestampNTZNanos(i));
+        } else if (pdt instanceof PhysicalTimestampLTZNanosType) {
+          row.update(i, getTimestampLTZNanos(i));
         } else {
           throw new RuntimeException("Not implemented. " + dt);
         }
@@ -138,8 +149,23 @@ public final class ColumnarRow extends InternalRow {
   }
 
   @Override
+  public BinaryView getBinaryView(int ordinal) {
+    return data.getChild(ordinal).getBinaryView(rowId);
+  }
+
+  @Override
   public CalendarInterval getInterval(int ordinal) {
     return data.getChild(ordinal).getInterval(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampNTZNanos(int ordinal) {
+    return data.getChild(ordinal).getTimestampNTZNanos(rowId);
+  }
+
+  @Override
+  public TimestampNanosVal getTimestampLTZNanos(int ordinal) {
+    return data.getChild(ordinal).getTimestampLTZNanos(rowId);
   }
 
   @Override
@@ -164,6 +190,7 @@ public final class ColumnarRow extends InternalRow {
 
   @Override
   public Object get(int ordinal, DataType dataType) {
+    if (isNullAt(ordinal)) return null;
     if (dataType instanceof BooleanType) {
       return getBoolean(ordinal);
     } else if (dataType instanceof ByteType) {
@@ -190,6 +217,10 @@ public final class ColumnarRow extends InternalRow {
       return getLong(ordinal);
     } else if (dataType instanceof TimestampNTZType) {
       return getLong(ordinal);
+    } else if (dataType instanceof TimestampNTZNanosType) {
+      return getTimestampNTZNanos(ordinal);
+    } else if (dataType instanceof TimestampLTZNanosType) {
+      return getTimestampLTZNanos(ordinal);
     } else if (dataType instanceof ArrayType) {
       return getArray(ordinal);
     } else if (dataType instanceof StructType) {
@@ -198,6 +229,8 @@ public final class ColumnarRow extends InternalRow {
       return getMap(ordinal);
     } else if (dataType instanceof VariantType) {
       return getVariant(ordinal);
+    } else if (dataType instanceof UserDefinedType<?> udt) {
+      return get(ordinal, udt.sqlType());
     } else {
       throw new SparkUnsupportedOperationException("_LEGACY_ERROR_TEMP_3155");
     }

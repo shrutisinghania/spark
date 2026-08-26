@@ -29,6 +29,9 @@ import org.apache.spark.{SparkException, SparkUnsupportedOperationException, Tas
 import org.apache.spark.TaskContext.withTaskContext
 import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
+import org.apache.spark.sql.execution.streaming.operators.stateful.StatefulOperatorsUtils
+import org.apache.spark.sql.execution.streaming.operators.stateful.StatePartitionKeyExtractorFactory
+import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.{TransformWithStateVariableInfo, TransformWithStateVariableUtils}
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.statefulprocessor.{ImplicitGroupingKeyTracker, StatefulProcessorHandleImpl}
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.ttl.ValueStateImplWithTTL
 import org.apache.spark.sql.execution.streaming.runtime.StreamExecution
@@ -368,6 +371,131 @@ class ValueStateSuite extends StateVariableSuiteBase {
     }
   }
 
+  test("Value state TTL uses the current processing-time function") {
+    tryWithProviderResource(newStoreProviderWithStateVariable(true)) { provider =>
+      val store = provider.getStore(0)
+      var currentTimestampMs = 1000L
+      val handle = new StatefulProcessorHandleImpl(
+        store,
+        UUID.randomUUID(),
+        stringEncoder,
+        TimeMode.ProcessingTime(),
+        batchTimestampMs = Some(currentTimestampMs),
+        currentTimestampMs = Some(() => currentTimestampMs))
+      val state = handle.getValueState[String](
+        "testState", Encoders.STRING, TTLConfig(Duration.ofMillis(100)))
+        .asInstanceOf[ValueStateImplWithTTL[String]]
+
+      ImplicitGroupingKeyTracker.setImplicitKey("test_key")
+      try {
+        state.update("v1")
+        assert(state.getTTLValue().contains(("v1", 1100L)))
+
+        currentTimestampMs = 1099L
+        assert(state.get() === "v1")
+        currentTimestampMs = 1100L
+        assert(state.get() === null)
+
+        state.update("v2")
+        assert(state.getTTLValue().contains(("v2", 1200L)))
+        currentTimestampMs = 1199L
+        assert(state.get() === "v2")
+        currentTimestampMs = 1200L
+        assert(state.get() === null)
+      } finally {
+        ImplicitGroupingKeyTracker.removeImplicitKey()
+      }
+    }
+  }
+
+  // Guards against the UnsafeRow byte-order bug where a scan boundary row with a
+  // null element-key struct encodes larger than a real entry (null-bitmap bit = 1),
+  // making seek() silently skip boundary entries. Uses a primitive Long grouping
+  // key so the element-key schema is fixed-size; variable-size schemas (e.g. String)
+  // happen to mask the bug via size-based byte differences.
+  test("SPARK-56400: TTL eviction iterator - boundary at prev+1 with fixed-size element key") {
+    tryWithProviderResource(newStoreProviderWithStateVariable(true)) { provider =>
+      val store = CkptIdCollectingStateStoreWrapper(provider.getStore(0))
+      assert(!store.isInstanceOf[SupportsReusableIterator])
+      val longKeyEncoder = encoderFor(Encoders.scalaLong).asInstanceOf[ExpressionEncoder[Any]]
+
+      // 1 ms TTL so expiration = batchTimestampMs + 1, hitting the prev+1 boundary
+      // exactly when we scan in the next batch with prevBatchTimestampMs = 1000.
+      val ttlConfig = TTLConfig(Duration.ofMillis(1))
+
+      val firstBatchTs = 1000L
+      val handle1 = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
+        longKeyEncoder, TimeMode.ProcessingTime(),
+        batchTimestampMs = Some(firstBatchTs))
+      val state1 = handle1.getValueState[Long]("testState", Encoders.scalaLong, ttlConfig)
+        .asInstanceOf[ValueStateImplWithTTL[Long]]
+
+      Seq(10L, 20L, 30L).foreach { k =>
+        ImplicitGroupingKeyTracker.setImplicitKey(k)
+        state1.update(k)
+        ImplicitGroupingKeyTracker.removeImplicitKey()
+      }
+
+      val nextBatchTs = 2000L
+      val handle2 = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
+        longKeyEncoder, TimeMode.ProcessingTime(),
+        batchTimestampMs = Some(nextBatchTs),
+        prevBatchTimestampMs = Some(firstBatchTs))
+      val state2 = handle2.getValueState[Long]("testState", Encoders.scalaLong, ttlConfig)
+        .asInstanceOf[ValueStateImplWithTTL[Long]]
+
+      // Sanity: all three rows are present in the TTL index (full iterator, no bounds).
+      assert(state2.getTTLRows().toSeq.map(_.expirationMs).sorted ===
+        Seq(firstBatchTs + 1, firstBatchTs + 1, firstBatchTs + 1))
+
+      // The eviction iterator (bounded range scan) should find all three entries.
+      val evicted = state2.ttlEvictionIterator(nextBatchTs).toList
+      assert(evicted.size === 3,
+        s"Expected 3 evictable TTL entries at expiration = prevBatch + 1, got ${evicted.size}")
+    }
+  }
+
+  test("TTL eviction reusable iterator refreshes and resumes from prior threshold") {
+    tryWithProviderResource(newStoreProviderWithStateVariable(true)) { provider =>
+      val store = provider.getStore(0)
+      assert(store.isInstanceOf[SupportsReusableIterator])
+      val longKeyEncoder = encoderFor(Encoders.scalaLong).asInstanceOf[ExpressionEncoder[Any]]
+      val ttlConfig = TTLConfig(Duration.ofMillis(500))
+      var currentTimeMs = 250L
+      val handle = new StatefulProcessorHandleImpl(
+        store,
+        UUID.randomUUID(),
+        longKeyEncoder,
+        TimeMode.ProcessingTime(),
+        batchTimestampMs = Some(5000L),
+        prevBatchTimestampMs = Some(5000L),
+        currentTimestampMs = Some(() => currentTimeMs))
+      val state = handle.getValueState[Long](
+        "testState", Encoders.scalaLong, ttlConfig).asInstanceOf[ValueStateImplWithTTL[Long]]
+
+      def update(key: Long): Unit = {
+        ImplicitGroupingKeyTracker.setImplicitKey(key)
+        try {
+          state.update(key)
+        } finally {
+          ImplicitGroupingKeyTracker.removeImplicitKey()
+        }
+      }
+
+      // The first scan starts at the column-family beginning and stops on the future entry.
+      update(1L) // expires at 750
+      assert(state.clearExpiredStateForAllKeys(500L) === 0L)
+
+      // Refreshing makes this new entry visible and seeking to the prior threshold revisits the
+      // entry consumed by the first scan. Seeking to the new threshold would skip it.
+      currentTimeMs = 500L
+      update(2L) // expires at 1000
+      assert(state.clearExpiredStateForAllKeys(900L) === 1L)
+      assert(state.clearExpiredStateForAllKeys(1000L) === 1L)
+      assert(state.getTTLRows().isEmpty)
+    }
+  }
+
   test("test null or zero TTL duration throws error") {
     tryWithProviderResource(newStoreProviderWithStateVariable(true)) { provider =>
       val store = provider.getStore(0)
@@ -421,6 +549,30 @@ class ValueStateSuite extends StateVariableSuiteBase {
       assert(ttlStateValueIterator.isDefined)
     }
   }
+
+  test("Partition key extraction - ValueState without TTL") {
+    testValueStatePartitionKeyExtraction(ttlEnabled = false)
+  }
+
+  test("Partition key extraction - ValueState with TTL") {
+    testValueStatePartitionKeyExtraction(ttlEnabled = true)
+  }
+
+  private def testValueStatePartitionKeyExtraction(ttlEnabled: Boolean): Unit = {
+    testPartitionKeyExtraction(
+      addStateFunc = { (handle, ttlConfig, _) =>
+        val testState: ValueState[Long] = handle.getValueState[Long]("testState", ttlConfig)
+        ImplicitGroupingKeyTracker.setImplicitKey("key1")
+        testState.update(100L)
+        ImplicitGroupingKeyTracker.setImplicitKey("key2")
+        testState.update(200L)
+      },
+      stateVariableInfo = TransformWithStateVariableUtils.getValueState("testState", ttlEnabled),
+      ttlEnabled = ttlEnabled,
+      expectedNumColFamilies = if (ttlEnabled) 2 else 1,
+      groupingKeyToExpectedCount = Map("key1" -> 1, "key2" -> 1)
+    )
+  }
 }
 
 /**
@@ -454,10 +606,17 @@ abstract class StateVariableSuiteBase extends SharedSparkSession
   protected def useMultipleValuesPerKey = false
 
   protected def newStoreProviderWithStateVariable(
-      useColumnFamilies: Boolean): RocksDBStateStoreProvider = {
+      useColumnFamilies: Boolean,
+      schemaProvider: Option[StateSchemaProvider]): RocksDBStateStoreProvider = {
     newStoreProviderWithStateVariable(StateStoreId(newDir(), Random.nextInt(), 0),
       NoPrefixKeyStateEncoderSpec(schemaForKeyRow),
-      useColumnFamilies = useColumnFamilies)
+      useColumnFamilies = useColumnFamilies,
+      schemaProvider = schemaProvider)
+  }
+
+  protected def newStoreProviderWithStateVariable(
+      useColumnFamilies: Boolean): RocksDBStateStoreProvider = {
+    newStoreProviderWithStateVariable(useColumnFamilies, schemaProvider = None)
   }
 
   protected def newStoreProviderWithStateVariable(
@@ -465,14 +624,15 @@ abstract class StateVariableSuiteBase extends SharedSparkSession
       keyStateEncoderSpec: KeyStateEncoderSpec,
       sqlConf: SQLConf = SQLConf.get,
       conf: Configuration = new Configuration,
-      useColumnFamilies: Boolean = false): RocksDBStateStoreProvider = {
+      useColumnFamilies: Boolean = false,
+      schemaProvider: Option[StateSchemaProvider] = None): RocksDBStateStoreProvider = {
     val provider = new RocksDBStateStoreProvider()
     conf.set(StreamExecution.RUN_ID_KEY, UUID.randomUUID().toString)
     provider.init(
       storeId, schemaForKeyRow, schemaForValueRow, keyStateEncoderSpec,
       useColumnFamilies,
       new StateStoreConf(sqlConf), conf, useMultipleValuesPerKey,
-      Some(new TestStateSchemaProvider))
+      schemaProvider.orElse(Some(new TestStateSchemaProvider)))
     provider
   }
 
@@ -491,5 +651,73 @@ abstract class StateVariableSuiteBase extends SharedSparkSession
       provider.close()
     }
   }
+
+  protected def testPartitionKeyExtraction(
+      addStateFunc: (StatefulProcessorHandleImpl, TTLConfig, StateStore) => Unit,
+      stateVariableInfo: TransformWithStateVariableInfo,
+      ttlEnabled: Boolean,
+      expectedNumColFamilies: Int,
+      groupingKeyToExpectedCount: Map[String, Int],
+      timeMode: TimeMode = TimeMode.ProcessingTime()): Unit = {
+    val schemaProvider = new TestStateSchemaProvider
+    tryWithProviderResource(
+      newStoreProviderWithStateVariable(true, Some(schemaProvider))) { provider =>
+      val store = provider.getStore(0)
+      val timestampMs = 10
+      val handle = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
+        stringEncoder, timeMode, batchTimestampMs = Some(timestampMs))
+
+      val ttlConfig = if (ttlEnabled) {
+        TTLConfig(ttlDuration = Duration.ofMinutes(1))
+      } else {
+        TTLConfig.NONE
+      }
+
+      // call the passed in func to create the state variable and add state
+      addStateFunc(handle, ttlConfig, store)
+
+      // Get all the column families and their key schemas
+      val colFamilyNameAndKeySchema = schemaProvider.schemas.filter(_._1.isKey)
+        .map(kv => (kv._1.colFamilyName, kv._2.sqlSchema))
+        // don't include default CF
+        .filterNot(_._1 == StateStore.DEFAULT_COL_FAMILY_NAME)
+
+      assert(colFamilyNameAndKeySchema.size === expectedNumColFamilies,
+        s"Should have $expectedNumColFamilies column families, " +
+          s"found ${colFamilyNameAndKeySchema.size}")
+
+      // Verify partition key extraction for each column family
+      val expectedStateKeyCount = groupingKeyToExpectedCount.values.sum
+      colFamilyNameAndKeySchema.foreach { case (colFamilyName, keySchema) =>
+        val extractor = StatePartitionKeyExtractorFactory.create(
+          StatefulOperatorsUtils.TRANSFORM_WITH_STATE_EXEC_OP_NAME,
+          keySchema,
+          storeName = StateStoreId.DEFAULT_STORE_NAME,
+          colFamilyName = colFamilyName,
+          stateVariableInfo = Some(stateVariableInfo)
+        )
+
+        assert(extractor.partitionKeySchema === stringEncoder.schema,
+          "Partition key schema should match the grouping key schema")
+
+        // Get all state keys and extract partition keys
+        val stateKeys = store.iterator(colFamilyName).map(_.key.copy()).toList
+        assert(stateKeys.length == expectedStateKeyCount,
+          s"Should have $expectedStateKeyCount state keys, found ${stateKeys.length}")
+
+        val partitionKeys = stateKeys.map(extractor.partitionKey(_).copy())
+
+        groupingKeyToExpectedCount.foreach { case (keyStr, expectedCount) =>
+          val keyRow = stringEncoder.createSerializer().apply(keyStr).copy()
+          assert(partitionKeys.count(_ === keyRow) == expectedCount,
+            s"Should have $expectedCount partition keys for $keyStr")
+        }
+      }
+    }
+  }
 }
 
+/**
+ * Test suite that runs all ValueStateSuite tests with row checksum enabled.
+ */
+class ValueStateSuiteWithRowChecksum extends ValueStateSuite with EnableStateStoreRowChecksum

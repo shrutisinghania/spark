@@ -23,11 +23,11 @@ import scala.reflect.ClassTag
 import scala.util.Random
 import scala.util.control.NonFatal
 
-import org.scalatest.{Assertions, BeforeAndAfterAll}
+import org.scalatest.Assertions
 import org.scalatest.concurrent.{Eventually, Signaler, ThreadSignaler, TimeLimits}
 import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.exceptions.TestFailedDueToTimeoutException
-import org.scalatest.time.Span
+import org.scalatest.time.{Millis, Span}
 import org.scalatest.time.SpanSugar._
 
 import org.apache.spark.SparkEnv
@@ -73,7 +73,7 @@ import org.apache.spark.util.{Clock, SystemClock, Utils}
  * avoid hanging forever in the case of failures. However, individual suites can change this
  * by overriding `streamingTimeout`.
  */
-trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with BeforeAndAfterAll {
+trait StreamTest extends SharedSparkSession with TimeLimits {
 
   // Necessary to make ScalaTest 3.x interrupt a thread on the JVM like ScalaTest 2.2.x
   implicit val defaultSignaler: Signaler = ThreadSignaler
@@ -172,6 +172,31 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
       CheckAnswerRowsByFunc(globalCheckFunction, false)
   }
 
+  object CheckAnswerWithTimeout {
+
+    def apply[A: Encoder](timeoutMs: Long, data: A*): CheckAnswerRowsNoWait = {
+      val toExternalRow = createToExternalRowConverter[A]()
+      CheckAnswerRowsNoWait(data.map(toExternalRow), timeoutMs)
+    }
+
+    def apply(timeoutMs: Long, rows: Row*): CheckAnswerRowsNoWait =
+      CheckAnswerRowsNoWait(rows, timeoutMs)
+  }
+
+  /**
+   * Used for testing Real-time mode where batches run for a fixed amount of time
+   */
+  object CheckAnswerRowsContainsWithTimeout {
+
+    def apply[A: Encoder](timeoutMs: Long, data: A*): CheckAnswerRowsContainsWithTimeout = {
+      val toExternalRow = createToExternalRowConverter[A]()
+      CheckAnswerRowsContainsWithTimeout(data.map(toExternalRow), timeoutMs)
+    }
+
+    def apply(timeoutMs: Long, rows: Row*): CheckAnswerRowsContainsWithTimeout =
+      CheckAnswerRowsContainsWithTimeout(rows, timeoutMs)
+  }
+
   /**
    * Checks to make sure that the current data stored in the sink matches the `expectedAnswer`.
    * This operation automatically blocks until all added data has been processed.
@@ -218,6 +243,20 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
     override def toString: String = s"CheckNewAnswer: ${expectedAnswer.mkString(",")}"
   }
 
+  case class CheckAnswerRowsNoWait(expectedAnswer: Seq[Row], waitTimeoutMs: Long)
+    extends StreamAction
+      with StreamMustBeRunning {
+    override def toString: String = s"$operatorName: ${expectedAnswer.mkString(",")}"
+    private def operatorName = "CheckAnswerWithTimeout"
+  }
+
+  case class CheckAnswerRowsContainsWithTimeout(expectedAnswer: Seq[Row], waitTimeoutMs: Long)
+    extends StreamAction
+      with StreamMustBeRunning {
+    override def toString: String = s"$operatorName: ${expectedAnswer.mkString(",")}"
+    private def operatorName = "CheckAnswerContainsWithTimeout"
+  }
+
   object CheckNewAnswer {
     def apply(): CheckNewAnswerRows = CheckNewAnswerRows(Seq.empty)
 
@@ -243,6 +282,10 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
   /** Advance the trigger clock's time manually. */
   case class AdvanceManualClock(timeToAdd: Long) extends StreamAction
 
+  case class WaitUntilBatchProcessed(batchId: Long) extends StreamAction with StreamMustBeRunning
+
+  case object WaitUntilCurrentBatchProcessed extends StreamAction with StreamMustBeRunning
+
   /**
    * Signals that a failure is expected and should not kill the test.
    *
@@ -252,10 +295,12 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
    */
   case class ExpectFailure[T <: Throwable : ClassTag](
       assertFailure: Throwable => Unit = _ => {},
-      isFatalError: Boolean = false) extends StreamAction {
+      isFatalError: Boolean = false,
+      typeIsSuperClass: Boolean = false) extends StreamAction {
     val causeClass: Class[T] = implicitly[ClassTag[T]].runtimeClass.asInstanceOf[Class[T]]
     override def toString(): String =
-      s"ExpectFailure[${causeClass.getName}, isFatalError: $isFatalError]"
+      s"ExpectFailure[${causeClass.getName}, isFatalError: $isFatalError, " +
+        s"typeIsSuperClass: $typeIsSuperClass]"
   }
 
   /**
@@ -556,6 +601,7 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
               .streams
               .startQuery(
                 None,
+                None,
                 Some(metadataRoot),
                 stream,
                 extraOptions,
@@ -599,6 +645,39 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
             s"Unexpected clock time after updating: " +
               s"expecting $manualClockExpectedTime, current ${clock.getTimeMillis()}")
 
+        case WaitUntilBatchProcessed(batchId) =>
+          eventually("Next batch was never processed") {
+            if (!currentStream.exception.isDefined) {
+              assert(currentStream.commitLog.getLatestBatchId().getOrElse(-1L) >= batchId)
+
+              // The progress gets updated after the commit log is updated, but callers
+              // use WaitUntil(Current)BatchProcessed to check the streaming query progress.
+              //
+              // Checking the progress alone is not enough because progress can be posted due
+              // to idleness even if the commitLog has not been updated.
+              val latestProgressBatchId =
+                currentStream.recentProgress.lastOption.map(_.batchId).getOrElse(-1L)
+              assert(latestProgressBatchId >= batchId)
+            }
+          }
+          if (currentStream.exception.isDefined) {
+            throw currentStream.exception.get
+          }
+
+        case WaitUntilCurrentBatchProcessed =>
+          if (currentStream.exception.isDefined) {
+            throw currentStream.exception.get
+          }
+          val currBatch = currentStream.commitLog.getLatestBatchId().getOrElse(-1L)
+          eventually("Current batch never finishes") {
+            assert(currentStream.commitLog.getLatestBatchId() != None
+              && currentStream.commitLog.getLatestBatchId().get > currBatch)
+
+            // See WaitUntilBatchProcessed for an explanation of why we wait for the progress
+            val latestProgressBatchId =
+              currentStream.recentProgress.lastOption.map(_.batchId).getOrElse(-1L)
+            assert(latestProgressBatchId >= currBatch)
+          }
         case StopStream =>
           verify(currentStream != null, "can not stop a stream that is not running")
           try failAfter(streamingTimeout) {
@@ -635,14 +714,25 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
               s"incorrect exception returned by query.exception()")
 
             val exception = currentStream.exception.get
-            verify(exception.cause.getClass === ef.causeClass,
-              "incorrect cause in exception returned by query.exception()\n" +
-                s"\tExpected: ${ef.causeClass}\n\tReturned: ${exception.cause.getClass}")
+            if (ef.typeIsSuperClass) {
+              verify(ef.causeClass.isInstance(exception.cause),
+                "incorrect cause in exception returned by query.exception()\n" +
+                  s"\tExpected: ${ef.causeClass}\n\tReturned: ${exception.cause.getClass}")
+            } else {
+              verify(exception.cause.getClass === ef.causeClass,
+                "incorrect cause in exception returned by query.exception()\n" +
+                  s"\tExpected: ${ef.causeClass}\n\tReturned: ${exception.cause.getClass}")
+            }
             if (ef.isFatalError) {
               // This is a fatal error, `streamThreadDeathCause` should be set to this error in
               // UncaughtExceptionHandler.
-              verify(streamThreadDeathCause != null &&
-                streamThreadDeathCause.getClass === ef.causeClass,
+              val fatalErrorMatches = streamThreadDeathCause != null && (
+                if (ef.typeIsSuperClass) {
+                  ef.causeClass.isInstance(streamThreadDeathCause)
+                } else {
+                  streamThreadDeathCause.getClass === ef.causeClass
+                })
+              verify(fatalErrorMatches,
                 "UncaughtExceptionHandler didn't receive the correct error\n" +
                   s"\tExpected: ${ef.causeClass}\n\tReturned: $streamThreadDeathCause")
               streamThreadDeathCause = null
@@ -742,6 +832,23 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
 
         case e: ExternalAction =>
           e.runAction()
+
+
+        case CheckAnswerRowsNoWait(expectedAnswer, timeoutMs) =>
+          Eventually.eventually(Timeout(Span(timeoutMs, Millis))) {
+            val sparkAnswer = sink.allData
+            QueryTest.sameRows(expectedAnswer, sparkAnswer).foreach {
+              error => failTest(error)
+            }
+          }
+
+        case CheckAnswerRowsContainsWithTimeout(expectedAnswer, timeoutMs) =>
+          Eventually.eventually(Timeout(Span(timeoutMs, Millis))) {
+            val sparkAnswer = sink.allData
+            QueryTest.includesRows(expectedAnswer, sparkAnswer).foreach { error =>
+              failTest(error)
+            }
+          }
 
         case CheckAnswerRows(expectedAnswer, lastOnly, isSorted) =>
           val sparkAnswer = fetchStreamAnswer(currentStream, lastOnly)

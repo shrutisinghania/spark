@@ -211,11 +211,11 @@ You can profile it as below.
          8     51.5 MiB      0.0 MiB       df = session.range(10000)
          9     54.4 MiB      2.8 MiB       return df.collect()
 
-Python/Pandas UDF
-~~~~~~~~~~~~~~~~~
+Python/Pandas/Arrow UDF
+~~~~~~~~~~~~~~~~~~~~~~~
 
 PySpark provides remote `memory_profiler <https://github.com/pythonprofilers/memory_profiler>`_ for
-Python/Pandas UDFs. That can be used on editors with line numbers such as Jupyter notebooks. UDFs that are generator functions are not supported.
+Python/Pandas/Arrow UDFs. That can be used on editors with line numbers such as Jupyter notebooks. UDFs that are generator functions are not supported.
 
 SparkSession-based memory profiler can be enabled by setting the `Runtime SQL configuration <https://spark.apache.org/docs/latest/configuration.html#runtime-sql-configuration>`_
 ``spark.sql.pyspark.udf.profiler`` to ``memory``. An example on a Jupyter notebook is as shown below.
@@ -316,11 +316,11 @@ regular Python process unless you are running your driver program in another mac
           276    0.000    0.000    0.002    0.000 <frozen importlib._bootstrap>:147(__enter__)
     ...
 
-Python/Pandas UDF
-~~~~~~~~~~~~~~~~~
+Python/Pandas/Arrow UDF
+~~~~~~~~~~~~~~~~~~~~~~~
 
 PySpark provides remote `Python Profilers <https://docs.python.org/3/library/profile.html>`_ for
-Python/Pandas UDFs. UDFs that are generator functions are not supported.
+Python/Pandas/Arrow UDFs. UDFs that are generator functions are not supported.
 
 SparkSession-based performance profiler can be enabled by setting the `Runtime SQL configuration <https://spark.apache.org/docs/latest/configuration.html#runtime-sql-configuration>`_
 ``spark.sql.pyspark.udf.profiler`` to ``perf``. An example is as shown below.
@@ -575,7 +575,7 @@ Solution:
     1    6
     dtype: int64
 
-**RuntimeError: Result vector from pandas_udf was not the required length**
+**PySparkRuntimeError: [RESULT_ROWS_MISMATCH] The number of output rows must match the number of input rows**
 
 Exception:
 
@@ -588,7 +588,7 @@ Exception:
     22/04/12 13:46:39 ERROR Executor: Exception in task 2.0 in stage 16.0 (TID 88)
     org.apache.spark.api.python.PythonException: Traceback (most recent call last):
     ...
-    RuntimeError: Result vector from pandas_udf was not the required length: expected 1, got 0
+    pyspark.errors.exceptions.base.PySparkRuntimeError: [RESULT_ROWS_MISMATCH] The number of output rows (0) must match the number of input rows (1).
 
 Solution:
 

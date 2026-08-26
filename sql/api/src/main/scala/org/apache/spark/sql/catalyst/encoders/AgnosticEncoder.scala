@@ -237,8 +237,10 @@ object AgnosticEncoders {
   // Nullable leaf encoders
   case object NullEncoder extends LeafEncoder[java.lang.Void](NullType)
   case object StringEncoder extends LeafEncoder[String](StringType)
-  case class CharEncoder(length: Int) extends LeafEncoder[String](CharType(length))
-  case class VarcharEncoder(length: Int) extends LeafEncoder[String](VarcharType(length))
+  // Carry the full constrained type (length + collation), matching GeographyEncoder /
+  // GeometryEncoder. Reconstructing from length alone would drop a declared collation.
+  case class CharEncoder(dt: CharType) extends LeafEncoder[String](dt)
+  case class VarcharEncoder(dt: VarcharType) extends LeafEncoder[String](dt)
   case object BinaryEncoder extends LeafEncoder[Array[Byte]](BinaryType)
   case object ScalaBigIntEncoder extends LeafEncoder[BigInt](DecimalType.BigIntDecimal)
   case object JavaBigIntEncoder extends LeafEncoder[JBigInt](DecimalType.BigIntDecimal)
@@ -246,6 +248,8 @@ object AgnosticEncoders {
   case object DayTimeIntervalEncoder extends LeafEncoder[Duration](DayTimeIntervalType())
   case object YearMonthIntervalEncoder extends LeafEncoder[Period](YearMonthIntervalType())
   case object VariantEncoder extends LeafEncoder[VariantVal](VariantType)
+  case class GeographyEncoder(dt: GeographyType) extends LeafEncoder[Geography](dt)
+  case class GeometryEncoder(dt: GeometryType) extends LeafEncoder[Geometry](dt)
   case class DateEncoder(override val lenientSerialization: Boolean)
       extends LeafEncoder[jsql.Date](DateType)
   case class LocalDateEncoder(override val lenientSerialization: Boolean)
@@ -255,6 +259,14 @@ object AgnosticEncoders {
   case class InstantEncoder(override val lenientSerialization: Boolean)
       extends LeafEncoder[Instant](TimestampType)
   case object LocalDateTimeEncoder extends LeafEncoder[LocalDateTime](TimestampNTZType)
+  // Nanosecond-precision counterparts of `LocalDateTimeEncoder` / `InstantEncoder(false)`.
+  // They are used by `RowEncoder` when the schema declares a `TimestampNTZNanosType(p)` or
+  // `TimestampLTZNanosType(p)` column, so Dataset create/collect roundtrips preserve full
+  // nanosecond precision. See SPARK-57033.
+  case class LocalDateTimeNanosEncoder(precision: Int)
+      extends LeafEncoder[LocalDateTime](TimestampNTZNanosType(precision))
+  case class InstantNanosEncoder(precision: Int)
+      extends LeafEncoder[Instant](TimestampLTZNanosType(precision))
   case object LocalTimeEncoder extends LeafEncoder[LocalTime](TimeType())
 
   case class SparkDecimalEncoder(dt: DecimalType) extends LeafEncoder[Decimal](dt)
@@ -277,6 +289,10 @@ object AgnosticEncoders {
     ScalaDecimalEncoder(DecimalType.SYSTEM_DEFAULT)
   val DEFAULT_JAVA_DECIMAL_ENCODER: JavaDecimalEncoder =
     JavaDecimalEncoder(DecimalType.SYSTEM_DEFAULT, lenientSerialization = false)
+  val DEFAULT_GEOMETRY_ENCODER: GeometryEncoder =
+    GeometryEncoder(GeometryType(Geometry.DEFAULT_SRID))
+  val DEFAULT_GEOGRAPHY_ENCODER: GeographyEncoder =
+    GeographyEncoder(GeographyType(Geography.DEFAULT_SRID))
 
   /**
    * Encoder that transforms external data into a representation that can be further processed by

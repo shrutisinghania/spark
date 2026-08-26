@@ -17,35 +17,45 @@
 
 package org.apache.spark.sql.execution.streaming.runtime
 
+import java.util.concurrent.atomic.AtomicLong
+
 import scala.collection.mutable.{Map => MutableMap}
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
+import org.apache.hadoop.fs.Path
+
+import org.apache.spark.{SparkException, SparkIllegalArgumentException, SparkIllegalStateException}
 import org.apache.spark.internal.LogKeys
-import org.apache.spark.internal.LogKeys.BATCH_ID
+import org.apache.spark.internal.LogKeys._
+import org.apache.spark.sql.catalyst.analysis.{ResolveDeduplicate, V2TableReference}
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, CurrentBatchTimestamp, CurrentDate, CurrentTimestamp, FileSourceMetadataAttribute, LocalTimestamp}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, GlobalLimit, LeafNode, LocalRelation, LogicalPlan, Project, StreamSourceAwareLogicalPlan}
-import org.apache.spark.sql.catalyst.streaming.{StreamingRelationV2, WriteToStream}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, CurrentBatchTimestamp, CurrentDate, CurrentTimestamp, CurrentTimestampNanos, FileSourceMetadataAttribute, LocalTimestamp, LocalTimestampNanos}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Deduplicate, DeduplicateWithinWatermark, Distinct, FlatMapGroupsInPandasWithState, FlatMapGroupsWithState, GlobalLimit, Join, LeafNode, LocalRelation, LogicalPlan, Project, StreamSourceAwareLogicalPlan, TransformWithState, TransformWithStateInPySpark}
+import org.apache.spark.sql.catalyst.streaming.{StreamingRelationV2, Unassigned, WriteToStream}
 import org.apache.spark.sql.catalyst.trees.TreePattern.CURRENT_LIKE
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.classic.{Dataset, SparkSession}
 import org.apache.spark.sql.classic.ClassicConversions.castToImpl
-import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, TableCapability}
-import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset => OffsetV2, ReadLimit, SparkDataStream, SupportsAdmissionControl, SupportsTriggerAvailableNow}
+import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, TableCapability, TransactionalCatalogPlugin}
+import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns
+import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset => OffsetV2, ReadLimit, SparkDataStream, SupportsAdmissionControl, SupportsRealTimeMode, SupportsTriggerAvailableNow}
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
 import org.apache.spark.sql.execution.datasources.LogicalRelation
-import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, StreamingDataSourceV2Relation, StreamingDataSourceV2ScanRelation, StreamWriterCommitProgress, WriteToDataSourceV2Exec}
-import org.apache.spark.sql.execution.streaming.{AvailableNowTrigger, Offset, OneTimeTrigger, ProcessingTimeTrigger, Sink, Source}
-import org.apache.spark.sql.execution.streaming.checkpointing.{CommitMetadata, OffsetSeq, OffsetSeqMetadata}
+import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, RealTimeStreamScanExec, StreamingDataSourceV2Relation, StreamingDataSourceV2ScanRelation, StreamWriterCommitProgress, WriteToDataSourceV2Exec}
+import org.apache.spark.sql.execution.streaming.{AvailableNowTrigger, Offset, OneTimeTrigger, ProcessingTimeTrigger, RealTimeTrigger, Sink, Source, StreamingQueryPlanTraverseHelper}
+import org.apache.spark.sql.execution.streaming.checkpointing.{CheckpointFileManager, CheckpointVersionManager, CommitLog, CommitLogType, CommitMetadataV3, OffsetLogType, OffsetSeqBase, OffsetSeqLog, OffsetSeqMetadata, OffsetSeqMetadataV2, SinkMetadataInfo}
 import org.apache.spark.sql.execution.streaming.operators.stateful.{StatefulOperatorStateInfo, StatefulOpStateStoreCheckpointInfo, StateStoreWriter}
-import org.apache.spark.sql.execution.streaming.runtime.AcceptsLatestSeenOffsetHandler
+import org.apache.spark.sql.execution.streaming.runtime.StreamingCheckpointConstants.{DIR_NAME_COMMITS, DIR_NAME_OFFSETS, DIR_NAME_STATE}
 import org.apache.spark.sql.execution.streaming.sources.{ForeachBatchSink, WriteToMicroBatchDataSource, WriteToMicroBatchDataSourceV1}
-import org.apache.spark.sql.execution.streaming.state.StateSchemaBroadcast
+import org.apache.spark.sql.execution.streaming.state.{OfflineStateRepartitionUtils, StateSchemaBroadcast, StateStoreErrors}
+import org.apache.spark.sql.execution.streaming.utils.StreamingUtils
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.connector.PartitionOffsetWithIndex
 import org.apache.spark.sql.streaming.Trigger
-import org.apache.spark.util.{Clock, Utils}
+import org.apache.spark.util.{Clock, ErrorNotifier, Utils}
 
 class MicroBatchExecution(
     sparkSession: SparkSession,
@@ -71,6 +81,8 @@ class MicroBatchExecution(
       progressReporter,
       -1,
       sparkSession,
+      offsetLogFormatVersionOpt = None,
+      commitLogFormatVersionOpt = None,
       previousContext = None)
 
   override def getLatestExecutionContext(): StreamExecutionContext = latestExecutionContext
@@ -94,6 +106,40 @@ class MicroBatchExecution(
 
   @volatile protected var sources: Seq[SparkDataStream] = Seq.empty
 
+  // Source ID mapping for OffsetMap support
+  // Using index as sourceId initially, can be extended to support user-provided names
+  // This is initialized in the same path as the sources Seq (defined above) and is used
+  // in the same way, when OffsetLog v2 is used.
+  @volatile protected var sourceIdMap: Map[String, SparkDataStream] = Map.empty
+
+  override protected def sourceToIdMap: Map[SparkDataStream, String] = sourceIdMap.map(_.swap)
+
+  // Sink name for commit log support
+  // If sink evolution is enabled, use user-provided sinkName (or error if not provided)
+  // Otherwise, always use DEFAULT_SINK_NAME for backward compatibility
+  private val sinkName: String = {
+    if (sparkSession.sessionState.conf.enableStreamingSinkEvolution) {
+      plan.sinkName.getOrElse {
+        throw new SparkException(
+          errorClass = "STREAMING_QUERY_EVOLUTION_ERROR.UNNAMED_STREAMING_SINKS_WITH_ENFORCEMENT",
+          messageParameters = Map.empty,
+          cause = null)
+      }
+    } else {
+      MicroBatchExecution.DEFAULT_SINK_NAME
+    }
+  }
+
+  // Historical sink metadata keyed by sink name, read from the commit log on restart. Hydrated by
+  // [[populateStartOffsets]] from the latest CommitMetadataV3 and rewritten by the commit-log write
+  // in [[markMicroBatchEnd]]. The active sink is identified by its isActive flag, not by position,
+  // so the iteration order is not significant.
+  private val sinkMetadataMap = mutable.HashMap.empty[String, SinkMetadataInfo]
+
+  /** True when the current query should persist V3 sink metadata in the commit log. */
+  private def commitLogV3Enabled: Boolean =
+    sparkSession.sessionState.conf.enableStreamingSinkEvolution
+
   @volatile protected[sql] var triggerExecutor: TriggerExecutor = _
 
   protected def getTrigger(): TriggerExecutor = {
@@ -101,6 +147,7 @@ class MicroBatchExecution(
     trigger match {
       case t: ProcessingTimeTrigger => ProcessingTimeExecutor(t, triggerClock)
       case OneTimeTrigger => SingleBatchExecutor()
+      case _: RealTimeTrigger => ProcessingTimeExecutor(ProcessingTimeTrigger(0), triggerClock)
       case AvailableNowTrigger =>
         // When the flag is enabled, Spark will wrap sources which do not support
         // Trigger.AvailableNow with wrapper implementation, so that Trigger.AvailableNow can
@@ -148,11 +195,21 @@ class MicroBatchExecution(
   // into every subsequent batch's query plan.
   private val stateSchemaMetadatas = MutableMap[Long, StateSchemaBroadcast]()
 
+  /**
+   * Cached result of the first `offsetLog.getLatest()` call. Reused by both
+   * `logicalPlan` (to determine `enforceNamed`) and `initializeExecution` (to seed
+   * `latestStartedBatch`). This avoids a redundant `ListStatus` on the checkpoint's
+   * `offsets/` directory during stream startup. Safe to cache: between construction
+   * and `initializeExecution`, nothing else writes the offset log on the query thread.
+   */
+  private lazy val initialLatestOffsetSeq: Option[(Long, OffsetSeqBase)] =
+    offsetLog.getLatest()
+
   override lazy val logicalPlan: LogicalPlan = {
     assert(queryExecutionThread eq Thread.currentThread,
       "logicalPlan must be initialized in QueryExecutionThread " +
         s"but the current thread was ${Thread.currentThread}")
-    var nextSourceId = 0L
+    val nextSourceId = new AtomicLong(0L)
     val toExecutionRelationMap = MutableMap[StreamingRelation, StreamingExecutionRelation]()
     val v2ToExecutionRelationMap = MutableMap[StreamingRelationV2, StreamingExecutionRelation]()
     val v2ToRelationMap = MutableMap[StreamingRelationV2, StreamingDataSourceV2ScanRelation]()
@@ -167,37 +224,90 @@ class MicroBatchExecution(
     val disabledSources =
       Utils.stringToSeq(sparkSession.sessionState.conf.disabledV2StreamingMicroBatchReaders)
 
+    // Read the source evolution enforcement from the last written offset log entry. If no entries
+    // are found, use the session config value.
+    val enforceNamed = initialLatestOffsetSeq.flatMap { case (_, offsetSeq) =>
+      offsetSeq.metadataOpt.flatMap { metadata =>
+        OffsetSeqMetadata.readValueOpt(metadata, SQLConf.ENABLE_STREAMING_SOURCE_EVOLUTION)
+          .map(_.toBoolean)
+      }
+    }.getOrElse(sparkSessionForStream.sessionState.conf.enableStreamingSourceEvolution)
+
+    // SPARK-57489: dropDuplicates / dropDuplicatesWithinWatermark resolve their keys with the
+    // deterministic order by default, but streaming deduplication binds state-store keys by
+    // position. A query restored from a checkpoint that predates this change must keep its original
+    // (legacy) key order, so recompute the keys from the recipe carried on the resolved node using
+    // the order pinned in the offset log (mirroring how `enforceNamed` is read above). For a new
+    // query the offset log has no entry yet, so the session value is used and pinned at batch 0.
+    val streamConf = sparkSessionForStream.sessionState.conf
+    val orderDeterministically = initialLatestOffsetSeq.flatMap { case (_, offsetSeq) =>
+      offsetSeq.metadataOpt.flatMap { metadata =>
+        OffsetSeqMetadata.readValueOpt(metadata, SQLConf.DROP_DUPLICATES_DETERMINISTIC_KEY_ORDER)
+          .map(_.toBoolean)
+      }
+    }.getOrElse(streamConf.getConf(SQLConf.DROP_DUPLICATES_DETERMINISTIC_KEY_ORDER))
+    val dedupResolver = sparkSessionForStream.sessionState.analyzer.resolver
+    val planWithDedupKeys = analyzedPlan.transformUp {
+      case d @ Deduplicate(_, child, Some(spec)) =>
+        d.copy(keys =
+          ResolveDeduplicate.computeKeys(child, spec, orderDeterministically, dedupResolver))
+      case d @ DeduplicateWithinWatermark(_, child, Some(spec)) =>
+        d.copy(keys =
+          ResolveDeduplicate.computeKeys(child, spec, orderDeterministically, dedupResolver))
+    }
+
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
-    val _logicalPlan = analyzedPlan.transform {
-      case streamingRelation @ StreamingRelation(dataSourceV1, sourceName, output) =>
+    val _logicalPlan = planWithDedupKeys.transform {
+      case streamingRelation @ StreamingRelation(
+          dataSourceV1, sourceName, output, sourceIdentifyingName) =>
         toExecutionRelationMap.getOrElseUpdate(streamingRelation, {
           // Materialize source to avoid creating it in every batch
-          val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
+          val metadataPath = StreamingUtils.getMetadataPath(
+            sourceIdentifyingName, nextSourceId, resolvedCheckpointRoot)
           val source = dataSourceV1.createSource(metadataPath)
-          nextSourceId += 1
           logInfo(log"Using Source [${MDC(LogKeys.STREAMING_SOURCE, source)}] " +
             log"from DataSourceV1 named '${MDC(LogKeys.STREAMING_DATA_SOURCE_NAME, sourceName)}' " +
             log"[${MDC(LogKeys.STREAMING_DATA_SOURCE_DESCRIPTION, dataSourceV1)}]")
-          StreamingExecutionRelation(source, output, dataSourceV1.catalogTable)(sparkSession)
+          StreamingExecutionRelation(
+            source, output, dataSourceV1.catalogTable, sourceIdentifyingName)(sparkSession)
         })
 
       case s @ StreamingRelationV2(src, srcName, table: SupportsRead, options, output,
-        catalog, identifier, v1) =>
+        catalog, identifier, v1, sourceIdentifyingName) =>
         val dsStr = if (src.nonEmpty) s"[${src.get}]" else ""
         val v2Disabled = disabledSources.contains(src.getOrElse(None).getClass.getCanonicalName)
         if (!v2Disabled && table.supports(TableCapability.MICRO_BATCH_READ)) {
           v2ToRelationMap.getOrElseUpdate(s, {
             // Materialize source to avoid creating it in every batch
-            val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
-            nextSourceId += 1
+            val metadataPath = StreamingUtils.getMetadataPath(
+              sourceIdentifyingName, nextSourceId, resolvedCheckpointRoot)
             logInfo(log"Reading table [${MDC(LogKeys.STREAMING_TABLE, table)}] " +
               log"from DataSourceV2 named '${MDC(LogKeys.STREAMING_DATA_SOURCE_NAME, srcName)}' " +
               log"${MDC(LogKeys.STREAMING_DATA_SOURCE_DESCRIPTION, dsStr)}")
             // TODO: operator pushdown.
-            val scan = table.newScanBuilder(options).build()
+            // Passes the full output schema (not a pruned subset) so that connectors
+            // implementing SupportsMetadataColumns can include metadata columns in readSchema().
+            val scanBuilder = table.newScanBuilder(options)
+            scanBuilder match {
+              case r: SupportsPushDownRequiredColumns =>
+                r.pruneColumns(output.toStructType)
+              case _ =>
+            }
+            val scan = scanBuilder.build()
             val stream = scan.toMicroBatchStream(metadataPath)
             val relation = StreamingDataSourceV2Relation(
-              table, output, catalog, identifier, options, metadataPath)
+                table,
+                output,
+                catalog,
+                identifier,
+                options,
+                metadataPath,
+                trigger match {
+                  case RealTimeTrigger(duration) => Some(duration)
+                  case _ => None
+                },
+                sourceIdentifyingName
+              )
             StreamingDataSourceV2ScanRelation(relation, scan, output, stream)
           })
         } else if (v1.isEmpty) {
@@ -206,24 +316,62 @@ class MicroBatchExecution(
         } else {
           v2ToExecutionRelationMap.getOrElseUpdate(s, {
             // Materialize source to avoid creating it in every batch
-            val metadataPath = s"$resolvedCheckpointRoot/sources/$nextSourceId"
+            val metadataPath = StreamingUtils.getMetadataPath(
+              sourceIdentifyingName, nextSourceId, resolvedCheckpointRoot)
             val source =
               v1.get.asInstanceOf[StreamingRelation].dataSource.createSource(metadataPath)
-            nextSourceId += 1
             logInfo(log"Using Source [${MDC(LogKeys.STREAMING_SOURCE, source)}] from " +
               log"DataSourceV2 named '${MDC(LogKeys.STREAMING_DATA_SOURCE_NAME, srcName)}' " +
               log"${MDC(LogKeys.STREAMING_DATA_SOURCE_DESCRIPTION, dsStr)}")
             // We don't have a catalog table but may have a table identifier. Given this is about
             // v1 fallback path, we just give up and set the catalog table as None.
-            StreamingExecutionRelation(source, output, None)(sparkSession)
+            StreamingExecutionRelation(source, output, None, sourceIdentifyingName)(sparkSession)
           })
         }
     }
-    sources = _logicalPlan.collect {
+
+    // Extract sources and their sourceIdentifyingName for sourceIdMap mapping
+    val sourcesWithNames = _logicalPlan.collect {
       // v1 source
-      case s: StreamingExecutionRelation => s.source
+      case s: StreamingExecutionRelation => (s.source, s.sourceIdentifyingName)
       // v2 source
-      case r: StreamingDataSourceV2ScanRelation => r.stream
+      case r: StreamingDataSourceV2ScanRelation => (r.stream, r.relation.sourceIdentifyingName)
+    }
+    sources = sourcesWithNames.map(_._1)
+
+    if (enforceNamed) {
+      // When enforcement is enabled, all sources should be named after validation in analysis.
+      // This assertion ensures that the validation in NameStreamingSources worked correctly.
+      assert(sourcesWithNames.forall(s => s._2 != Unassigned),
+        "All sources should be named at this point - validation should have happened in analysis")
+
+      // Create source ID mapping using names (for OffsetMap format)
+      sourceIdMap = sourcesWithNames.map { case (source, sourceIdentifyingName) =>
+        sourceIdentifyingName.nameOpt match {
+          case Some(name) => name -> source
+          case None =>
+            throw new IllegalStateException(
+              "Unassigned sources should not exist when enforcement is enabled")
+        }
+      }.toMap
+    } else {
+      // When enforcement is disabled, use positional indices (backward compatibility)
+      sourceIdMap = sources.zipWithIndex.map {
+        case (source, index) => index.toString -> source
+      }.toMap
+    }
+
+    // Inform the source if it is in real time mode
+    if (trigger.isInstanceOf[RealTimeTrigger]) {
+      sources.foreach{
+        case s: SupportsRealTimeMode =>
+          s.prepareForRealTimeMode()
+        case s =>
+          throw new SparkIllegalArgumentException(
+            errorClass = "STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED",
+            messageParameters = Map("className" -> s.getClass.getName)
+          )
+      }
     }
 
     // Initializing TriggerExecutor relies on `sources`, hence calling this after initializing
@@ -260,22 +408,48 @@ class MicroBatchExecution(
           case s => s -> ReadLimit.allAvailable()
         }.toMap
     }
+    if (trigger.isInstanceOf[RealTimeTrigger] && uniqueSources.size != sources.size) {
+      throw new SparkIllegalStateException(
+        errorClass = s"STREAMING_REAL_TIME_MODE.IDENTICAL_SOURCES_IN_UNION_NOT_SUPPORTED",
+        messageParameters = Map("sources" -> sources.mkString(", "))
+      )
+    }
 
-    // TODO (SPARK-27484): we should add the writing node before the plan is analyzed.
     sink match {
       case s: SupportsWrite =>
-        val relationOpt = plan.catalogAndIdent.map {
-          case (catalog, ident) => DataSourceV2Relation.create(s, Some(catalog), Some(ident))
+        val relation = plan.catalogAndIdent match {
+          // For transactional catalog sinks, capture the baseline table metadata in a
+          // V2TableReference so that each micro-batch re-resolves the table through the
+          // transaction-aware catalog and fails if the table has been replaced or schema changed.
+          case Some((catalog: TransactionalCatalogPlugin, ident)) =>
+            // Re-resolve through the streaming session's catalog manager so the reference
+            // captures the streaming-session-specific catalog instance. TransactionalWrite
+            // detection and transaction begin must happen in the streaming session context.
+            val catalogManager = sparkSessionForStream.sessionState.catalogManager
+            val streamingCatalog = catalogManager.catalog(catalog.name)
+            val v2Relation = DataSourceV2Relation.create(s, Some(streamingCatalog), Some(ident))
+            V2TableReference.createForWriteTarget(v2Relation)
+          case Some((catalog, ident)) =>
+            DataSourceV2Relation.create(s, Some(catalog), Some(ident))
+          case None => DataSourceV2Relation.create(s, None, None)
         }
         WriteToMicroBatchDataSource(
-          relationOpt,
-          table = s,
+          relation,
           query = _logicalPlan,
           queryId = id.toString,
           extraOptions,
           outputMode)
 
       case s: Sink =>
+        // SinkV1 is not compatible with Real-Time Mode due to API limitations.
+        // SinkV1 does not support writing outputs row by row.
+        if (trigger.isInstanceOf[RealTimeTrigger]) {
+          throw new SparkIllegalArgumentException(
+            errorClass = "STREAMING_REAL_TIME_MODE.SINK_NOT_SUPPORTED",
+            messageParameters = Map("className" -> s.getClass.getName)
+          )
+        }
+
         WriteToMicroBatchDataSourceV1(
           plan.catalogTable,
           sink = s,
@@ -330,20 +504,160 @@ class MicroBatchExecution(
 
   private def initializeExecution(
       sparkSessionForStream: SparkSession): MicroBatchExecutionContext = {
+    var latestStartedBatch = initialLatestOffsetSeq
+    val latestCommittedBatch = commitLog.getLatest()
+
+    val lastCommittedBatchId = latestCommittedBatch match {
+      case Some((batchId, _)) => batchId
+      case _ => -1L
+    }
+
+    // Fail the query if the latest started batch is an uncommitted repartition batch
+    if (sparkSessionForStream.sessionState.conf.streamingCheckUnfinishedRepartitionOnRestart) {
+      checkUnfinishedRepartitionBatch(
+        latestStartedBatch.map(_._1), lastCommittedBatchId, offsetLog)
+    }
+
+    // For a query running in Real-time Mode that fails after
+    // writing to offset log but before writing to commit log, we delete the extra
+    // entries in offsetLog to sync up. Note that this also means async checkpoint rollback handling
+    // is not compatible with Real-time Mode at this stage.
+    if (trigger.isInstanceOf[RealTimeTrigger]) {
+      val lastOffsetLogBatchId = latestStartedBatch.map(_._1).getOrElse(-1L)
+      if (lastOffsetLogBatchId > lastCommittedBatchId) {
+        logWarning(log"Deleting extra entries in offset log to sync up with commit log. " +
+          log"Last committed batch id = ${MDC(BATCH_ID, lastCommittedBatchId)}, " +
+          log"last offset log batch id = ${MDC(CURRENT_BATCH_ID, lastOffsetLogBatchId)}")
+        offsetLog.purgeAfter(lastCommittedBatchId)
+        latestStartedBatch = offsetLog.getLatest()
+      }
+    }
+
     AcceptsLatestSeenOffsetHandler.setLatestSeenOffsetOnSources(
-      offsetLog.getLatest().map(_._2), sources)
+      offsetLog.getLatest().map(_._2),
+      sources,
+      sourceIdMap
+    )
+
+    // For existing queries, the offset log format version is read from the last written offset log
+    // entry; for new queries, it is resolved from the session config (honoring any feature-driven
+    // minimums). Restarting with an incompatible feature set on an existing checkpoint is rejected
+    // inside the manager.
+    if (latestStartedBatch.isEmpty) {
+      // If no offset log entries are found, assert that the query does not have any committed
+      // batches to be extra safe.
+      assert(lastCommittedBatchId == -1L)
+    }
+    val offsetLogFormatVersion = CheckpointVersionManager.resolveOffsetLogVersion(
+      sparkSessionForStream, latestStartedBatch)
+
+    // Persist the resolved offset log format version on the streaming session.
+    CheckpointVersionManager.setFormatVersion(
+      sparkSessionForStream, OffsetLogType, offsetLogFormatVersion)
+
+    // Resolve the commit log format version the same way: an existing checkpoint keeps the version
+    // it was created with, and only a fresh one takes the version from the session config. Persist
+    // the implied state store checkpoint format so it agrees with what is actually being written.
+    val commitLogFormatVersion = CheckpointVersionManager.resolveCommitLogVersion(
+      sparkSessionForStream, latestCommittedBatch)
+    CheckpointVersionManager.setFormatVersion(
+      sparkSessionForStream,
+      CommitLogType,
+      commitLogFormatVersion,
+      latestCommittedBatch.map(_._2))
+    val stateStoreCheckpointFormatVersion =
+      sparkSessionForStream.sessionState.conf.stateStoreCheckpointFormatVersion
+
+    // Real-Time Mode requires state store checkpoint format v2. It writes the offset log at
+    // batch end
+    // (markMicroBatchStart is a no-op for it), so a mid-batch failure can leave durable state at a
+    // version that was never logged; the re-execution then rewrites that same state version. With
+    // checkpoint format v1 the rewritten files reuse the same names as the orphaned ones, so a load
+    // can pick up a stale file (see the checksum hazard documented on
+    // StateStoreConf.skipChecksumOnFileMissingChecksum). Format v2 avoids this because each batch
+    // run generates unique state store checkpoint ids. Commit log v2 persists those ids; a v3
+    // commit may or may not contain them, so the resolved state store format is the authoritative
+    // check. Reject v1 with an escape hatch.
+    if (trigger.isInstanceOf[RealTimeTrigger] && stateStoreCheckpointFormatVersion < 2) {
+      if (!sparkSessionForStream.sessionState.conf
+          .getConf(SQLConf.STREAMING_REAL_TIME_MODE_DANGEROUSLY_ALLOW_CHECKPOINT_V1)) {
+        throw new SparkIllegalArgumentException(
+          errorClass = "STREAMING_REAL_TIME_MODE.CHECKPOINT_FORMAT_V1_NOT_SUPPORTED",
+          messageParameters = Map(
+            "config" -> SQLConf.STREAMING_REAL_TIME_MODE_DANGEROUSLY_ALLOW_CHECKPOINT_V1.key))
+      }
+      logWarning(log"Starting a Real-Time Mode query on state store checkpoint format version " +
+        log"${MDC(LogKeys.FILE_VERSION, stateStoreCheckpointFormatVersion)} because " +
+        log"${MDC(LogKeys.CONFIG, SQLConf.STREAMING_REAL_TIME_MODE_DANGEROUSLY_ALLOW_CHECKPOINT_V1
+          .key)} is set. A failed batch may lose data on rerun.")
+    }
 
     val execCtx = new MicroBatchExecutionContext(id, runId, name, triggerClock, sources, sink,
-      progressReporter, -1, sparkSession, None)
+      progressReporter, -1, sparkSession,
+      offsetLogFormatVersionOpt = Some(offsetLogFormatVersion),
+      commitLogFormatVersionOpt = Some(commitLogFormatVersion),
+      previousContext = None)
 
-    execCtx.offsetSeqMetadata =
-      OffsetSeqMetadata(batchWatermarkMs = 0, batchTimestampMs = 0, sparkSessionForStream.conf)
+    execCtx.offsetSeqMetadata = offsetLogFormatVersion match {
+      case OffsetSeqLog.VERSION_2 =>
+        OffsetSeqMetadataV2(batchWatermarkMs = 0, batchTimestampMs = 0, sparkSessionForStream.conf)
+      case OffsetSeqLog.VERSION_1 =>
+        OffsetSeqMetadata(batchWatermarkMs = 0, batchTimestampMs = 0, sparkSessionForStream.conf)
+      case v =>
+        throw QueryExecutionErrors.logVersionGreaterThanSupported(v, OffsetSeqLog.MAX_VERSION)
+    }
     setLatestExecutionContext(execCtx)
 
     populateStartOffsets(execCtx, sparkSessionForStream)
+
+    // SPARK-53941: This code path is executed for the first batch, regardless of whether it's a
+    // fresh new run or restart.
+    disableAQESupportInStatelessIfUnappropriated(sparkSessionForStream)
+
     logInfo(log"Stream started from ${MDC(LogKeys.STREAMING_OFFSETS_START, execCtx.startOffsets)}")
     execCtx
   }
+
+  protected def checkUnfinishedRepartitionBatch(
+      latestStartedBatchId: Option[Long],
+      lastCommittedBatchId: Long,
+      offsetLog: OffsetSeqLog): Unit = {
+    if (latestStartedBatchId.isDefined && lastCommittedBatchId >= 0 &&
+      latestStartedBatchId.get > lastCommittedBatchId &&
+      OfflineStateRepartitionUtils.isRepartitionBatch(latestStartedBatchId.get, offsetLog)) {
+      throw QueryExecutionErrors
+        .unfinishedRepartitionDetectedError(latestStartedBatchId.get, lastCommittedBatchId)
+    }
+  }
+
+  private def disableAQESupportInStatelessIfUnappropriated(
+      sparkSessionToRunBatches: SparkSession): Unit = {
+    def containsStatefulOperator(p: LogicalPlan): Boolean = {
+      p.exists {
+        case node: Aggregate if node.isStreaming => true
+        case node: Deduplicate if node.isStreaming => true
+        case node: DeduplicateWithinWatermark if node.isStreaming => true
+        case node: Distinct if node.isStreaming => true
+        case node: Join if node.left.isStreaming && node.right.isStreaming => true
+        case node: FlatMapGroupsWithState if node.isStreaming => true
+        case node: FlatMapGroupsInPandasWithState if node.isStreaming => true
+        case node: TransformWithState if node.isStreaming => true
+        case node: TransformWithStateInPySpark if node.isStreaming => true
+        case node: GlobalLimit if node.isStreaming => true
+        case _ => false
+      }
+    }
+
+    if (trigger.isInstanceOf[RealTimeTrigger]) {
+      logWarning(log"Disabling AQE since AQE is not supported for Real-time Mode.")
+      sparkSessionToRunBatches.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
+    } else if (containsStatefulOperator(analyzedPlan)) {
+      // SPARK-53941: We disable AQE for stateful workloads as of now.
+      logWarning(log"Disabling AQE since AQE is not supported in stateful workloads.")
+      sparkSessionToRunBatches.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
+    }
+  }
+
   /**
    * Repeatedly attempts to run batches as data arrives.
    */
@@ -393,7 +707,12 @@ class MicroBatchExecution(
         // Record the trigger offset range for progress reporting *before* processing the batch
         execCtx.recordTriggerOffsets(
           from = execCtx.startOffsets,
-          to = execCtx.endOffsets,
+          to = if (trigger.isInstanceOf[RealTimeTrigger]) {
+            // We don't know endOffsets in real time mode here.
+            new StreamProgress(Map())
+          } else {
+            execCtx.endOffsets
+          },
           latest = execCtx.latestOffsets)
 
         // Remember whether the current batch has data or not. This will be required later
@@ -445,7 +764,7 @@ class MicroBatchExecution(
    * @param latestBatchId the batch id of the current micro batch
    * @return A option that contains the offset of the previously written batch
    */
-  def validateOffsetLogAndGetPrevOffset(latestBatchId: Long): Option[OffsetSeq] = {
+  def validateOffsetLogAndGetPrevOffset(latestBatchId: Long): Option[OffsetSeqBase] = {
     if (latestBatchId != 0) {
       Some(offsetLog.get(latestBatchId - 1).getOrElse {
         logError(log"The offset log for batch ${MDC(LogKeys.BATCH_ID, latestBatchId - 1)} " +
@@ -494,16 +813,16 @@ class MicroBatchExecution(
          * in the offset log */
         execCtx.batchId = latestBatchId
         execCtx.isCurrentBatchConstructed = true
-        execCtx.endOffsets = nextOffsets.toStreamProgress(sources)
+        execCtx.endOffsets = nextOffsets.toStreamProgress(sources, sourceIdMap)
 
         // validate the integrity of offset log and get the previous offset from the offset log
         val secondLatestOffsets = validateOffsetLogAndGetPrevOffset(latestBatchId)
         secondLatestOffsets.foreach { offset =>
-          execCtx.startOffsets = offset.toStreamProgress(sources)
+          execCtx.startOffsets = offset.toStreamProgress(sources, sourceIdMap)
         }
 
         // update offset metadata
-        nextOffsets.metadata.foreach { metadata =>
+        nextOffsets.metadataOpt.foreach { metadata =>
           OffsetSeqMetadata.setSessionConf(metadata, sparkSessionToRunBatches.sessionState.conf)
           execCtx.offsetSeqMetadata = OffsetSeqMetadata(
             metadata.batchWatermarkMs, metadata.batchTimestampMs, sparkSessionToRunBatches.conf)
@@ -518,6 +837,11 @@ class MicroBatchExecution(
           case Some((latestCommittedBatchId, commitMetadata)) =>
             commitMetadata.stateUniqueIds.foreach {
               stateUniqueIds => currentStateStoreCkptId ++= stateUniqueIds
+            }
+            commitMetadata match {
+              case v3: CommitMetadataV3 =>
+                sinkMetadataMap ++= v3.sinkMetadataMap
+              case _ =>
             }
             if (latestBatchId == latestCommittedBatchId) {
               /* The last batch was successfully committed, so we can safely process a
@@ -562,6 +886,11 @@ class MicroBatchExecution(
           log"offsets ${MDC(LogKeys.STREAMING_OFFSETS_START, execCtx.startOffsets)} and " +
           log"available offsets ${MDC(LogKeys.STREAMING_OFFSETS_END, execCtx.endOffsets)}")
       case None => // We are starting this stream for the first time.
+        val shouldVerifyNewCheckpointDirectory =
+          sparkSession.conf.get(SQLConf.STREAMING_VERIFY_CHECKPOINT_DIRECTORY_EMPTY_ON_START)
+        if (shouldVerifyNewCheckpointDirectory) {
+          verifyNewCheckpointDirectory()
+        }
         logInfo(s"Starting new streaming query.")
         execCtx.batchId = 0
         watermarkTracker = WatermarkTracker(sparkSessionToRunBatches.conf, logicalPlan)
@@ -569,15 +898,48 @@ class MicroBatchExecution(
   }
 
   /**
+   * Verify that the checkpoint directory is in a good state to start a new
+   * streaming query. This checks that the offsets, state, commits directories are
+   * either non-existent or empty.
+   *
+   * If this check fails, an exception is thrown.
+   */
+  private def verifyNewCheckpointDirectory(): Unit = {
+    val fileManager = CheckpointFileManager.create(new Path(resolvedCheckpointRoot),
+      sparkSession.sessionState.newHadoopConf())
+    var dirNamesThatShouldNotHaveFiles = Array[String](DIR_NAME_OFFSETS, DIR_NAME_COMMITS)
+
+    // Since real-time mode writes the offset log after the batch is committed, the state directory
+    // may contain files so we want to allow the streaming query to retry.
+    if (!trigger.isInstanceOf[RealTimeTrigger]) {
+      dirNamesThatShouldNotHaveFiles :+= DIR_NAME_STATE
+    }
+
+    dirNamesThatShouldNotHaveFiles.foreach { dirName =>
+      val path = new Path(resolvedCheckpointRoot, dirName)
+
+      if (fileManager.exists(path) && !fileManager.list(path).isEmpty) {
+        val loc = path.toString
+        throw StateStoreErrors.streamingStateCheckpointLocationNotEmpty(loc)
+      }
+    }
+  }
+
+  /**
    * Returns true if there is any new data available to be processed.
    */
   private def isNewDataAvailable(execCtx: MicroBatchExecutionContext): Boolean = {
-    execCtx.endOffsets.exists {
-      case (source, available) =>
-        execCtx.startOffsets
-          .get(source)
-          .map(committed => committed != available)
-          .getOrElse(true)
+    // For real-time mode, we always assume there is new data and run the batch.
+    if (trigger.isInstanceOf[RealTimeTrigger]) {
+      true
+    } else {
+      execCtx.endOffsets.exists {
+        case (source, available) =>
+          execCtx.startOffsets
+            .get(source)
+            .map(committed => committed != available)
+            .getOrElse(true)
+      }
     }
   }
 
@@ -657,9 +1019,22 @@ class MicroBatchExecution(
       .map(p => p._1 -> p._2.get).toMap
 
     // Update the query metadata
-    execCtx.offsetSeqMetadata = execCtx.offsetSeqMetadata.copy(
-      batchWatermarkMs = watermarkTracker.currentWatermark,
-      batchTimestampMs = triggerClock.getTimeMillis())
+    execCtx.offsetSeqMetadata = execCtx.offsetLogFormatVersionOpt.get match {
+      case OffsetSeqLog.VERSION_2 =>
+        OffsetSeqMetadataV2(
+          batchWatermarkMs = watermarkTracker.currentWatermark,
+          batchTimestampMs = triggerClock.getTimeMillis(),
+          conf = execCtx.offsetSeqMetadata.conf
+        )
+      case OffsetSeqLog.VERSION_1 =>
+        OffsetSeqMetadata(
+          batchWatermarkMs = watermarkTracker.currentWatermark,
+          batchTimestampMs = triggerClock.getTimeMillis(),
+          conf = execCtx.offsetSeqMetadata.conf
+        )
+      case v =>
+        throw QueryExecutionErrors.logVersionGreaterThanSupported(v, OffsetSeqLog.MAX_VERSION)
+    }
 
     // Check whether next batch should be constructed
     val lastExecutionRequiresAnotherBatch = noDataBatchesEnabled &&
@@ -706,8 +1081,8 @@ class MicroBatchExecution(
     shouldConstructNextBatch
   }
 
-  protected def commitSources(offsetSeq: OffsetSeq): Unit = {
-    offsetSeq.toStreamProgress(sources).foreach {
+  protected def commitSources(offsetSeq: OffsetSeqBase): Unit = {
+    offsetSeq.toStreamProgress(sources, sourceIdMap).foreach {
       case (src: Source, off: Offset) => src.commit(off)
       case (stream: MicroBatchStream, off) =>
         stream.commit(stream.deserializeOffset(off.json))
@@ -739,6 +1114,19 @@ class MicroBatchExecution(
           logDebug(s"Retrieving data from $source: $current -> $available")
           Some(source -> batch.logicalPlan)
 
+        case (stream: MicroBatchStream, _) if trigger.isInstanceOf[RealTimeTrigger] =>
+          if (!stream.isInstanceOf[SupportsRealTimeMode]) {
+            throw new SparkIllegalArgumentException(
+              errorClass = "STREAMING_REAL_TIME_MODE.INPUT_STREAM_NOT_SUPPORTED",
+              messageParameters = Map("className" -> stream.getClass.getName)
+            )
+          }
+          val current = execCtx.startOffsets.get(stream).map {
+            off => stream.deserializeOffset(off.json)
+          }
+          val startOffset = current.getOrElse(stream.initialOffset)
+          Some(stream -> OffsetHolder(startOffset, None))
+
         case (stream: MicroBatchStream, available)
           if execCtx.startOffsets.get(stream).map(_ != available).getOrElse(true) =>
           val current = execCtx.startOffsets.get(stream).map {
@@ -754,7 +1142,7 @@ class MicroBatchExecution(
           // To be compatible with the v1 source, the `newData` is represented as a logical plan,
           // while the `newData` of v2 source is just the start and end offsets. Here we return a
           // fake logical plan to carry the offsets.
-          Some(stream -> OffsetHolder(startOffset, endOffset))
+          Some(stream -> OffsetHolder(startOffset, Some(endOffset)))
 
         case _ => None
       }
@@ -763,13 +1151,23 @@ class MicroBatchExecution(
     // Replace sources in the logical plan with data that has arrived since the last batch.
     val newBatchesPlan = logicalPlan transform {
       // For v1 sources.
-      case StreamingExecutionRelation(source, output, catalogTable) =>
+      case StreamingExecutionRelation(source, output, catalogTable, _) =>
         mutableNewData.get(source).map { dataPlan =>
           val hasFileMetadata = output.exists {
             case FileSourceMetadataAttribute(_) => true
             case _ => false
           }
           val finalDataPlan = dataPlan transformUp {
+            // SPARK-53625: Propagate metadata columns through Projects
+            case p: Project if hasFileMetadata =>
+              // Check if there is any metadata fields not in the output list
+              val newMetadata = p.metadataOutput.filterNot(p.outputSet.contains)
+              if (newMetadata.nonEmpty) {
+                // If so, add it to projection
+                p.copy(projectList = p.projectList ++ newMetadata)
+              } else {
+                p
+              }
             case l: LogicalRelation =>
               var newRelation = l
               if (hasFileMetadata) {
@@ -820,7 +1218,7 @@ class MicroBatchExecution(
       case r: StreamingDataSourceV2ScanRelation =>
         mutableNewData.get(r.stream).map {
           case OffsetHolder(start, end) =>
-            r.copy(startOffset = Some(start), endOffset = Some(end))
+            r.copy(startOffset = Some(start), endOffset = end)
         }.getOrElse {
           // Don't track the source node which is known to produce zero rows.
           LocalRelation(r.output, isStreaming = true)
@@ -836,7 +1234,17 @@ class MicroBatchExecution(
         // dummy string to prevent UnresolvedException and to prevent to be used in the future.
         CurrentBatchTimestamp(execCtx.offsetSeqMetadata.batchTimestampMs,
           ct.dataType, Some("Dummy TimeZoneId"))
+      case ct: CurrentTimestampNanos =>
+        // Like CurrentTimestamp, the nanosecond current_timestamp(p) is not
+        // TimeZoneAwareExpression, so supply the dummy time zone. The batch timestamp is
+        // millisecond resolution, so the folded TIMESTAMP_LTZ(p) literal has zero
+        // nanos-within-micro.
+        CurrentBatchTimestamp(execCtx.offsetSeqMetadata.batchTimestampMs,
+          ct.dataType, Some("Dummy TimeZoneId"))
       case lt: LocalTimestamp =>
+        CurrentBatchTimestamp(execCtx.offsetSeqMetadata.batchTimestampMs,
+          lt.dataType, lt.timeZoneId)
+      case lt: LocalTimestampNanos =>
         CurrentBatchTimestamp(execCtx.offsetSeqMetadata.batchTimestampMs,
           lt.dataType, lt.timeZoneId)
       case cd: CurrentDate =>
@@ -874,13 +1282,27 @@ class MicroBatchExecution(
         execCtx.previousContext.isEmpty,
         currentStateStoreCkptId,
         stateSchemaMetadatas,
-        isTerminatingTrigger = trigger.isInstanceOf[AvailableNowTrigger.type])
+        isTerminatingTrigger = trigger.isInstanceOf[AvailableNowTrigger.type],
+        isRealTimeMode = trigger.isInstanceOf[RealTimeTrigger])
       execCtx.executionPlan.executedPlan // Force the lazy generation of execution plan
     }
     // Set up StateStore commit tracking before execution begins
     setupStateStoreCommitTracking(execCtx)
 
     markMicroBatchExecutionStart(execCtx)
+    if (!isActive) {
+      // Workaround for the case the interrupt status is unexpectedly cleared. See SPARK-57963 for
+      // more details.
+      Thread.currentThread.interrupt
+    }
+
+    if (trigger.isInstanceOf[RealTimeTrigger]) {
+      RealTimeModeAllowlist.checkAllowedPhysicalOperator(
+        execCtx.executionPlan.executedPlan,
+        sparkSession.sessionState.conf.getConf(
+          SQLConf.STREAMING_REAL_TIME_MODE_ALLOWLIST_CHECK)
+      )
+    }
 
     if (execCtx.previousContext.isEmpty) {
       purgeStatefulMetadataAsync(execCtx.executionPlan.executedPlan)
@@ -894,6 +1316,12 @@ class MicroBatchExecution(
       SQLExecution.withNewExecutionId(execCtx.executionPlan) {
         sink match {
           case s: Sink =>
+            if (trigger.isInstanceOf[RealTimeTrigger]) {
+              throw new SparkIllegalStateException(
+                errorClass = "STREAMING_REAL_TIME_MODE.SINK_NOT_SUPPORTED",
+                messageParameters = Map("className" -> s.getClass.getName)
+              )
+            }
             s.addBatch(execCtx.batchId, nextBatch)
             // DSv2 write node has a mechanism to invalidate DSv2 relation, but there is no
             // corresponding one for DSv1. Given we have an information of catalog table for sink,
@@ -925,13 +1353,23 @@ class MicroBatchExecution(
    * checkpointing to offset log and any microbatch startup tasks.
    */
   protected def markMicroBatchStart(execCtx: MicroBatchExecutionContext): Unit = {
-    if (!offsetLog.add(execCtx.batchId,
-      execCtx.endOffsets.toOffsetSeq(sources, execCtx.offsetSeqMetadata))) {
-      throw QueryExecutionErrors.concurrentStreamLogUpdate(execCtx.batchId)
-    }
 
-    logInfo(log"Committed offsets for batch ${MDC(LogKeys.BATCH_ID, execCtx.batchId)}. " +
-      log"Metadata ${MDC(LogKeys.OFFSET_SEQUENCE_METADATA, execCtx.offsetSeqMetadata.toString)}")
+    if (!trigger.isInstanceOf[RealTimeTrigger]) {
+      if (!offsetLog.add(
+          execCtx.batchId,
+          execCtx.endOffsets.toOffsets(sources, sourceIdMap, execCtx.offsetSeqMetadata)
+        )) {
+        throw QueryExecutionErrors.concurrentStreamLogUpdate(execCtx.batchId)
+      }
+
+      logInfo(
+        log"Committed offsets for batch ${MDC(LogKeys.BATCH_ID, execCtx.batchId)}. " +
+        log"Metadata ${MDC(LogKeys.OFFSET_SEQUENCE_METADATA, execCtx.offsetSeqMetadata.toString)}"
+      )
+    } else {
+      logInfo(log"Delay offset logging for batch ${MDC(BATCH_ID, execCtx.batchId)} " +
+        log"in real time mode.")
+    }
   }
 
   /**
@@ -948,7 +1386,21 @@ class MicroBatchExecution(
       execCtx: MicroBatchExecutionContext,
       opId: Long,
       checkpointInfo: Array[StatefulOpStateStoreCheckpointInfo]): Unit = {
-    // TODO validate baseStateStoreCkptId
+    // Validate that each partition's baseStateStoreCkptId matches what the driver sent
+    currentStateStoreCkptId.get(opId).foreach { previousCkptIds =>
+      checkpointInfo.foreach { info =>
+        val expectedBaseId = previousCkptIds(info.partitionId)
+        val actualBaseId = info.baseStateStoreCkptId
+        if (!actualBaseId.exists(_.sameElements(expectedBaseId))) {
+          throw StateStoreErrors.stateStoreBaseCheckpointIdMismatch(
+            info.batchVersion,
+            info.partitionId,
+            opId,
+            expectedBaseId.mkString("[", ", ", "]"),
+            actualBaseId.map(_.mkString("[", ", ", "]")).getOrElse("None"))
+        }
+      }
+    }
     checkpointInfo.map(_.batchVersion).foreach { v =>
       assert(
         execCtx.batchId == -1 || v == execCtx.batchId + 1,
@@ -1037,6 +1489,32 @@ class MicroBatchExecution(
       sparkSessionForStream.sessionState.conf)) {
       updateStateStoreCkptId(execCtx, latestExecPlan)
     }
+
+    // In real-time mode, we delay the offset logging until the end of the batch.
+    // We first gather the offsets processed up to from all RealTimeStreamScanExec,
+    // i.e. tasks that execute a source partition.  We merge the offsets and
+    // write them to the offset log
+    if (trigger.isInstanceOf[RealTimeTrigger]) {
+      populateBatchOffsetsForRTM(execCtx)
+      execCtx.reportTimeTaken("walCommit") {
+        if (!offsetLog.add(
+          execCtx.batchId,
+          execCtx.endOffsets.toOffsets(sources, sourceIdMap, execCtx.offsetSeqMetadata)
+          )) {
+          throw QueryExecutionErrors.concurrentStreamLogUpdate(execCtx.batchId)
+        }
+      }
+      logInfo(
+        log"Committed offsets for batch ${MDC(LogKeys.BATCH_ID, execCtx.batchId)}. Metadata " +
+        log"${MDC(LogKeys.OFFSET_SEQUENCE_METADATA, execCtx.offsetSeqMetadata)}"
+      )
+
+      // State schema validation and broadcast creation still happen during planning, but RTM
+      // defers operator metadata until its end offset is durable. This prevents a failed batch
+      // from leaving metadata that has no corresponding offset log entry.
+      execCtx.executionPlan.writeRecordedStateMetadata()
+    }
+
     execCtx.reportTimeTaken("commitOffsets") {
       val stateStoreCkptId = if (StatefulOperatorStateInfo.enableStateStoreCheckpointIds(
         sparkSessionForStream.sessionState.conf)) {
@@ -1044,12 +1522,111 @@ class MicroBatchExecution(
       } else {
         None
       }
-      if (!commitLog.add(execCtx.batchId,
-        CommitMetadata(watermarkTracker.currentWatermark, stateStoreCkptId))) {
+      val metadata = if (commitLogV3Enabled) {
+        val sinkApiVersion = sink match {
+          case _: SupportsWrite => "DSv2"
+          case _ => "DSv1"
+        }
+        val currentSinkInfo = SinkMetadataInfo(
+          sinkName = sinkName,
+          commitOffset = OffsetSeqLog.SERIALIZED_VOID_OFFSET,
+          providerName = sink.getClass.getName,
+          apiVersion = sinkApiVersion,
+          isActive = true)
+        // Mark every previously-seen sink as inactive, then overlay the current sink as active.
+        // The previous entry for [[sinkName]], if any, is overwritten here.
+        val deactivated = sinkMetadataMap.iterator
+          .map { case (name, info) => name -> info.copy(isActive = false) }
+          .toMap
+        val updatedSinkMap = deactivated + (sinkName -> currentSinkInfo)
+        sinkMetadataMap.clear()
+        sinkMetadataMap ++= updatedSinkMap
+        commitLog.createMetadata(
+          nextBatchWatermarkMs = watermarkTracker.currentWatermark,
+          stateUniqueIds = stateStoreCkptId,
+          sinkMetadataMap = updatedSinkMap,
+          commitLogFormatVersion = CommitLog.VERSION_3)
+      } else {
+        commitLog.createMetadata(
+          nextBatchWatermarkMs = watermarkTracker.currentWatermark,
+          stateUniqueIds = stateStoreCkptId,
+          commitLogFormatVersion = execCtx.commitLogFormatVersionOpt.getOrElse(
+            sparkSessionForStream.sessionState.conf.streamingCommitLogFormatVersion))
+      }
+      if (!commitLog.add(execCtx.batchId, metadata)) {
         throw QueryExecutionErrors.concurrentStreamLogUpdate(execCtx.batchId)
       }
     }
+    signalProcessAllAvailableIfRealTimeMode(execCtx)
     committedOffsets ++= execCtx.endOffsets
+  }
+
+  /**
+   * When running in RealTimeTrigger mode, this method extracts the end offsets after the current
+   * batch has finished execution and writes them to the execution context. In real-time mode the
+   * end offsets are not known up front; they are gathered from all [[RealTimeStreamScanExec]]
+   * nodes (i.e. tasks that execute a source partition), merged, and recorded on the context so
+   * they can subsequently be written to the offset log.
+   */
+  protected def populateBatchOffsetsForRTM(execCtx: MicroBatchExecutionContext): Unit = {
+    assert(trigger.isInstanceOf[RealTimeTrigger])
+
+    val execs = StreamingQueryPlanTraverseHelper
+      .collectFromUnfoldedPlan(lastExecution.executedPlan) {
+      case e: RealTimeStreamScanExec => e
+    }
+
+    val endOffsetMap = MutableMap[SparkDataStream, OffsetV2]()
+    execs.foreach { e =>
+      val lowLatencyExec = e.asInstanceOf[RealTimeStreamScanExec]
+      val accus: Seq[PartitionOffsetWithIndex] =
+        lowLatencyExec.endOffsetsAccumulator.value.asScala.toSeq
+      val sortedPartitionOffsets = accus.sortBy(_.index).map(_.partitionOffset).toArray
+      val source = e.stream
+      val endOffset = source
+        .asInstanceOf[SupportsRealTimeMode]
+        .mergeOffsets(sortedPartitionOffsets)
+      endOffsetMap += (source -> endOffset)
+    }
+
+    assert(endOffsetMap.size == execs.size, "Identical sources exist in the physical nodes" +
+      " which is not supported.")
+
+    execCtx.endOffsets ++= endOffsetMap
+    execCtx.recordEndOffsets(execCtx.endOffsets)
+    execCtx.recordTriggerOffsets(
+      from = execCtx.startOffsets,
+      to = execCtx.endOffsets,
+      latest = execCtx.latestOffsets
+    )
+  }
+
+  /**
+   * RealTime Mode deals with ProcessAllAvailable() differently. Unlike non-real-time mode, which
+   * sets [[noNewData]] in the query planning phase, real-time mode only knows a batch was empty
+   * (i.e. the end offsets did not advance past the start offsets) after the batch has finished.
+   * When that is the case, this signals the progress lock so a pending processAllAvailable() call
+   * can return.
+   */
+  protected def signalProcessAllAvailableIfRealTimeMode(
+      execCtx: MicroBatchExecutionContext): Unit = {
+    if (trigger.isInstanceOf[RealTimeTrigger]) {
+      var emptyBatch = true
+      sources.foreach { s =>
+        execCtx.startOffsets.get(s).foreach { prevOffsets =>
+          if (!prevOffsets.equals(execCtx.endOffsets.get(s).get)) {
+            emptyBatch = false
+          }
+        }
+      }
+      if (emptyBatch) {
+        // To trigger processAllAvailable() return.
+        noNewData = true
+        withProgressLocked {
+          awaitProgressLockCondition.signalAll()
+        }
+      }
+    }
   }
 
   protected def cleanUpLastExecutedMicroBatch(execCtx: MicroBatchExecutionContext): Unit = {
@@ -1079,8 +1656,14 @@ class MicroBatchExecution(
 
 object MicroBatchExecution {
   val BATCH_ID_KEY = "streaming.sql.batchId"
+
+  /**
+   * Default sink name used when sink evolution is disabled or no explicit name is provided.
+   * This maintains backward compatibility with existing streaming queries.
+   */
+  private[sql] val DEFAULT_SINK_NAME = "sink-0"
 }
 
-case class OffsetHolder(start: OffsetV2, end: OffsetV2) extends LeafNode {
+case class OffsetHolder(start: OffsetV2, end: Option[OffsetV2]) extends LeafNode {
   override def output: Seq[Attribute] = Nil
 }

@@ -19,7 +19,7 @@ package org.apache.spark.sql
 
 import scala.jdk.CollectionConverters._
 
-import org.apache.spark.annotation.Stable
+import org.apache.spark.annotation.{DeveloperApi, Stable}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{LEFT_EXPR, RIGHT_EXPR}
 import org.apache.spark.sql.catalyst.parser.DataTypeParser
@@ -30,11 +30,19 @@ import org.apache.spark.sql.internal.{ColumnNode, TableValuedFunctionArgument}
 import org.apache.spark.sql.types._
 import org.apache.spark.util.ArrayImplicits._
 
-private[spark] object Column {
+/**
+ * The companion object is public so that the `Column` type can be referenced as a value. This
+ * allows an implementation to add a `Column(expression)` factory through an extension method. All
+ * of its members are internal to Spark.
+ *
+ * @since 4.4.0
+ */
+@DeveloperApi
+object Column {
 
-  def apply(colName: String): Column = new Column(colName)
+  private[spark] def apply(colName: String): Column = new Column(colName)
 
-  def apply(node: => ColumnNode): Column = withOrigin(new Column(node))
+  private[spark] def apply(node: => ColumnNode): Column = withOrigin(new Column(node))
 
   /**
    * Invoke a function with an options map as its last argument. If there are no options, its
@@ -1423,6 +1431,22 @@ class Column(val node: ColumnNode) extends Logging with TableValuedFunctionArgum
    * @since 4.0.0
    */
   def outer(): Column = Column(internal.LazyExpression(node))
+
+  /**
+   * Concise syntax for chaining custom transformations.
+   * {{{
+   *   def addPrefix(c: Column): Column = concat(lit("prefix_"), c)
+   *
+   *   df.select($"name".transform(addPrefix))
+   *
+   *   // Chaining multiple transformations
+   *   df.select($"name".transform(addPrefix).transform(upper))
+   * }}}
+   *
+   * @group expr_ops
+   * @since 4.1.0
+   */
+  def transform(f: Column => Column): Column = f(this)
 
 }
 

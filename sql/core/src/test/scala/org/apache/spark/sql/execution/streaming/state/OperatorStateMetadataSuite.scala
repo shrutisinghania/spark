@@ -21,7 +21,7 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.SparkRuntimeException
 import org.apache.spark.sql.{Column, Row}
-import org.apache.spark.sql.execution.datasources.v2.state.{StateDataSourceUnspecifiedRequiredOption, StateSourceOptions}
+import org.apache.spark.sql.execution.datasources.v2.state.{StateDataSourceUnspecifiedRequiredOption, StateSourceOptions, WriteProtectedCheckpointTestMixin}
 import org.apache.spark.sql.execution.streaming.checkpointing.{CheckpointFileManager, OffsetSeq, OffsetSeqLog}
 import org.apache.spark.sql.execution.streaming.runtime.{LongOffset, MemoryStream}
 import org.apache.spark.sql.execution.streaming.runtime.StreamingCheckpointConstants.DIR_NAME_OFFSETS
@@ -29,9 +29,8 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{OutputMode, RunningCountStatefulProcessor, StreamTest, TimeMode}
 import org.apache.spark.sql.streaming.OutputMode.{Complete, Update}
-import org.apache.spark.sql.test.SharedSparkSession
 
-class OperatorStateMetadataSuite extends StreamTest with SharedSparkSession {
+class OperatorStateMetadataSuite extends StreamTest with WriteProtectedCheckpointTestMixin {
   import testImplicits._
 
   private lazy val hadoopConf = spark.sessionState.newHadoopConf()
@@ -71,15 +70,19 @@ class OperatorStateMetadataSuite extends StreamTest with SharedSparkSession {
 
   test("Serialize and deserialize stateful operator metadata") {
     withTempDir { checkpointDir =>
-      val offsetLog = new OffsetSeqLog(spark,
-        new Path(checkpointDir.toString, DIR_NAME_OFFSETS).toString)
-      val batch0 = OffsetSeq.fill(LongOffset(0), LongOffset(1), LongOffset(2))
-      offsetLog.add(0, batch0)
-      val statePath = new Path(checkpointDir.toString, "state/0")
-      val stateStoreInfo = (1 to 4).map(i => StateStoreMetadataV1(s"store$i", 1, 200))
-      val operatorInfo = OperatorInfoV1(1, "Join")
-      val operatorMetadata = OperatorStateMetadataV1(operatorInfo, stateStoreInfo.toArray)
-      new OperatorStateMetadataV1Writer(statePath, hadoopConf).write(operatorMetadata)
+      // Test setup writes the offset log and operator metadata directly to the checkpoint.
+      val operatorMetadata = withWritableCheckpoint {
+        val offsetLog = new OffsetSeqLog(spark,
+          new Path(checkpointDir.toString, DIR_NAME_OFFSETS).toString)
+        val batch0 = OffsetSeq.fill(LongOffset(0), LongOffset(1), LongOffset(2))
+        offsetLog.add(0, batch0)
+        val statePath = new Path(checkpointDir.toString, "state/0")
+        val stateStoreInfo = (1 to 4).map(i => StateStoreMetadataV1(s"store$i", 1, 200))
+        val operatorInfo = OperatorInfoV1(1, "Join")
+        val metadata = OperatorStateMetadataV1(operatorInfo, stateStoreInfo.toArray)
+        new OperatorStateMetadataV1Writer(statePath, hadoopConf).write(metadata)
+        metadata
+      }
       checkOperatorStateMetadata(checkpointDir.toString, 0, operatorMetadata)
       val df = spark.read.format("state-metadata").load(checkpointDir.toString)
       // Commit log is empty, there is no available batch id.
@@ -414,10 +417,12 @@ class OperatorStateMetadataSuite extends StreamTest with SharedSparkSession {
         StopStream
       )
 
-      // Delete operator metadata path
-      val metadataPath = new Path(checkpointDir.toString, s"state/0/_metadata/metadata")
-      val fm = CheckpointFileManager.create(new Path(checkpointDir.getCanonicalPath), hadoopConf)
-      fm.delete(metadataPath)
+      // Delete operator metadata path (test setup mutates the checkpoint).
+      withWritableCheckpoint {
+        val metadataPath = new Path(checkpointDir.toString, s"state/0/_metadata/metadata")
+        val fm = CheckpointFileManager.create(new Path(checkpointDir.getCanonicalPath), hadoopConf)
+        fm.delete(metadataPath)
+      }
 
       // Restart the query
       testStream(aggregated, Complete)(
@@ -470,6 +475,85 @@ class OperatorStateMetadataSuite extends StreamTest with SharedSparkSession {
           }
         )
       }
+    }
+  }
+
+  test("Restart with stateful operator but empty state directory triggers error") {
+    withTempDir { checkpointDir =>
+      val inputData = MemoryStream[Int]
+      val stream = inputData.toDF()
+
+      // Run a streaming query with stateful operator
+      testStream(stream.dropDuplicates())(
+        StartStream(checkpointLocation = checkpointDir.toString),
+        AddData(inputData, 1, 2, 3),
+        ProcessAllAvailable(),
+        StopStream)
+
+      // Delete the state directory to simulate deleted state files (test setup mutates
+      // the checkpoint).
+      withWritableCheckpoint {
+        val stateDir = new Path(checkpointDir.toString, "state")
+        val fileManager = CheckpointFileManager.create(stateDir, hadoopConf)
+        fileManager.delete(stateDir)
+      }
+
+      // Restart the query - should fail with empty state directory error
+      testStream(stream.dropDuplicates())(
+        StartStream(checkpointLocation = checkpointDir.toString),
+        AddData(inputData, 4),
+        ExpectFailure[SparkRuntimeException] { t =>
+          def formatPairString(pair: (Long, String)): String =
+            s"(OperatorId: ${pair._1} -> OperatorName: ${pair._2})"
+
+          checkError(
+            t.asInstanceOf[SparkRuntimeException],
+            "STREAMING_STATEFUL_OPERATOR_MISSING_STATE_DIRECTORY",
+            "42K03",
+            Map("OpsInCurBatchSeq" -> formatPairString(0L -> "dedupe")))
+        }
+      )
+    }
+  }
+
+  test("Restart with stateful operator added to previously stateless query triggers error") {
+    withTempDir { checkpointDir =>
+      val inputData = MemoryStream[Int]
+
+      // Run a stateless streaming query first
+      testStream(inputData.toDF().select($"value" * 2 as "doubled"))(
+        StartStream(checkpointLocation = checkpointDir.toString),
+        AddData(inputData, 1, 2, 3),
+        ProcessAllAvailable(),
+        AddData(inputData, 1, 2, 3),
+        ProcessAllAvailable(),
+        StopStream)
+
+      // Delete the state directory if it exists (it shouldn't for stateless query).
+      // Wrapped so the test-setup delete bypasses write protection.
+      withWritableCheckpoint {
+        val stateDir = new Path(checkpointDir.toString, "state")
+        val fileManager = CheckpointFileManager.create(stateDir, hadoopConf)
+        if (fileManager.exists(stateDir)) {
+          fileManager.delete(stateDir)
+        }
+      }
+
+      // Restart with a stateful operator added - should fail
+      testStream(inputData.toDF().dropDuplicates())(
+        StartStream(checkpointLocation = checkpointDir.toString),
+        AddData(inputData, 4),
+        ExpectFailure[SparkRuntimeException] { t =>
+          def formatPairString(pair: (Long, String)): String =
+            s"(OperatorId: ${pair._1} -> OperatorName: ${pair._2})"
+
+          checkError(
+            t.asInstanceOf[SparkRuntimeException],
+            "STREAMING_STATEFUL_OPERATOR_MISSING_STATE_DIRECTORY",
+            "42K03",
+            Map("OpsInCurBatchSeq" -> formatPairString(0L -> "dedupe")))
+        }
+      )
     }
   }
 }

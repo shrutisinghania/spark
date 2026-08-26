@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -16,14 +15,17 @@
 # limitations under the License.
 #
 
-import unittest
 import os
+import unittest
 
-from pyspark.util import is_remote_only
 from pyspark.ml.tests.connect.test_legacy_mode_classification import ClassificationTestsMixin
-from pyspark.testing.connectutils import should_test_connect, connect_requirement_message
+from pyspark.testing.connectutils import (
+    ReusedConnectTestCase,
+    connect_requirement_message,
+    should_test_connect,
+)
 from pyspark.testing.utils import have_torch, torch_requirement_message
-from pyspark.testing.connectutils import ReusedConnectTestCase
+from pyspark.util import is_remote_only
 
 
 @unittest.skipIf(
@@ -35,7 +37,7 @@ from pyspark.testing.connectutils import ReusedConnectTestCase
 class ClassificationTestsOnConnect(ClassificationTestsMixin, ReusedConnectTestCase):
     @classmethod
     def conf(cls):
-        config = super(ClassificationTestsOnConnect, cls).conf()
+        config = super().conf()
         config.set("spark.sql.artifact.copyFromLocalToFs.allowDestLocal", "true")
         return config
 
@@ -45,12 +47,6 @@ class ClassificationTestsOnConnect(ClassificationTestsMixin, ReusedConnectTestCa
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.connect.test_connect_classification import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

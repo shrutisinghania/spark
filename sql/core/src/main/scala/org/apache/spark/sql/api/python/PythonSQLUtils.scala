@@ -22,23 +22,27 @@ import java.nio.channels.{Channels, SocketChannel}
 
 import net.razorvine.pickle.{Pickler, Unpickler}
 
+import org.apache.spark.SparkContext
 import org.apache.spark.api.python.DechunkedInputStream
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.CLASS_LOADER
 import org.apache.spark.security.SocketAuthServer
-import org.apache.spark.sql.{internal, Column, DataFrame, Row, SparkSession}
+import org.apache.spark.sql.{internal, Column, DataFrame, DataFrameReader, Dataset, Encoders, Row, SparkSession, TableArg}
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.analysis.{FunctionRegistry, TableFunctionRegistry}
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
+import org.apache.spark.sql.classic.{DataFrameReader => ClassicDataFrameReader}
 import org.apache.spark.sql.classic.ClassicConversions._
 import org.apache.spark.sql.classic.ExpressionUtils.expression
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.{ExplainMode, QueryExecution}
 import org.apache.spark.sql.execution.arrow.ArrowConverters
 import org.apache.spark.sql.execution.python.EvaluatePython
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DataType, StructType}
+import org.apache.spark.storage.PythonWorkerLogBlockId
 import org.apache.spark.util.{MutableURLClassLoader, Utils}
 
 private[sql] object PythonSQLUtils extends Logging {
@@ -117,7 +121,7 @@ private[sql] object PythonSQLUtils extends Logging {
   def toPyRow(row: Row): Array[Byte] = {
     assert(row.isInstanceOf[GenericRowWithSchema])
     withInternalRowPickler(_.dumps(EvaluatePython.toJava(
-      CatalystTypeConverters.convertToCatalyst(row), row.schema)))
+      CatalystTypeConverters.convertToCatalyst(row), row.schema, SQLConf.get.pysparkBinaryAsBytes)))
   }
 
   def toJVMRow(
@@ -182,11 +186,63 @@ private[sql] object PythonSQLUtils extends Logging {
   def namedArgumentExpression(name: String, e: Column): Column =
     Column(NamedArgumentExpression(name, expression(e)))
 
+  def namedArgumentExpression(name: String, e: TableArg): Column =
+    Column(NamedArgumentExpression(name, e.expression))
+
   @scala.annotation.varargs
   def fn(name: String, arguments: Column*): Column = Column.fn(name, arguments: _*)
 
   @scala.annotation.varargs
   def internalFn(name: String, inputs: Column*): Column = Column.internalFn(name, inputs: _*)
+
+  /**
+   * Validates that the input [[DataFrame]] has exactly one column of StringType
+   * and converts it to a Dataset[String].
+   */
+  private def toStringDataset(df: DataFrame): Dataset[String] = {
+    val fields = df.schema.fields
+    if (fields.length != 1) {
+      throw QueryCompilationErrors.dataframeInputNotSingleColumnError(fields.length)
+    }
+    if (fields.head.dataType != org.apache.spark.sql.types.StringType) {
+      throw QueryCompilationErrors.dataframeInputNotStringTypeError(fields.head.dataType)
+    }
+    df.as(Encoders.STRING)
+  }
+
+  def jsonFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].json(toStringDataset(df))
+  }
+
+  def csvFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].csv(toStringDataset(df))
+  }
+
+  def xmlFromDataFrame(
+      reader: DataFrameReader,
+      df: DataFrame): DataFrame = {
+    reader.asInstanceOf[ClassicDataFrameReader].xml(toStringDataset(df))
+  }
+
+  def cleanupPythonWorkerLogs(sessionUUID: String, sparkContext: SparkContext): Unit = {
+    if (!sparkContext.isStopped) {
+      try {
+        val blockManager = sparkContext.env.blockManager.master
+        blockManager.getMatchingBlockIds(
+            id => id.isInstanceOf[PythonWorkerLogBlockId] &&
+              id.asInstanceOf[PythonWorkerLogBlockId].sessionId == sessionUUID,
+            askStorageEndpoints = true)
+          .distinct
+          .foreach(blockManager.removeBlock)
+      } catch {
+        case _ if sparkContext.isStopped => // Ignore when SparkContext is stopped.
+      }
+    }
+  }
 }
 
 /**

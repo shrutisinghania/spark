@@ -17,26 +17,28 @@
 """
 User-defined table function related classes and functions
 """
-import pickle
-from dataclasses import dataclass, field
+
 import inspect
+import pickle
 import sys
 import warnings
-from typing import Any, Type, TYPE_CHECKING, Optional, Sequence, Union
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Type, Union
 
 from pyspark.errors import (
     PySparkAttributeError,
+    PySparkImportError,
     PySparkPicklingError,
     PySparkTypeError,
-    PySparkImportError,
 )
-from pyspark.util import PythonEvalType
 from pyspark.sql.pandas.utils import require_minimum_pandas_version, require_minimum_pyarrow_version
 from pyspark.sql.types import DataType, StructType, _parse_datatype_string
 from pyspark.sql.udf import _wrap_function
+from pyspark.util import PythonEvalType
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
+
     from pyspark.sql._typing import TVFArgumentOrName
     from pyspark.sql.dataframe import DataFrame
     from pyspark.sql.session import SparkSession
@@ -278,6 +280,7 @@ def _validate_arrow_udtf_handler(cls: Any, returnType: Optional[Union[StructType
     _validate_udtf_handler(cls, returnType)
 
     # Block analyze method usage in arrow UDTFs
+    # TODO(SPARK-53286): Support analyze method for Arrow UDTFs to enable dynamic return types
     has_analyze = hasattr(cls, "analyze")
     if has_analyze:
         raise PySparkAttributeError(
@@ -417,9 +420,8 @@ class UserDefinedTableFunction:
         return judtf
 
     def __call__(self, *args: "TVFArgumentOrName", **kwargs: "TVFArgumentOrName") -> "DataFrame":
-        from pyspark.sql.classic.column import _to_java_column, _to_seq
-
         from pyspark.sql import DataFrame, SparkSession
+        from pyspark.sql.classic.column import _to_java_column, _to_seq
         from pyspark.sql.table_arg import TableArg
 
         spark = SparkSession._getActiveSessionOrCreate()
@@ -554,13 +556,14 @@ class UDTFRegistration:
 
 def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.sql.udf
+    from pyspark.sql import SparkSession
 
     globs = pyspark.sql.udtf.__dict__.copy()
     spark = SparkSession.builder.master("local[4]").appName("sql.udtf tests").getOrCreate()
     globs["spark"] = spark
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.udtf, globs=globs, optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
     )
     spark.stop()

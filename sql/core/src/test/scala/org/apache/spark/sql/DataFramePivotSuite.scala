@@ -26,7 +26,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
-class DataFramePivotSuite extends QueryTest with SharedSparkSession {
+class DataFramePivotSuite extends SharedSparkSession {
   import testImplicits._
 
   test("pivot courses") {
@@ -371,5 +371,150 @@ class DataFramePivotSuite extends QueryTest with SharedSparkSession {
     }
 
     assert(e.getMessage.contains("pivot is not supported on a streaming DataFrames/Datasets"))
+  }
+
+  test("SPARK-55483: pivot with null non-atomic pivot column should not throw NPE") {
+    // When the pivot column is a non-atomic type (struct, array), PivotFirst uses a TreeMap
+    // whose comparison-based lookup throws NPE on null keys. Null pivot column values should
+    // be silently ignored since they can never match any declared pivot value.
+    withTempView("struct_pivot_data") {
+      sql(
+        """CREATE OR REPLACE TEMP VIEW struct_pivot_data AS
+          |SELECT * FROM VALUES
+          |  (named_struct('x', 1, 'y', 2), 100),
+          |  (named_struct('x', 3, 'y', 4), 200),
+          |  (CAST(NULL AS STRUCT<x: INT, y: INT>), 300),
+          |  (named_struct('x', 1, 'y', 2), 400)
+          |AS t(key, amount)""".stripMargin)
+
+      checkAnswer(
+        sql(
+          """SELECT * FROM struct_pivot_data
+            |PIVOT (SUM(amount) FOR key IN (
+            |  named_struct('x', 1, 'y', 2) AS k12,
+            |  named_struct('x', 3, 'y', 4) AS k34
+            |))""".stripMargin),
+        Row(500, 200))
+    }
+  }
+
+  test("pivot with explicit values under UTF8_LCASE collation") {
+    withTable("lcase_pivot") {
+      sql(
+        """CREATE TABLE lcase_pivot (
+          |  quarter STRING COLLATE UTF8_LCASE,
+          |  course STRING,
+          |  earnings INT
+          |) USING PARQUET""".stripMargin)
+      sql(
+        """INSERT INTO lcase_pivot VALUES
+          |  ('q1', 'dotNET', 10000),
+          |  ('q2', 'dotNET', 15000),
+          |  ('q1', 'Java',   20000),
+          |  ('q2', 'Java',   30000)""".stripMargin)
+
+      checkAnswer(
+        sql(
+          """SELECT * FROM lcase_pivot
+            |PIVOT (
+            |  SUM(earnings)
+            |  FOR quarter IN ('Q1' AS Q1, 'Q2' AS Q2)
+            |)""".stripMargin),
+        Row("dotNET", 10000, 15000) ::
+          Row("Java", 20000, 30000) :: Nil)
+    }
+  }
+
+  test("pivot with explicit values under UNICODE_CI collation") {
+    // scalastyle:off nonascii
+    val precomposed = "\u00FCber"  // über (precomposed)
+    val decomposed = "u\u0308ber" // über (decomposed)
+    // scalastyle:on nonascii
+    withTable("uci_pivot") {
+      sql(
+        """CREATE TABLE uci_pivot (
+          |  key STRING COLLATE UNICODE_CI,
+          |  amount INT
+          |) USING PARQUET""".stripMargin)
+      sql(s"INSERT INTO uci_pivot VALUES ('$precomposed', 100)")
+      sql(s"INSERT INTO uci_pivot VALUES ('$decomposed', 200)")
+      sql("INSERT INTO uci_pivot VALUES ('other', 50)")
+
+      checkAnswer(
+        sql(
+          s"""SELECT * FROM uci_pivot
+             |PIVOT (
+             |  SUM(amount) FOR key IN (
+             |    '$precomposed' AS uber,
+             |    'other' AS other
+             |  )
+             |)""".stripMargin),
+        Row(300, 50))
+    }
+  }
+
+  test("pivot with null collated string column should not NPE") {
+    withTable("lcase_null_pivot") {
+      sql(
+        """CREATE TABLE lcase_null_pivot (
+          |  key STRING COLLATE UTF8_LCASE,
+          |  amount INT
+          |) USING PARQUET""".stripMargin)
+      sql(
+        """INSERT INTO lcase_null_pivot VALUES
+          |  ('a', 10),
+          |  (NULL, 20),
+          |  ('b', 30)""".stripMargin)
+
+      checkAnswer(
+        sql(
+          """SELECT * FROM lcase_null_pivot
+            |PIVOT (
+            |  SUM(amount)
+            |  FOR key IN ('a' AS a, 'b' AS b)
+            |)""".stripMargin),
+        Row(10, 30))
+    }
+  }
+
+  test("ORDER BY on a column dropped by PIVOT fails name resolution") {
+    // PIVOT drops the pivoted measure column, so `t.v` fails name resolution with
+    // UNRESOLVED_COLUMN: the dropped column is never appended to a lower operator.
+    withSQLConf(SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false") {
+      checkError(
+        exception = intercept[AnalysisException] {
+          spark.sql(
+            """SELECT * FROM VALUES (1, 1, 100), (2, 2, 200) AS t(id, m, v)
+              |PIVOT (SUM(v) FOR m IN (1, 2))
+              |ORDER BY t.v""".stripMargin)
+        },
+        condition = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+        parameters = Map(
+          "objectName" -> "`t`.`v`",
+          "proposal" -> "`1`, `2`, `t`.`id`"),
+        queryContext =
+          Array(ExpectedContext(fragment = "t.v", start = 101, stop = 103)))
+    }
+  }
+
+  test("DataFrame sort on a column dropped by PIVOT is rejected") {
+    // The Column reference carries the dropped column's id, so unlike the SQL case above it
+    // reaches hidden-output insertion rather than failing name resolution, and analysis fails
+    // with MISSING_ATTRIBUTES.
+    withSQLConf(SQLConf.ANALYZER_DUAL_RUN_LEGACY_AND_SINGLE_PASS_RESOLVER.key -> "false") {
+      val df = Seq((1, 1, 100), (2, 2, 200)).toDF("id", "m", "v")
+      val pivoted = df.groupBy("id").pivot("m", Seq(1, 2)).agg(sum($"v"))
+
+      checkError(
+        exception = intercept[AnalysisException] {
+          pivoted.sort(df("v"))
+        },
+        condition = "MISSING_ATTRIBUTES.RESOLVED_ATTRIBUTE_MISSING_FROM_INPUT",
+        parameters = Map(
+          "missingAttributes" -> "\"v\"",
+          "input" -> "\"id\", \"1\", \"2\"",
+          "operator" -> "!Sort \\[v#\\d+ ASC NULLS FIRST\\], true"),
+        matchPVals = true)
+    }
   }
 }

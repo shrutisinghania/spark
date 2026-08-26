@@ -18,6 +18,7 @@
 import sys
 import warnings
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Iterable,
@@ -27,19 +28,17 @@ from typing import (
     TypeVar,
     Union,
     overload,
-    TYPE_CHECKING,
 )
 
 import numpy as np
 
-from pyspark import RDD, since
-from pyspark.streaming.dstream import DStream
-from pyspark.mllib.common import callMLlibFunc, _py2java, _java2py, inherit_doc
-from pyspark.mllib.linalg import _convert_to_vector
-from pyspark.mllib.util import Saveable, Loader
-from pyspark.core.rdd import RDD
+from pyspark import since
 from pyspark.core.context import SparkContext
-from pyspark.mllib.linalg import Vector
+from pyspark.core.rdd import RDD
+from pyspark.mllib.common import _java2py, _py2java, callMLlibFunc, inherit_doc
+from pyspark.mllib.linalg import Vector, _convert_to_vector
+from pyspark.mllib.util import Loader, Saveable
+from pyspark.streaming.dstream import DStream
 
 if TYPE_CHECKING:
     from pyspark.mllib._typing import VectorLike
@@ -65,7 +64,6 @@ __all__ = [
 
 
 class LabeledPoint:
-
     """
     Class that represents the features and labels of a data point.
 
@@ -84,7 +82,7 @@ class LabeledPoint:
     'label' and 'features' are accessible as class attributes.
     """
 
-    def __init__(self, label: float, features: Iterable[float]):
+    def __init__(self, label: float, features: "VectorLike"):
         self.label = float(label)
         self.features = _convert_to_vector(features)
 
@@ -99,7 +97,6 @@ class LabeledPoint:
 
 
 class LinearModel:
-
     """
     A linear model that has a vector of coefficients and an intercept.
 
@@ -135,7 +132,6 @@ class LinearModel:
 
 @inherit_doc
 class LinearRegressionModelBase(LinearModel):
-
     """A linear regression model.
 
     .. versionadded:: 0.9.0
@@ -151,12 +147,10 @@ class LinearRegressionModelBase(LinearModel):
     """
 
     @overload
-    def predict(self, x: "VectorLike") -> float:
-        ...
+    def predict(self, x: "VectorLike") -> float: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[float]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[float]: ...
 
     def predict(self, x: Union["VectorLike", RDD["VectorLike"]]) -> Union[float, RDD[float]]:
         """
@@ -173,7 +167,6 @@ class LinearRegressionModelBase(LinearModel):
 
 @inherit_doc
 class LinearRegressionModel(LinearRegressionModelBase):
-
     """A linear regression model derived from a least-squares fit.
 
     .. versionadded:: 0.9.0
@@ -384,7 +377,6 @@ class LinearRegressionWithSGD:
 
 @inherit_doc
 class LassoModel(LinearRegressionModelBase):
-
     """A linear regression model derived from a least-squares fit with
     an l_1 penalty term.
 
@@ -562,7 +554,6 @@ class LassoWithSGD:
 
 @inherit_doc
 class RidgeRegressionModel(LinearRegressionModelBase):
-
     """A linear regression model derived from a least-squares fit with
     an l_2 penalty term.
 
@@ -743,7 +734,6 @@ class RidgeRegressionWithSGD:
 
 
 class IsotonicRegressionModel(Saveable, Loader["IsotonicRegressionModel"]):
-
     """
     Regression model for isotonic regression.
 
@@ -791,20 +781,16 @@ class IsotonicRegressionModel(Saveable, Loader["IsotonicRegressionModel"]):
         self.isotonic = isotonic
 
     @overload
-    def predict(self, x: float) -> np.float64:
-        ...
+    def predict(self, x: float) -> np.float64: ...
 
     @overload
-    def predict(self, x: "VectorLike") -> np.ndarray:
-        ...
+    def predict(self, x: "VectorLike") -> np.ndarray: ...
 
     @overload
-    def predict(self, x: RDD[float]) -> RDD[np.float64]:
-        ...
+    def predict(self, x: RDD[float]) -> RDD[np.float64]: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[np.ndarray]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[np.ndarray]: ...
 
     def predict(
         self, x: Union[float, "VectorLike", RDD[float], RDD["VectorLike"]]
@@ -1014,7 +1000,7 @@ class StreamingLinearRegressionWithSGD(StreamingLinearAlgorithm):
         self.miniBatchFraction = miniBatchFraction
         self.convergenceTol = convergenceTol
         self._model: Optional[LinearModel] = None
-        super(StreamingLinearRegressionWithSGD, self).__init__(model=self._model)
+        super().__init__(model=self._model)
 
     @since("1.5.0")
     def setInitialWeights(self, initialWeights: "VectorLike") -> "StreamingLinearRegressionWithSGD":
@@ -1051,13 +1037,14 @@ class StreamingLinearRegressionWithSGD(StreamingLinearAlgorithm):
 
 def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.mllib.regression
+    from pyspark.sql import SparkSession
 
     globs = pyspark.mllib.regression.__dict__.copy()
     spark = SparkSession.builder.master("local[2]").appName("mllib.regression tests").getOrCreate()
     globs["sc"] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
         sys.exit(-1)

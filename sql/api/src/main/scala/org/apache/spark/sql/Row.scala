@@ -32,6 +32,7 @@ import org.json4s.jackson.JsonMethods.{compact, pretty, render}
 import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.annotation.{Stable, Unstable}
 import org.apache.spark.sql.catalyst.expressions.GenericRow
+import org.apache.spark.sql.catalyst.types.ops.TypeApiOps
 import org.apache.spark.sql.catalyst.util.{DateFormatter, SparkDateTimeUtils, TimestampFormatter, UDTUtils}
 import org.apache.spark.sql.errors.DataTypeErrors
 import org.apache.spark.sql.errors.DataTypeErrors.{toSQLType, toSQLValue}
@@ -303,6 +304,24 @@ trait Row extends Serializable {
   def getDecimal(i: Int): java.math.BigDecimal = getAs[java.math.BigDecimal](i)
 
   /**
+   * Returns the value at position i of geometry type as org.apache.spark.sql.types.Geometry.
+   *
+   * @throws ClassCastException
+   *   when data type does not match.
+   */
+  def getGeometry(i: Int): org.apache.spark.sql.types.Geometry =
+    getAs[org.apache.spark.sql.types.Geometry](i)
+
+  /**
+   * Returns the value at position i of geography type as org.apache.spark.sql.types.Geography.
+   *
+   * @throws ClassCastException
+   *   when data type does not match.
+   */
+  def getGeography(i: Int): org.apache.spark.sql.types.Geography =
+    getAs[org.apache.spark.sql.types.Geography](i)
+
+  /**
    * Returns the value at position i of date type as java.sql.Date.
    *
    * @throws ClassCastException
@@ -319,7 +338,7 @@ trait Row extends Serializable {
   def getLocalDate(i: Int): java.time.LocalDate = getAs[java.time.LocalDate](i)
 
   /**
-   * Returns the value at position i of date type as java.sql.Timestamp.
+   * Returns the value at position i of timestamp type as java.sql.Timestamp.
    *
    * @throws ClassCastException
    *   when data type does not match.
@@ -327,7 +346,7 @@ trait Row extends Serializable {
   def getTimestamp(i: Int): java.sql.Timestamp = getAs[java.sql.Timestamp](i)
 
   /**
-   * Returns the value at position i of date type as java.time.Instant.
+   * Returns the value at position i of timestamp type as java.time.Instant.
    *
    * @throws ClassCastException
    *   when data type does not match.
@@ -370,7 +389,7 @@ trait Row extends Serializable {
   def getMap[K, V](i: Int): scala.collection.Map[K, V] = getAs[Map[K, V]](i)
 
   /**
-   * Returns the value at position i of array type as a `java.util.Map`.
+   * Returns the value at position i of map type as a `java.util.Map`.
    *
    * @throws ClassCastException
    *   when data type does not match.
@@ -608,8 +627,22 @@ trait Row extends Serializable {
     }
 
     // Convert a value to json.
-    def toJson(value: Any, dataType: DataType): JValue = (value, dataType) match {
-      case (null, _) => JNull
+    def toJson(value: Any, dataType: DataType): JValue =
+      if (value == null) {
+        JNull
+      } else {
+        // A public Row holds external values (e.g. java.time.LocalTime for TimeType), so render
+        // through the framework's formatExternal rather than format, which expects the internal
+        // representation and would otherwise fail the value cast. A framework type either returns a
+        // rendered string or raises its own error (e.g. the nanosecond timestamp types raise the
+        // unsupported-rendering error); types outside the framework fall back to legacy rendering.
+        TypeApiOps(dataType)
+          .flatMap(_.formatExternal(value))
+          .map(JString(_))
+          .getOrElse(toJsonDefault(value, dataType))
+      }
+
+    def toJsonDefault(value: Any, dataType: DataType): JValue = (value, dataType) match {
       case (b: Boolean, _) => JBool(b)
       case (b: Byte, _) => JLong(b)
       case (s: Short, _) => JLong(s)

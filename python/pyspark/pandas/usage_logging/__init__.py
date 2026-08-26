@@ -20,10 +20,11 @@ from typing import Union
 
 import pandas as pd
 
+from pyspark.instrumentation_utils import _attach
 from pyspark.pandas import config, namespace, sql_formatter
 from pyspark.pandas.accessors import PandasOnSparkFrameMethods
-from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.datetimes import DatetimeMethods
+from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.groupby import DataFrameGroupBy, SeriesGroupBy
 from pyspark.pandas.indexes.base import Index
 from pyspark.pandas.indexes.category import CategoricalIndex
@@ -43,11 +44,11 @@ from pyspark.pandas.missing.indexes import (
 from pyspark.pandas.missing.series import MissingPandasLikeSeries
 from pyspark.pandas.missing.window import (
     MissingPandasLikeExpanding,
-    MissingPandasLikeRolling,
     MissingPandasLikeExpandingGroupby,
-    MissingPandasLikeRollingGroupby,
     MissingPandasLikeExponentialMoving,
     MissingPandasLikeExponentialMovingGroupby,
+    MissingPandasLikeRolling,
+    MissingPandasLikeRollingGroupby,
 )
 from pyspark.pandas.series import Series
 from pyspark.pandas.spark.accessors import (
@@ -59,12 +60,11 @@ from pyspark.pandas.strings import StringMethods
 from pyspark.pandas.window import (
     Expanding,
     ExpandingGroupby,
-    Rolling,
-    RollingGroupby,
     ExponentialMoving,
     ExponentialMovingGroupby,
+    Rolling,
+    RollingGroupby,
 )
-from pyspark.instrumentation_utils import _attach
 
 
 def attach(logger_module: Union[str, ModuleType]) -> None:
@@ -117,20 +117,20 @@ def attach(logger_module: Union[str, ModuleType]) -> None:
     sql_formatter._CAPTURE_SCOPES = 4
     modules.append(sql_formatter)
 
-    missings = [
+    missings: list[tuple[Union[type, ModuleType], type]] = [
         (pd, MissingPandasLikeGeneralFunctions),
         (pd.DataFrame, MissingPandasLikeDataFrame),
         (pd.Series, MissingPandasLikeSeries),
         (pd.Index, MissingPandasLikeIndex),
         (pd.MultiIndex, MissingPandasLikeMultiIndex),
         (pd.DatetimeIndex, MissingPandasLikeDatetimeIndex),
-        (pd.core.groupby.DataFrameGroupBy, MissingPandasLikeDataFrameGroupBy),
-        (pd.core.groupby.SeriesGroupBy, MissingPandasLikeSeriesGroupBy),
-        (pd.core.window.Expanding, MissingPandasLikeExpanding),
-        (pd.core.window.Rolling, MissingPandasLikeRolling),
-        (pd.core.window.ExpandingGroupby, MissingPandasLikeExpandingGroupby),
-        (pd.core.window.RollingGroupby, MissingPandasLikeRollingGroupby),
-        (pd.core.window.ExponentialMovingWindow, MissingPandasLikeExponentialMoving),
+        (pd.core.groupby.DataFrameGroupBy, MissingPandasLikeDataFrameGroupBy),  # type: ignore[attr-defined]
+        (pd.core.groupby.SeriesGroupBy, MissingPandasLikeSeriesGroupBy),  # type: ignore[attr-defined]
+        (pd.core.window.Expanding, MissingPandasLikeExpanding),  # type: ignore[attr-defined]
+        (pd.core.window.Rolling, MissingPandasLikeRolling),  # type: ignore[attr-defined]
+        (pd.core.window.ExpandingGroupby, MissingPandasLikeExpandingGroupby),  # type: ignore[attr-defined]
+        (pd.core.window.RollingGroupby, MissingPandasLikeRollingGroupby),  # type: ignore[attr-defined]
+        (pd.core.window.ExponentialMovingWindow, MissingPandasLikeExponentialMoving),  # type: ignore[attr-defined]
         (
             pd.core.window.ExponentialMovingWindowGroupby,  # type: ignore[attr-defined]
             MissingPandasLikeExponentialMovingGroupby,

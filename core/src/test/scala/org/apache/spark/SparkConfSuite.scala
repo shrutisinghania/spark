@@ -112,6 +112,18 @@ class SparkConfSuite extends SparkFunSuite with LocalSparkContext with ResetSyst
     assert(conf.getOption("k4") === None)
   }
 
+  test("getAllAsJavaMap") {
+    val conf = new SparkConf(false)
+    assert(conf.getAllAsJavaMap.isEmpty)
+    conf.set("k1", "v1")
+    conf.setAll(Seq(("k2", "v2"), ("k3", "v3")))
+    val javaMap = conf.getAllAsJavaMap
+    assert(javaMap.size() === 3)
+    assert(javaMap.get("k1") === "v1")
+    assert(javaMap.get("k2") === "v2")
+    assert(javaMap.get("k3") === "v3")
+  }
+
   test("basic getAllWithPrefix") {
     val prefix = "spark.prefix."
     val conf = new SparkConf(false)
@@ -125,6 +137,26 @@ class SparkConfSuite extends SparkFunSuite with LocalSparkContext with ResetSyst
 
     assert(conf.getAllWithPrefix(prefix).toSet ===
       Set(("main.suffix", "v1"), ("main2.suffix", "v2"), ("main3.extra1.suffix", "v3")))
+  }
+
+  test("more flexible getAllWithPrefix") {
+    val prefix = "spark.fs.s3a."
+    val newPrefix = "spark.hadoop.fs.s3a."
+    val conf = new SparkConf(false)
+    conf.set("spark.fs.s3a.config1", "v1")
+    val f = (k: String) => {
+      val keyWithoutPrefix = k.substring(prefix.length)
+      newPrefix + keyWithoutPrefix
+    }
+    assert(conf.getAllWithPrefix(prefix, f).toSet ===
+      Set(("spark.hadoop.fs.s3a.config1", "v1")))
+
+    conf.set("spark.fs.s3a.config1.suffix", "v2")
+    conf.set("spark.fs.s3a.config1.extra.suffix", "v3")
+    conf.set("spark.notMatching.main4", "v4")
+
+    assert(conf.getAllWithPrefix(prefix).toSet ===
+      Set(("config1", "v1"), ("config1.suffix", "v2"), ("config1.extra.suffix", "v3")))
   }
 
   test("creating SparkContext without master and app name") {

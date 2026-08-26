@@ -16,28 +16,34 @@
 #
 
 from abc import ABCMeta, abstractmethod
-from typing import Any, Generic, Optional, List, Type, TypeVar, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Generic, List, Optional, Type, TypeVar
 
 from pyspark import since
+from pyspark.ml.base import (
+    Estimator,
+    Model,
+    PredictionModel,
+    Predictor,
+    Transformer,
+    _PredictorParams,
+)
+from pyspark.ml.common import _java2py, _py2java, inherit_doc
+from pyspark.ml.param import Param, Params
 from pyspark.ml.util import (
-    try_remote_transform_relation,
+    _jvm,
     try_remote_call,
-    try_remote_fit,
     try_remote_del,
-    try_remote_return_java_class,
+    try_remote_fit,
     try_remote_intercept,
+    try_remote_return_java_class,
+    try_remote_transform_relation,
 )
 from pyspark.sql import DataFrame, is_remote
-from pyspark.ml import Estimator, Predictor, PredictionModel, Transformer, Model
-from pyspark.ml.base import _PredictorParams
-from pyspark.ml.param import Param, Params
-from pyspark.ml.util import _jvm
-from pyspark.ml.common import inherit_doc, _java2py, _py2java
-
 
 if TYPE_CHECKING:
+    from py4j.java_gateway import JavaClass, JavaObject
+
     from pyspark.ml._typing import ParamMap
-    from py4j.java_gateway import JavaObject, JavaClass
 
 
 T = TypeVar("T")
@@ -52,7 +58,7 @@ class JavaWrapper:
     """
 
     def __init__(self, java_obj: Optional["JavaObject"] = None):
-        super(JavaWrapper, self).__init__()
+        super().__init__()
         self._java_obj = java_obj
 
     @try_remote_del
@@ -355,7 +361,7 @@ class JavaParams(JavaWrapper, Params, metaclass=ABCMeta):
         """
         if extra is None:
             extra = dict()
-        that = super(JavaParams, self).copy(extra)
+        that = super().copy(extra)
         if self._java_obj is not None:
             from pyspark.ml.util import RemoteModelRef
 
@@ -374,7 +380,7 @@ class JavaParams(JavaWrapper, Params, metaclass=ABCMeta):
         """
         assert self._java_obj is not None
 
-        super(JavaParams, self).clear(param)
+        super().clear(param)
         java_param = self._java_obj.getParam(param.name)
         self._java_obj.clear(java_param)
 
@@ -457,7 +463,7 @@ class JavaModel(JavaTransformer, Model, metaclass=ABCMeta):
         these wrappers depend on pyspark.ml.util (both directly and via
         other ML classes).
         """
-        super(JavaModel, self).__init__(java_model)
+        super().__init__(java_model)
         if is_remote() and java_model is not None:
             from pyspark.ml.util import RemoteModelRef
 

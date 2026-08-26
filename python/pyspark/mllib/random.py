@@ -25,11 +25,10 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
-from pyspark.mllib.common import callMLlibFunc
 from pyspark.core.context import SparkContext
 from pyspark.core.rdd import RDD
+from pyspark.mllib.common import callMLlibFunc
 from pyspark.mllib.linalg import Vector
-
 
 __all__ = [
     "RandomRDDs",
@@ -681,6 +680,7 @@ class RandomRDDs:
 
 def _test() -> None:
     import doctest
+
     from pyspark.sql import SparkSession
 
     globs = globals().copy()
@@ -688,7 +688,7 @@ def _test() -> None:
     # even in these small test examples:
     spark = SparkSession.builder.master("local[2]").appName("mllib.random tests").getOrCreate()
     globs["sc"] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
         sys.exit(-1)

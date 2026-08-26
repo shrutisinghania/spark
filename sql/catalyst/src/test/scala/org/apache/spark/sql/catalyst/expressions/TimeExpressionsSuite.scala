@@ -25,7 +25,7 @@ import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{DataTypeMismatch,
 import org.apache.spark.sql.catalyst.expressions.Cast.{toSQLId, toSQLValue}
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils._
 import org.apache.spark.sql.catalyst.util.SparkDateTimeUtils.localTimeToNanos
-import org.apache.spark.sql.types.{DayTimeIntervalType, Decimal, DecimalType, IntegerType, StringType, TimeType}
+import org.apache.spark.sql.types.{DayTimeIntervalType, Decimal, DecimalType, IntegerType, LongType, StringType, TimeType}
 import org.apache.spark.sql.types.DayTimeIntervalType.{DAY, HOUR, SECOND}
 
 class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
@@ -59,6 +59,20 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       parameters = Map("input" -> "'100:50'", "format" -> "'mm:HH'"))
   }
 
+  test("SPARK-58296: to_time reports TimeType even when a foldable format is NULL") {
+    // A foldable format that evaluates to NULL must not change the output type: to_time
+    // still produces a TIME, matching the non-null and no-format branches. Before the fix
+    // the replacement fell back to the format argument's own type (STRING/NULL).
+    assert(new ToTime(Literal("00:00:00"), Literal.create(null, StringType)).dataType ===
+      TimeType())
+    assert(new ToTime(Literal("00:00:00"), Literal.create(null)).dataType === TimeType())
+    // The value is still NULL; assert type and value together for this exact case.
+    checkEvaluation(new ToTime(Literal("00:00:00"), Literal.create(null, StringType)), null)
+    // Sanity: the branches that were already correct.
+    assert(new ToTime(Literal("00:00:00")).dataType === TimeType())
+    assert(new ToTime(Literal("00:00:00"), Literal("HH:mm:ss")).dataType === TimeType())
+  }
+
   test("HourExpressionBuilder") {
     // Empty expressions list
     checkError(
@@ -82,7 +96,7 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(builtExprForTime.checkInputDataTypes().isSuccess)
 
     // test TIME-typed child should build HoursOfTime for all allowed custom precision values
-    (TimeType.MIN_PRECISION to TimeType.MICROS_PRECISION).foreach { precision =>
+    (TimeType.MIN_PRECISION to TimeType.MAX_PRECISION).foreach { precision =>
       val timeExpr = Literal(localTime(12, 58, 59), TimeType(precision))
       val builtExpr = HourExpressionBuilder.build("hour", Seq(timeExpr))
 
@@ -151,7 +165,7 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(builtExprForTime.checkInputDataTypes().isSuccess)
 
     // test TIME-typed child should build MinutesOfTime for all allowed custom precision values
-    (TimeType.MIN_PRECISION to TimeType.MICROS_PRECISION).foreach { precision =>
+    (TimeType.MIN_PRECISION to TimeType.MAX_PRECISION).foreach { precision =>
       val timeExpr = Literal(localTime(12, 58, 59), TimeType(precision))
       val builtExpr = MinuteExpressionBuilder.build("minute", Seq(timeExpr))
 
@@ -315,6 +329,14 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(expr.dataType == TimeType(2))
     assert(expr.checkInputDataTypes() == TypeCheckSuccess)
 
+    // test nanosecond precisions 7, 8, 9 are valid
+    (TimeType.MICROS_PRECISION + 1 to TimeType.MAX_PRECISION).foreach { p =>
+      expr = CurrentTime(Literal(p))
+      assert(expr.precision == p, s"Precision should be $p")
+      assert(expr.dataType == TimeType(p))
+      assert(expr.checkInputDataTypes() == TypeCheckSuccess)
+    }
+
     // test out of range precision => checkInputDataTypes fails
     expr = CurrentTime(Literal(2 + 8))
     assert(expr.checkInputDataTypes() ==
@@ -322,7 +344,7 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
         errorSubClass = "VALUE_OUT_OF_RANGE",
         messageParameters = Map(
           "exprName" -> toSQLId("precision"),
-          "valueRange" -> s"[${TimeType.MIN_PRECISION}, ${TimeType.MICROS_PRECISION}]",
+          "valueRange" -> s"[${TimeType.MIN_PRECISION}, ${TimeType.MAX_PRECISION}]",
           "currentValue" -> toSQLValue(10, IntegerType)
         )
       )
@@ -352,9 +374,22 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       4 -> 15.9876,
       5 -> 15.98765,
       6 -> 15.987654).foreach { case (precision, expected) =>
-      checkEvaluation(
-        SecondsOfTimeWithFraction(Literal(localTime(13, 11, 15, 987654), TimeType(precision))),
-        BigDecimal(expected))
+      val expr = SecondsOfTimeWithFraction(
+        Literal(localTime(13, 11, 15, 987654), TimeType(precision)))
+      assert(expr.dataType == DecimalType(2 + precision, precision),
+        s"TIME($precision) SECOND should have DecimalType(${2 + precision}, $precision)")
+      checkEvaluation(expr, BigDecimal(expected))
+    }
+    // Precisions 7-9 require sub-microsecond nanos
+    Seq(
+      7 -> BigDecimal("15.9876543"),
+      8 -> BigDecimal("15.98765432"),
+      9 -> BigDecimal("15.987654321")).foreach { case (precision, expected) =>
+      val expr = SecondsOfTimeWithFraction(
+        Literal(localTime(13, 11, 15, 987654, 321), TimeType(precision)))
+      assert(expr.dataType == DecimalType(2 + precision, precision),
+        s"TIME($precision) SECOND should have DecimalType(${2 + precision}, $precision)")
+      checkEvaluation(expr, expected)
     }
     // Verify NULL handling
     checkEvaluation(
@@ -569,5 +604,130 @@ class TimeExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     val timeTruncSec = TimeTrunc(Literal("SECOND"), Literal(timeWithMicroPrecision, TimeType(3)))
     assert(timeTruncSec.dataType == TimeType(3))
     checkEvaluation(timeTruncSec, localTime(15, 30, 45, 0))
+  }
+
+  test("Numeric to TIME conversions") {
+    // time_from_seconds (supports Long and Decimal for fractional seconds)
+    checkEvaluation(TimeFromSeconds(Literal(0L)), 0L)
+    checkEvaluation(TimeFromSeconds(Literal(43200L)), 43200000000000L)
+    checkEvaluation(TimeFromSeconds(Literal(52200L)), 52200000000000L)
+    checkEvaluation(TimeFromSeconds(Literal(Decimal(52200.5))), 52200500000000L)
+    checkEvaluation(TimeFromSeconds(Literal(Decimal(86399.999999))), 86399999999000L)
+
+    // time_from_millis
+    checkEvaluation(TimeFromMillis(Literal(0L)), 0L)
+    checkEvaluation(TimeFromMillis(Literal(52200000L)), 52200000000000L)
+    checkEvaluation(TimeFromMillis(Literal(52200500L)), 52200500000000L)
+    checkEvaluation(TimeFromMillis(Literal(86399999L)), 86399999000000L)
+
+    // time_from_micros
+    checkEvaluation(TimeFromMicros(Literal(0L)), 0L)
+    checkEvaluation(TimeFromMicros(Literal(52200000000L)), 52200000000000L)
+    checkEvaluation(TimeFromMicros(Literal(52200500000L)), 52200500000000L)
+    checkEvaluation(TimeFromMicros(Literal(86399999999L)), 86399999999000L)
+  }
+
+  test("Numeric to TIME conversions - range validation") {
+
+    // time_from_seconds - out of range [0, 86400)
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromSeconds(Literal(-1L)),
+      "Invalid TIME value")
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromSeconds(Literal(86400L)),
+      "Invalid TIME value")
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromSeconds(Literal(Decimal(-0.1))),
+      "Invalid TIME value")
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromSeconds(Literal(Decimal(86400.0))),
+      "Invalid TIME value")
+
+    // time_from_millis - out of range [0, 86400000)
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromMillis(Literal(-1L)),
+      "Invalid TIME value")
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromMillis(Literal(86400000L)),
+      "Invalid TIME value")
+
+    // time_from_micros - out of range [0, 86400000000)
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromMicros(Literal(-1L)),
+      "Invalid TIME value")
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromMicros(Literal(86400000000L)),
+      "Invalid TIME value")
+
+    // Test overflow in TIME conversion
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromSeconds(Literal(Long.MaxValue)),
+      "Overflow in TIME conversion")
+
+    // Test NaN and Infinite for floating point
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromSeconds(Literal(Float.NaN)),
+      "Cannot convert NaN or Infinite value to TIME")
+    checkExceptionInExpression[SparkDateTimeException](
+      TimeFromSeconds(Literal(Double.PositiveInfinity)),
+      "Cannot convert NaN or Infinite value to TIME")
+  }
+
+  test("Numeric to TIME conversions - NULL inputs") {
+    checkEvaluation(TimeFromSeconds(Literal.create(null, LongType)), null)
+    checkEvaluation(TimeFromSeconds(Literal.create(null, DecimalType(14, 6))), null)
+    checkEvaluation(TimeFromMillis(Literal.create(null, LongType)), null)
+    checkEvaluation(TimeFromMicros(Literal.create(null, LongType)), null)
+  }
+
+  test("TIME to numeric extractions") {
+    val midnight = Literal.create(0L, TimeType())
+    val afternoon = Literal.create(52200000000000L, TimeType())  // 14:30:00
+    val fractional = Literal.create(52200500000000L, TimeType()) // 14:30:00.5
+    val maxTime = Literal.create(86399999999000L, TimeType())    // 23:59:59.999999
+
+    // time_to_seconds (returns DECIMAL to preserve fractional seconds)
+    checkEvaluation(TimeToSeconds(midnight), Decimal(0))
+    checkEvaluation(TimeToSeconds(afternoon), Decimal(52200))
+    checkEvaluation(TimeToSeconds(fractional), Decimal(52200.5))
+    checkEvaluation(TimeToSeconds(maxTime), Decimal(86399.999999))
+
+    // time_to_millis (returns LONG)
+    checkEvaluation(TimeToMillis(midnight), 0L)
+    checkEvaluation(TimeToMillis(afternoon), 52200000L)
+    checkEvaluation(TimeToMillis(fractional), 52200500L)
+    checkEvaluation(TimeToMillis(maxTime), 86399999L)
+
+    // time_to_micros (returns LONG)
+    checkEvaluation(TimeToMicros(midnight), 0L)
+    checkEvaluation(TimeToMicros(afternoon), 52200000000L)
+    checkEvaluation(TimeToMicros(fractional), 52200500000L)
+    checkEvaluation(TimeToMicros(maxTime), 86399999999L)
+  }
+
+  test("TIME to numeric extractions - NULL inputs") {
+    val nullTime = Literal.create(null, TimeType())
+    checkEvaluation(TimeToSeconds(nullTime), null)
+    checkEvaluation(TimeToMillis(nullTime), null)
+    checkEvaluation(TimeToMicros(nullTime), null)
+  }
+
+  test("Round-trip conversions preserve precision") {
+    // Seconds (with fractional precision)
+    val seconds = Decimal(52200.123456)
+    checkEvaluation(TimeToSeconds(TimeFromSeconds(Literal(seconds))), seconds)
+
+    // Millis
+    val millis = 52200500L
+    checkEvaluation(TimeToMillis(TimeFromMillis(Literal(millis))), millis)
+
+    // Micros
+    val micros = 52200500000L
+    checkEvaluation(TimeToMicros(TimeFromMicros(Literal(micros))), micros)
+
+    // Cross-precision: seconds -> TIME -> micros
+    val secondsValue = Decimal(14.5)
+    val timeVal = TimeFromSeconds(Literal(secondsValue))
+    checkEvaluation(TimeToMicros(timeVal), 14500000L)
   }
 }

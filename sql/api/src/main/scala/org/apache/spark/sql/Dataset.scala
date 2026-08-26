@@ -820,6 +820,28 @@ abstract class Dataset[T] extends Serializable {
   def crossJoin(right: Dataset[_]): DataFrame
 
   /**
+   * Combines the columns of this DataFrame with another DataFrame side-by-side, preserving row
+   * alignment between the two inputs.
+   *
+   * Both DataFrames must produce the same canonicalized plan after stripping outer `Project`
+   * chains. In practice this means they derive from a common source through chains of
+   * projection-only operations (`select`, `withColumn`, `withColumnRenamed`, etc.); the chains
+   * may differ between the two sides, but anything below them -- including any `filter`,
+   * `orderBy`, `join`, or aggregation -- must be identical on both sides so the two sides stay
+   * row-aligned. Non-scalar Python UDFs (e.g., `GROUPED_MAP`) are not allowed on either side. An
+   * `AnalysisException` is thrown when the two DataFrames cannot be aligned.
+   *
+   * @param other
+   *   The DataFrame to combine with, which must derive from the same source as this DataFrame.
+   * @return
+   *   A new DataFrame containing the columns of this DataFrame followed by the columns of
+   *   `other`.
+   * @group untypedrel
+   * @since 4.3.0
+   */
+  def zip(other: Dataset[_]): DataFrame
+
+  /**
    * Joins this Dataset returning a `Tuple2` for each pair where `condition` evaluates to true.
    *
    * This is similar to the relation `join` function with one important difference in the result
@@ -911,6 +933,76 @@ abstract class Dataset[T] extends Serializable {
    * @since 4.0.0
    */
   def lateralJoin(right: Dataset[_], joinExprs: Column, joinType: String): DataFrame
+
+  /**
+   * Nearest-by top-K ranking join with another `DataFrame`, using the default `inner` join type.
+   * For each row on the left (query side), returns up to `numResults` rows from `right` (base
+   * side), ranked by `rankingExpression`.
+   *
+   * Equivalent SQL (with `mode = "exact"` and `direction = "similarity"`):
+   * {{{
+   *   left INNER JOIN right EXACT NEAREST numResults BY SIMILARITY rankingExpression
+   * }}}
+   *
+   * The current implementation evaluates the full cross-product of left and right and bounds
+   * memory per left row by `numResults`. Index-backed approximate strategies (transparent to
+   * `approx` mode) are planned for a future release; until then, pre-filter the right side when
+   * it is large. Tie-breaking among rows with equal ranking values is unspecified.
+   *
+   * @param right
+   *   Right (base side) of the join - the candidate pool searched for each row of this Dataset.
+   * @param rankingExpression
+   *   Scalar expression used to rank candidate rows.
+   * @param numResults
+   *   Maximum number of matches per query row. Must be between 1 and 100000.
+   * @param mode
+   *   Search algorithm contract. Must be one of: `approx`, `exact`. `approx` allows the optimizer
+   *   to use indexed or other approximate strategies when available; `exact` forces brute-force
+   *   evaluation and requires the ranking expression to be deterministic.
+   * @param direction
+   *   `"distance"` (smallest value first) or `"similarity"` (largest value first).
+   * @group untypedrel
+   * @since 4.2.0
+   */
+  def nearestByJoin(
+      right: Dataset[_],
+      rankingExpression: Column,
+      numResults: Int,
+      mode: String,
+      direction: String): DataFrame
+
+  /**
+   * Nearest-by top-K ranking join with another `DataFrame`.
+   *
+   * The current implementation evaluates the full cross-product of left and right and bounds
+   * memory per left row by `numResults`. Index-backed approximate strategies (transparent to
+   * `approx` mode) are planned for a future release; until then, pre-filter the right side when
+   * it is large. Tie-breaking among rows with equal ranking values is unspecified.
+   *
+   * @param right
+   *   Right (base side) of the join - the candidate pool searched for each row of this Dataset.
+   * @param rankingExpression
+   *   Scalar expression used to rank candidate rows.
+   * @param numResults
+   *   Maximum number of matches per query row. Must be between 1 and 100000.
+   * @param mode
+   *   Search algorithm contract. Must be one of: `approx`, `exact`. `approx` allows the optimizer
+   *   to use indexed or other approximate strategies when available; `exact` forces brute-force
+   *   evaluation and requires the ranking expression to be deterministic.
+   * @param direction
+   *   `"distance"` (smallest value first) or `"similarity"` (largest value first).
+   * @param joinType
+   *   Type of join to perform. Must be one of: `inner`, `leftouter`.
+   * @group untypedrel
+   * @since 4.2.0
+   */
+  def nearestByJoin(
+      right: Dataset[_],
+      rankingExpression: Column,
+      numResults: Int,
+      mode: String,
+      direction: String,
+      joinType: String): DataFrame
 
   protected def sortInternal(global: Boolean, sortExprs: Seq[Column]): Dataset[T]
 
@@ -1425,7 +1517,7 @@ abstract class Dataset[T] extends Serializable {
    *   ds.groupingSets(Seq(Seq($"department", $"group"), Seq()), $"department", $"group").avg()
    *
    *   // Compute the max age and average salary, group by specific grouping sets.
-   *   ds.groupingSets(Seq($"department", $"gender"), Seq()), $"department", $"group").agg(Map(
+   *   ds.groupingSets(Seq(Seq($"department", $"gender"), Seq()), $"department", $"group").agg(Map(
    *     "salary" -> "avg",
    *     "age" -> "max"
    *   ))
@@ -2011,6 +2103,37 @@ abstract class Dataset[T] extends Serializable {
   def exceptAll(other: Dataset[T]): Dataset[T]
 
   /**
+   * Returns a new `Dataset` by appending a column containing consecutive 0-based Long indices,
+   * similar to `RDD.zipWithIndex()`.
+   *
+   * The index column is appended as the last column of the resulting `DataFrame`.
+   *
+   * @group untypedrel
+   * @since 4.2.0
+   */
+  def zipWithIndex(): DataFrame = zipWithIndex("index")
+
+  /**
+   * Returns a new `Dataset` by appending a column containing consecutive 0-based Long indices,
+   * similar to `RDD.zipWithIndex()`.
+   *
+   * The index column is appended as the last column of the resulting `DataFrame`.
+   *
+   * @note
+   *   If a column with `indexColName` already exists in the schema, the resulting `DataFrame`
+   *   will have duplicate column names. Selecting the duplicate column by name will throw
+   *   `AMBIGUOUS_REFERENCE`, and writing the `DataFrame` will throw `COLUMN_ALREADY_EXISTS`.
+   *
+   * @param indexColName
+   *   The name of the index column to append.
+   * @group untypedrel
+   * @since 4.2.0
+   */
+  def zipWithIndex(indexColName: String): DataFrame = {
+    select(col("*"), Column.internalFn("distributed_sequence_id").alias(indexColName))
+  }
+
+  /**
    * Returns a new [[Dataset]] by sampling a fraction of rows (without replacement), using a
    * user-supplied seed.
    *
@@ -2290,7 +2413,9 @@ abstract class Dataset[T] extends Serializable {
   def withColumnsRenamed(colsMap: util.Map[String, String]): DataFrame =
     withColumnsRenamed(colsMap.asScala.toMap)
 
-  protected def withColumnsRenamed(colNames: Seq[String], newColNames: Seq[String]): DataFrame
+  protected[spark] def withColumnsRenamed(
+      colNames: Seq[String],
+      newColNames: Seq[String]): DataFrame
 
   /**
    * Returns a new Dataset by updating an existing column with metadata.
@@ -2968,6 +3093,20 @@ abstract class Dataset[T] extends Serializable {
   }
 
   /**
+   * Repartition the Dataset into the given number of partitions using the specified partition ID
+   * expression.
+   *
+   * @param numPartitions
+   *   the number of partitions to use.
+   * @param partitionIdExpr
+   *   the expression to be used as the partition ID. Must be an integer type.
+   *
+   * @group typedrel
+   * @since 4.1.0
+   */
+  def repartitionById(numPartitions: Int, partitionIdExpr: Column): Dataset[T]
+
+  /**
    * Returns a new Dataset that has exactly `numPartitions` partitions, when the fewer partitions
    * are requested. If a larger number of partitions is requested, it will stay at the current
    * number of partitions. Similar to coalesce defined on an `RDD`, this operation results in a
@@ -3004,6 +3143,8 @@ abstract class Dataset[T] extends Serializable {
   /**
    * Persist this Dataset with the default storage level (`MEMORY_AND_DISK`).
    *
+   * @note
+   *   Cached data is shared across all Spark sessions on the cluster.
    * @group basic
    * @since 1.6.0
    */
@@ -3012,6 +3153,8 @@ abstract class Dataset[T] extends Serializable {
   /**
    * Persist this Dataset with the default storage level (`MEMORY_AND_DISK`).
    *
+   * @note
+   *   Cached data is shared across all Spark sessions on the cluster.
    * @group basic
    * @since 1.6.0
    */
@@ -3023,6 +3166,8 @@ abstract class Dataset[T] extends Serializable {
    * @param newLevel
    *   One of: `MEMORY_ONLY`, `MEMORY_AND_DISK`, `MEMORY_ONLY_SER`, `MEMORY_AND_DISK_SER`,
    *   `DISK_ONLY`, `MEMORY_ONLY_2`, `MEMORY_AND_DISK_2`, etc.
+   * @note
+   *   Cached data is shared across all Spark sessions on the cluster.
    * @group basic
    * @since 1.6.0
    */
@@ -3042,6 +3187,9 @@ abstract class Dataset[T] extends Serializable {
    *
    * @param blocking
    *   Whether to block until all blocks are deleted.
+   * @note
+   *   Cached data is shared across all Spark sessions on the cluster, so unpersisting it affects
+   *   all sessions.
    * @group basic
    * @since 1.6.0
    */
@@ -3051,6 +3199,9 @@ abstract class Dataset[T] extends Serializable {
    * Mark the Dataset as non-persistent, and remove all blocks for it from memory and disk. This
    * will not un-persist any cached data that is built upon this Dataset.
    *
+   * @note
+   *   Cached data is shared across all Spark sessions on the cluster, so unpersisting it affects
+   *   all sessions.
    * @group basic
    * @since 1.6.0
    */

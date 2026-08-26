@@ -25,7 +25,7 @@ import org.apache.spark.sql.catalyst.catalog.{BucketSpec, ClusterBySpec}
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
-import org.apache.spark.sql.catalyst.util.{quoteIfNeeded, QuotingUtils}
+import org.apache.spark.sql.catalyst.util.{quoteIfNeeded, quoteNameParts, removeInternalMetadata, QuotingUtils}
 import org.apache.spark.sql.connector.expressions.{BucketTransform, ClusterByTransform, FieldReference, IdentityTransform, LogicalExpressions, Transform}
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.types.StructType
@@ -105,14 +105,14 @@ private[sql] object CatalogV2Implicits {
       case tableCatalog: TableCatalog =>
         tableCatalog
       case _ =>
-        throw QueryCompilationErrors.missingCatalogAbilityError(plugin, "tables")
+        throw QueryCompilationErrors.missingCatalogTablesAbilityError(plugin)
     }
 
     def asNamespaceCatalog: SupportsNamespaces = plugin match {
       case namespaceCatalog: SupportsNamespaces =>
         namespaceCatalog
       case _ =>
-        throw QueryCompilationErrors.missingCatalogAbilityError(plugin, "namespaces")
+        throw QueryCompilationErrors.missingCatalogNamespacesAbilityError(plugin)
     }
 
     def isFunctionCatalog: Boolean = plugin match {
@@ -124,14 +124,14 @@ private[sql] object CatalogV2Implicits {
       case functionCatalog: FunctionCatalog =>
         functionCatalog
       case _ =>
-        throw QueryCompilationErrors.missingCatalogAbilityError(plugin, "functions")
+        throw QueryCompilationErrors.missingCatalogFunctionsAbilityError(plugin)
     }
 
     def asProcedureCatalog: ProcedureCatalog = plugin match {
         case procedureCatalog: ProcedureCatalog =>
           procedureCatalog
         case _ =>
-          throw QueryCompilationErrors.missingCatalogAbilityError(plugin, "procedures")
+          throw QueryCompilationErrors.missingCatalogProceduresAbilityError(plugin)
     }
   }
 
@@ -166,10 +166,19 @@ private[sql] object CatalogV2Implicits {
     def asMultipartIdentifier: Seq[String] = (ident.namespace :+ ident.name).toImmutableArraySeq
 
     def asTableIdentifier: TableIdentifier = ident.namespace match {
-      case ns if ns.isEmpty => TableIdentifier(ident.name)
       case Array(dbName) => TableIdentifier(ident.name, Some(dbName))
-      case _ => throw QueryCompilationErrors.identifierTooManyNamePartsError(original)
+      case _ =>
+        throw QueryCompilationErrors.requiresSinglePartNamespaceError(asMultipartIdentifier)
     }
+
+    // Build a v1 TableIdentifier for display / error-rendering purposes. Collapses a
+    // multi-part namespace to its last segment (v1 TableIdentifier has a single-string
+    // database field). Callers that need a lossless multi-part form should build a
+    // Seq[String] from toQualifiedNameParts instead.
+    def asLegacyTableIdentifier(catalogName: String): TableIdentifier = TableIdentifier(
+      table = ident.name(),
+      database = ident.namespace().lastOption,
+      catalog = Some(catalogName))
 
     /**
      * Tries to convert catalog identifier to the table identifier. Table identifier does not
@@ -192,9 +201,9 @@ private[sql] object CatalogV2Implicits {
     }
 
     def asFunctionIdentifier: FunctionIdentifier = ident.namespace() match {
-      case ns if ns.isEmpty => FunctionIdentifier(ident.name())
       case Array(dbName) => FunctionIdentifier(ident.name(), Some(dbName))
-      case _ => throw QueryCompilationErrors.identifierTooManyNamePartsError(original)
+      case _ =>
+        throw QueryCompilationErrors.requiresSinglePartNamespaceError(asMultipartIdentifier)
     }
 
     def toQualifiedNameParts(catalog: CatalogPlugin): Seq[String] = {
@@ -223,6 +232,8 @@ private[sql] object CatalogV2Implicits {
 
     def quoted: String = parts.map(quoteIfNeeded).mkString(".")
 
+    def fullyQuoted: String = quoteNameParts(parts)
+
     def original: String = parts.mkString(".")
   }
 
@@ -241,6 +252,15 @@ private[sql] object CatalogV2Implicits {
   implicit class ColumnsHelper(columns: Array[Column]) {
     def asSchema: StructType = CatalogV2Util.v2ColumnsToStructType(columns)
     def toAttributes: Seq[AttributeReference] = DataTypeUtils.toAttributes(asSchema)
+
+    /**
+     * Same as [[toAttributes]], but strips the internal metadata that must not surface in a
+     * relation's output, such as generation expressions. Column IDs are the exception: although
+     * the key is listed in INTERNAL_METADATA_KEYS so that other paths drop it, the column-ID
+     * feature deliberately surfaces field IDs on a relation's output.
+     */
+    def toOutputAttributes: Seq[AttributeReference] =
+      DataTypeUtils.toAttributes(removeInternalMetadata(asSchema, keepFieldIds = true))
   }
 
   def parseColumnPath(name: String): Seq[String] = {

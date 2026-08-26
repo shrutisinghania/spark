@@ -16,23 +16,22 @@
 #
 
 import json
-from shutil import rmtree
 import tempfile
-import unittest
+from shutil import rmtree
 
 from pyspark.ml import Transformer
 from pyspark.ml.classification import (
     DecisionTreeClassifier,
-    FMClassifier,
     FMClassificationModel,
+    FMClassifier,
     LogisticRegression,
-    MultilayerPerceptronClassifier,
     MultilayerPerceptronClassificationModel,
+    MultilayerPerceptronClassifier,
     OneVsRest,
     OneVsRestModel,
 )
 from pyspark.ml.clustering import KMeans
-from pyspark.ml.feature import Binarizer, Bucketizer, HashingTF, PCA
+from pyspark.ml.feature import PCA, Binarizer, Bucketizer, HashingTF
 from pyspark.ml.linalg import Vectors
 from pyspark.ml.param import Params
 from pyspark.ml.pipeline import Pipeline, PipelineModel
@@ -512,12 +511,6 @@ class PersistenceTest(SparkSessionTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_persistence import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -15,14 +15,14 @@
 # limitations under the License.
 #
 
-import time
-from datetime import datetime
-import traceback
 import sys
+import time
+import traceback
+from datetime import datetime
 
 from py4j.java_gateway import is_instance_of
 
-from pyspark import SparkContext, RDD
+from pyspark import RDD, SparkContext
 
 
 class TransformFunction:
@@ -163,6 +163,6 @@ def rddToFileName(prefix, suffix, timestamp):
 if __name__ == "__main__":
     import doctest
 
-    (failure_count, test_count) = doctest.testmod()
+    failure_count, test_count = doctest.testmod()
     if failure_count:
         sys.exit(-1)

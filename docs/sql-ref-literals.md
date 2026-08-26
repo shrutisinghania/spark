@@ -36,7 +36,7 @@ A string literal is used to specify a character string value.
 #### Syntax
 
 ```sql
-[ r ] { 'char [ ... ]' | "char [ ... ]" }
+[ r ] { 'char [ ... ]' | "char [ ... ]" } [ ... ]
 ```
 
 #### Parameters
@@ -64,6 +64,10 @@ The following escape sequences are recognized in regular string literals (withou
 - `\<other char>` -> `<other char>`, skip the slash and leave the character as is.
 
 The unescaping rules above can be turned off by setting the SQL config `spark.sql.parser.escapedStringLiterals` to `true`.
+
+Chains of string literals are coalesced into a single string literal.
+This can be useful when constructing strings that are too long to fit on a single line.
+It also allows mixing of string literals and parameter marker into a single string literal.
 
 #### Examples
 
@@ -95,6 +99,20 @@ SELECT r"'\n' represents newline character." AS col;
 +----------------------------------+
 |'\n' represents newline character.|
 +----------------------------------+
+
+SELECT 'Hello' ',' 'World!' AS col;
++-------------+
+|          col|
++-------------+
+|Hello, World!|
++-------------+
+
+EXECUTE IMMEDIATE 'SELECT "Hello, " :p "!" AS col' USING 'World' AS p;
++-------------+
+|          col|
++-------------+
+|Hello, World!|
++-------------+
 ```
 
 ### Binary Literal
@@ -415,7 +433,7 @@ SELECT DATE '2011-11-11' AS col;
 ```sql
 TIME { '[h]h:[m]m[:]' |
        '[h]h:[m]m:[s]s[.]' |
-       '[h]h:[m]m:[s]s.[ms][ms][ms][us][us][us]'}
+       '[h]h:[m]m:[s]s.[ms][ms][ms][us][us][us][ns][ns][ns]'}
 ```
 **Note:** defaults to `00` if hour, minute or second is not specified.
 
@@ -446,6 +464,12 @@ SELECT TIME'23:59:59.999999' as col;
 +---------------+
 |23:59:59.999999|
 +---------------+
+SELECT TIME'23:59:59.999999999' as col;
++------------------+
+|col               |
++------------------+
+|23:59:59.999999999|
++------------------+
 ```
 
 #### Timestamp Syntax

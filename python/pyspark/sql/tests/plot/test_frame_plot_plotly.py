@@ -21,10 +21,10 @@ from datetime import datetime
 from pyspark.errors import PySparkTypeError, PySparkValueError
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 from pyspark.testing.utils import (
-    have_plotly,
-    plotly_requirement_message,
     have_pandas,
+    have_plotly,
     pandas_requirement_message,
+    plotly_requirement_message,
 )
 
 if have_plotly and have_pandas:
@@ -517,12 +517,6 @@ class DataFramePlotPlotlyTests(DataFramePlotPlotlyTestsMixin, ReusedSQLTestCase)
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.plot.test_frame_plot_plotly import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -18,44 +18,59 @@
 """
 Base and utility classes for pandas-on-Spark objects.
 """
+
 import warnings
 from abc import ABCMeta, abstractmethod
-from functools import wraps, partial
+from functools import partial, wraps
 from itertools import chain
-from typing import Any, Callable, Optional, Sequence, Tuple, Union, cast, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Sequence, Tuple, Union, cast
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_list_like, CategoricalDtype  # type: ignore[attr-defined]
+from pandas.api.types import CategoricalDtype, is_list_like
 
-from pyspark.sql import functions as F, Column, Window
-from pyspark.sql.types import LongType, BooleanType, NumericType
 from pyspark import pandas as ps  # For running doctests and reference resolution in PyCharm.
 from pyspark.pandas._typing import Axis, Dtype, IndexOpsLike, Label, SeriesOrIndex
 from pyspark.pandas.config import get_option, option_context
+from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.internal import (
-    InternalField,
-    InternalFrame,
     NATURAL_ORDER_COLUMN_NAME,
     SPARK_DEFAULT_INDEX_NAME,
+    InternalField,
+    InternalFrame,
 )
 from pyspark.pandas.spark.accessors import SparkIndexOpsMethods
-from pyspark.pandas.typedef import extension_dtypes
+from pyspark.pandas.typedef.typehints import handle_dtype_as_extension_dtype
 from pyspark.pandas.utils import (
+    ERROR_MESSAGE_CANNOT_COMBINE,
     ansi_mode_context,
     combine_frames,
     same_anchor,
     scol_for,
     validate_axis,
-    ERROR_MESSAGE_CANNOT_COMBINE,
 )
-from pyspark.pandas.frame import DataFrame
+from pyspark.sql import Column, Window
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    BinaryType,
+    BooleanType,
+    CharType,
+    DataType,
+    DateType,
+    DayTimeIntervalType,
+    LongType,
+    NumericType,
+    StringType,
+    TimestampNTZType,
+    TimestampType,
+    TimeType,
+    VarcharType,
+)
 
 if TYPE_CHECKING:
-    from pyspark.sql._typing import ColumnOrName
-
     from pyspark.pandas.data_type_ops.base import DataTypeOps
     from pyspark.pandas.series import Series
+    from pyspark.sql._typing import ColumnOrName
 
 
 def should_alignment_for_column_op(self: SeriesOrIndex, other: SeriesOrIndex) -> bool:
@@ -118,9 +133,11 @@ def align_diff_index_ops(
                     column_op(func)(
                         this_index_ops.to_series().reset_index(drop=True),
                         *[
-                            arg.to_series().reset_index(drop=True)
-                            if isinstance(arg, Index)
-                            else arg
+                            (
+                                arg.to_series().reset_index(drop=True)
+                                if isinstance(arg, Index)
+                                else arg
+                            )
                             for arg in args
                         ],
                     ).sort_index(),
@@ -228,7 +245,7 @@ def column_op(f: Callable[..., Column]) -> Callable[..., SeriesOrIndex]:
             field = InternalField.from_struct_field(
                 self._internal.spark_frame.select(scol).schema[0],
                 use_extension_dtypes=any(
-                    isinstance(col.dtype, extension_dtypes) for col in [self] + cols
+                    handle_dtype_as_extension_dtype(col.dtype) for col in [self] + cols
                 ),
             )
 
@@ -278,11 +295,46 @@ def _exclude_pd_np_operand(other: Any) -> None:
         )
 
 
+def _is_value_type_compatible(value: Any, spark_type: DataType) -> bool:
+    """Check if a Python value's type is compatible with a Spark column type for isin matching.
+
+    Pandas isin() uses strict type matching: an integer 1 never matches a string "1".
+    However, numeric types (int, float, bool) are cross-compatible, matching Python semantics
+    where bool is a subclass of int and int/float compare equal when values match.
+    """
+    import datetime
+    import decimal
+
+    if isinstance(spark_type, NumericType):
+        return isinstance(value, (int, float, bool, decimal.Decimal, np.number))
+    if isinstance(spark_type, BooleanType):
+        return isinstance(value, (bool, np.bool_, int, float, np.number))
+    if isinstance(spark_type, (StringType, CharType, VarcharType)):
+        return isinstance(value, str)
+    if isinstance(spark_type, BinaryType):
+        return isinstance(value, (bytes, bytearray))
+    if isinstance(spark_type, (TimestampType, TimestampNTZType)):
+        return isinstance(value, (datetime.datetime, pd.Timestamp))
+    if isinstance(spark_type, DateType):
+        return isinstance(value, (datetime.date, pd.Timestamp))
+    if isinstance(spark_type, TimeType):
+        return isinstance(value, datetime.time)
+    if isinstance(spark_type, DayTimeIntervalType):
+        return isinstance(value, datetime.timedelta)
+    # For complex types (ArrayType, MapType, StructType) and other exotic types
+    # (VariantType, spatial types, YearMonthIntervalType, CalendarIntervalType),
+    # skip filtering and let Spark handle type resolution.
+    return True
+
+
 class IndexOpsMixin(object, metaclass=ABCMeta):
     """common ops mixin to support a unified interface / docs for Series / Index
 
     Assuming there are following attributes or properties and functions.
     """
+
+    # Keep pandas-on-Spark above pandas Series and Index for reflected ops.
+    __pandas_priority__: ClassVar[int] = pd.Series.__pandas_priority__ + 500  # type: ignore[attr-defined]
 
     @property
     @abstractmethod
@@ -490,12 +542,14 @@ class IndexOpsMixin(object, metaclass=ABCMeta):
     # NDArray Compat
     def __array_ufunc__(
         self, ufunc: Callable, method: str, *inputs: Any, **kwargs: Any
-    ) -> SeriesOrIndex:
+    ) -> Union[SeriesOrIndex, Tuple[SeriesOrIndex, SeriesOrIndex]]:
         from pyspark.pandas import numpy_compat
 
-        # Try dunder methods first.
-        result = numpy_compat.maybe_dispatch_ufunc_to_dunder_op(
-            self, ufunc, method, *inputs, **kwargs
+        # Try dunder methods first. A multi-output ufunc (for example np.modf) yields a
+        # 2-tuple of results rather than a single Series or Index, so both `result` and this
+        # method's return type must admit that tuple.
+        result: Union[SeriesOrIndex, Tuple[SeriesOrIndex, SeriesOrIndex]] = (
+            numpy_compat.maybe_dispatch_ufunc_to_dunder_op(self, ufunc, method, *inputs, **kwargs)
         )
 
         # After that, we try with PySpark APIs.
@@ -505,7 +559,7 @@ class IndexOpsMixin(object, metaclass=ABCMeta):
             )
 
         if result is not NotImplemented:
-            return cast(SeriesOrIndex, result)
+            return result
         else:
             # TODO: support more APIs?
             raise NotImplementedError(
@@ -924,12 +978,19 @@ class IndexOpsMixin(object, metaclass=ABCMeta):
             cast(np.ndarray, values).tolist() if isinstance(values, np.ndarray) else list(values)
         )
 
-        other = [F.lit(v) for v in values]
-        scol = self.spark.column.isin(other)
+        spark_type = self._internal.data_fields[0].spark_type
+        compatible = [
+            F.lit(v).cast(spark_type) for v in values if _is_value_type_compatible(v, spark_type)
+        ]
+        scol = (
+            F.coalesce(self.spark.column.isin(compatible), F.lit(False))
+            if compatible
+            else F.lit(False)
+        )
         field = self._internal.data_fields[0].copy(
             dtype=np.dtype("bool"), spark_type=BooleanType(), nullable=False
         )
-        return self._with_new_scol(scol=F.coalesce(scol, F.lit(False)), field=field)
+        return self._with_new_scol(scol=scol, field=field)
 
     def isnull(self: IndexOpsLike) -> IndexOpsLike:
         """
@@ -1394,8 +1455,8 @@ class IndexOpsMixin(object, metaclass=ABCMeta):
         3    1
         Name: count, dtype: int64
         """
-        from pyspark.pandas.series import first_series
         from pyspark.pandas.indexes.multi import MultiIndex
+        from pyspark.pandas.series import first_series
 
         if bins is not None:
             raise NotImplementedError("value_counts currently does not support bins")
@@ -1449,7 +1510,7 @@ class IndexOpsMixin(object, metaclass=ABCMeta):
         Parameters
         ----------
         dropna : bool, default True
-            Don’t include NaN in the count.
+            Don't include NaN in the count.
         approx: bool, default False
             If False, will use the exact algorithm and return the exact number of unique.
             If True, it uses the HyperLogLog approximate algorithm, which is significantly faster
@@ -1732,11 +1793,12 @@ class IndexOpsMixin(object, metaclass=ABCMeta):
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.base
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -1745,7 +1807,7 @@ def _test() -> None:
     spark = (
         SparkSession.builder.master("local[4]").appName("pyspark.pandas.base tests").getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.base,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

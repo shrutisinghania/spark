@@ -35,7 +35,7 @@ import org.apache.spark.sql.catalyst.util.{DateFormatter, DateTimeUtils, TimeFor
 import org.apache.spark.sql.catalyst.util.DateTimeUtils.localDateTimeToMicros
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.{PartitionPath => Partition}
-import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, FileTable}
+import org.apache.spark.sql.execution.datasources.v2.{ExtractV2Table, FileTable}
 import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -50,7 +50,7 @@ case class ParquetData(intField: Int, stringField: String)
 case class ParquetDataWithKey(intField: Int, pi: Int, stringField: String, ps: String)
 
 abstract class ParquetPartitionDiscoverySuite
-  extends QueryTest with ParquetTest with SharedSparkSession {
+  extends ParquetTest with SharedSparkSession {
   import PartitioningUtils._
   import testImplicits._
 
@@ -256,8 +256,38 @@ abstract class ParquetPartitionDiscoverySuite
     check("file://path/a=10/_temporary/c=1.5", None)
     check("file://path/a=10/c=1.5/_temporary", None)
 
-    checkThrows[AssertionError]("file://path/=10", "Empty partition column name")
-    checkThrows[AssertionError]("file://path/a=", "Empty partition column value")
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        parsePartition(new Path("file://path/=10"), true, Set.empty[Path], Map.empty, true,
+          timeZoneId, df, tf, tif)
+      },
+      condition = "EMPTY_PARTITION_COLUMN_NAME",
+      parameters = Map("columnSpec" -> "=10")
+    )
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        parsePartition(new Path("file://path/a="), true, Set.empty[Path], Map.empty, true,
+          timeZoneId, df, tf, tif)
+      },
+      condition = "EMPTY_PARTITION_COLUMN_VALUE",
+      parameters = Map("columnSpec" -> "a=")
+    )
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        parsePartition(new Path("file://path/a=1/=value"), true, Set.empty[Path], Map.empty, true,
+          timeZoneId, df, tf, tif)
+      },
+      condition = "EMPTY_PARTITION_COLUMN_NAME",
+      parameters = Map("columnSpec" -> "=value")
+    )
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        parsePartition(new Path("file://path/a=/b=1"), true, Set.empty[Path], Map.empty, true,
+          timeZoneId, df, tf, tif)
+      },
+      condition = "EMPTY_PARTITION_COLUMN_VALUE",
+      parameters = Map("columnSpec" -> "a=")
+    )
   }
 
   test("parse partition with base paths") {
@@ -1498,7 +1528,7 @@ class ParquetV2PartitionDiscoverySuite extends ParquetPartitionDiscoverySuite {
       (1 to 10).map(i => (i, i.toString)).toDF("a", "b").write.parquet(dir.getCanonicalPath)
       val queryExecution = spark.read.parquet(dir.getCanonicalPath).queryExecution
       queryExecution.analyzed.collectFirst {
-        case DataSourceV2Relation(fileTable: FileTable, _, _, _, _) =>
+        case ExtractV2Table(fileTable: FileTable) =>
           assert(fileTable.fileIndex.partitionSpec() === PartitionSpec.emptySpec)
       }.getOrElse {
         fail(s"Expecting a matching DataSourceV2Relation, but got:\n$queryExecution")

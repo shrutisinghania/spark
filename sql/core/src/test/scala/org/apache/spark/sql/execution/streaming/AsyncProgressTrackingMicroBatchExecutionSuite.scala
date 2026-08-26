@@ -18,7 +18,7 @@
 package org.apache.spark.sql.execution.streaming
 
 import java.io.File
-import java.util.concurrent.{CountDownLatch, Semaphore, TimeUnit}
+import java.util.concurrent.{CountDownLatch, ExecutionException, Semaphore, TimeUnit}
 
 import scala.collection.mutable.ListBuffer
 
@@ -26,17 +26,17 @@ import org.scalatest.BeforeAndAfter
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.time.{Seconds, Span}
 
-import org.apache.spark.TestUtils
+import org.apache.spark.{SparkIllegalArgumentException, TestUtils}
 import org.apache.spark.sql._
 import org.apache.spark.sql.connector.read.streaming
-import org.apache.spark.sql.execution.streaming.checkpointing.{AsyncCommitLog, AsyncOffsetSeqLog, OffsetSeq}
-import org.apache.spark.sql.execution.streaming.runtime.{AsyncProgressTrackingMicroBatchExecution, MemoryStream, StreamExecution}
+import org.apache.spark.sql.execution.streaming.checkpointing.{AsyncCommitLog, AsyncOffsetSeqLog, CommitMetadata, OffsetSeq}
+import org.apache.spark.sql.execution.streaming.runtime.{AsyncProgressTrackingMicroBatchExecution, LongOffset, MemoryStream, StreamExecution}
 import org.apache.spark.sql.execution.streaming.runtime.AsyncProgressTrackingMicroBatchExecution.{ASYNC_PROGRESS_TRACKING_CHECKPOINTING_INTERVAL_MS, ASYNC_PROGRESS_TRACKING_ENABLED, ASYNC_PROGRESS_TRACKING_OVERRIDE_SINK_SUPPORT_CHECK}
 import org.apache.spark.sql.functions.{column, window}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.{StreamingQuery, StreamingQueryException, StreamTest, Trigger}
 import org.apache.spark.sql.streaming.util.StreamManualClock
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{ErrorNotifier, ThreadUtils, Utils}
 
 class AsyncProgressTrackingMicroBatchExecutionSuite
   extends StreamTest with BeforeAndAfter with Matchers {
@@ -67,9 +67,9 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
 
   class MemoryStreamCapture[A: Encoder](
       id: Int,
-      sqlContext: SQLContext,
+      sparkSession: SparkSession,
       numPartitions: Option[Int] = None)
-    extends MemoryStream[A](id, sqlContext, numPartitions = numPartitions) {
+    extends MemoryStream[A](id, sparkSession, numPartitions = numPartitions) {
 
     val commits = new ListBuffer[streaming.Offset]()
     val commitThreads = new ListBuffer[Thread]()
@@ -136,7 +136,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   test("async WAL commits recovery") {
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
 
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDF()
 
     var index = 0
@@ -204,7 +204,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("async WAL commits turn on and off") {
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDS()
 
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
@@ -308,7 +308,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("Fail with once trigger") {
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDF()
 
     val e = intercept[IllegalArgumentException] {
@@ -323,7 +323,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
 
   test("Fail with available now trigger") {
 
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDF()
 
     val e = intercept[IllegalArgumentException] {
@@ -336,10 +336,55 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
     e.getMessage should equal("Async progress tracking cannot be used with AvailableNow trigger")
   }
 
+  test("Fail with streaming sink evolution enabled") {
+    val inputData = new MemoryStream[Int](id = 0, spark)
+    val ds = inputData.toDF()
+
+    // The sink is intentionally left unnamed: the combination is rejected before the execution is
+    // constructed, so the error does not depend on whether name() is set.
+    withSQLConf(SQLConf.ENABLE_STREAMING_SINK_EVOLUTION.key -> "true") {
+      val e = intercept[SparkIllegalArgumentException] {
+        ds.writeStream
+          .format("noop")
+          .option(ASYNC_PROGRESS_TRACKING_ENABLED, true)
+          .start()
+      }
+      checkError(
+        e,
+        condition = "STREAMING_QUERY_EVOLUTION_ERROR.ASYNC_PROGRESS_TRACKING_NOT_SUPPORTED",
+        parameters = Map.empty)
+    }
+  }
+
+  test("Succeed when only one of sink evolution / async progress tracking is enabled") {
+    val inputData = new MemoryStream[Int](id = 0, spark)
+    val ds = inputData.toDF()
+
+    // The guard must be narrow: it fires only when both configs are on. Verify that each config
+    // on its own still starts a query, so a future broadening of the condition is caught here.
+
+    // Async progress tracking on, sink evolution off (default).
+    val asyncOnly = ds.writeStream
+      .format("noop")
+      .option(ASYNC_PROGRESS_TRACKING_ENABLED, true)
+      .start()
+    try assert(asyncOnly.isActive) finally asyncOnly.stop()
+
+    // Sink evolution on, async progress tracking off. The sink must be named when sink evolution
+    // is enabled, otherwise the query is rejected before execution regardless of async tracking.
+    withSQLConf(SQLConf.ENABLE_STREAMING_SINK_EVOLUTION.key -> "true") {
+      val evolutionOnly = ds.writeStream
+        .format("noop")
+        .name("evolution_only_sink")
+        .start()
+      try assert(evolutionOnly.isActive) finally evolutionOnly.stop()
+    }
+  }
+
   test("switching between async wal commit enabled and trigger once") {
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
 
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDF()
 
     var index = 0
@@ -500,7 +545,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   test("switching between async wal commit enabled and available now") {
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
 
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDF()
 
     var index = 0
@@ -669,7 +714,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   def testAsyncWriteErrorsAlreadyExists(path: String): Unit = {
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDS()
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
 
@@ -720,7 +765,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   def testAsyncWriteErrorsPermissionsIssue(path: String): Unit = {
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDS()
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
     val commitDir = new File(checkpointLocation + path)
@@ -749,7 +794,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
               val e = intercept[StreamingQueryException] {
                 q.processAllAvailable()
               }
-              e.getCause.getCause.getMessage should include("Permission denied")
+              TestUtils.assertExceptionMsg(e, "Permission denied")
             }
         }
       )
@@ -774,11 +819,58 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
     testAsyncWriteErrorsPermissionsIssue("/commits")
   }
 
+  test("async log writes record first error and gate subsequent writes") {
+    val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
+    val offsetsDir = new File(checkpointLocation + "/offsets")
+    val commitsDir = checkpointLocation + "/commits"
+    offsetsDir.mkdirs()
+
+    val executor = ThreadUtils.newDaemonSingleThreadExecutor("async-log-write-test")
+    try {
+      val sharedNotifier = new ErrorNotifier()
+      val offsetLog = new AsyncOffsetSeqLog(
+        spark, offsetsDir.getAbsolutePath, executor, offsetCommitIntervalMs = 0,
+        errorNotifier = sharedNotifier)
+      val commitLog = new AsyncCommitLog(
+        spark, commitsDir, executor, errorNotifier = sharedNotifier)
+
+      offsetsDir.setReadOnly()
+      try {
+        val firstFuture = offsetLog.addAsync(0L, OffsetSeq.fill(LongOffset(0)))
+        val firstEx = intercept[ExecutionException] {
+          firstFuture.get(5, TimeUnit.SECONDS)
+        }
+        // In production this is done by the `.exceptionally` chain in
+        // AsyncProgressTrackingMicroBatchExecution.
+        sharedNotifier.markError(firstEx.getCause)
+        val firstError = sharedNotifier.getError().get
+
+        val commitFuture = commitLog.addAsync(0L, CommitMetadata())
+        val commitEx = intercept[ExecutionException] {
+          commitFuture.get(5, TimeUnit.SECONDS)
+        }
+        assert(commitEx.getCause eq firstError)
+        assert(getListOfFiles(commitsDir).isEmpty)
+
+        val secondOffsetFuture = offsetLog.addAsync(1L, OffsetSeq.fill(LongOffset(1)))
+        val secondOffsetEx = intercept[ExecutionException] {
+          secondOffsetFuture.get(5, TimeUnit.SECONDS)
+        }
+        assert(secondOffsetEx.getCause eq firstError)
+        assert(sharedNotifier.getError().contains(firstError))
+      } finally {
+        offsetsDir.setWritable(true)
+      }
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
   test("commit intervals happy path") {
 
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
 
-    val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStreamCapture[Int](id = 0, spark)
 
     val ds = inputData.toDF()
 
@@ -835,7 +927,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
     val offsetLog = new AsyncOffsetSeqLog(ds.sparkSession, checkpointLocation + "/offsets", null, 0)
     // commits received at source should match up to the ones found in the offset log
     for (i <- 0 until inputData.commits.length) {
-      val offsetOnDisk: OffsetSeq = offsetLog.get(offsetLogFiles(i)).get
+      val offsetOnDisk = offsetLog.get(offsetLogFiles(i)).get
 
       val sourceCommittedOffset: streaming.Offset = inputData.commits(i)
 
@@ -852,7 +944,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("interval commits and recovery") {
-    val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStreamCapture[Int](id = 0, spark)
     val ds = inputData.toDS()
 
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
@@ -934,7 +1026,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("recovery when first offset is not zero and not commit log entries") {
-    val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStreamCapture[Int](id = 0, spark)
     val ds = inputData.toDS()
 
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
@@ -961,7 +1053,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
     /**
      * start new stream
      */
-    val inputData2 = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData2 = new MemoryStreamCapture[Int](id = 0, spark)
     val ds2 = inputData2.toDS()
     testStream(ds2, extraOptions = Map(
       ASYNC_PROGRESS_TRACKING_ENABLED -> "true",
@@ -995,7 +1087,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("recovery non-contiguous log") {
-    val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStreamCapture[Int](id = 0, spark)
     val ds = inputData.toDS()
 
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
@@ -1088,7 +1180,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("Fail on pipelines using unsupported sinks") {
-    val inputData = new MemoryStream[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStream[Int](id = 0, spark)
     val ds = inputData.toDF()
 
     val e = intercept[IllegalArgumentException] {
@@ -1109,7 +1201,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
 
     withSQLConf(SQLConf.MIN_BATCHES_TO_RETAIN.key -> "2", SQLConf.ASYNC_LOG_PURGE.key -> "false") {
       withTempDir { checkpointLocation =>
-        val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+        val inputData = new MemoryStreamCapture[Int](id = 0, spark)
         val ds = inputData.toDS()
 
         val clock = new StreamManualClock
@@ -1243,7 +1335,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   test("with async log purging") {
     withSQLConf(SQLConf.MIN_BATCHES_TO_RETAIN.key -> "2", SQLConf.ASYNC_LOG_PURGE.key -> "true") {
       withTempDir { checkpointLocation =>
-        val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+        val inputData = new MemoryStreamCapture[Int](id = 0, spark)
         val ds = inputData.toDS()
 
         val clock = new StreamManualClock
@@ -1381,7 +1473,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("test multiple gaps in offset and commit logs") {
-    val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStreamCapture[Int](id = 0, spark)
     val ds = inputData.toDS()
 
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
@@ -1427,7 +1519,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
     /**
      * start new stream
      */
-    val inputData2 = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData2 = new MemoryStreamCapture[Int](id = 0, spark)
     val ds2 = inputData2.toDS()
     testStream(ds2, extraOptions = Map(
       ASYNC_PROGRESS_TRACKING_ENABLED -> "true",
@@ -1460,7 +1552,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
   }
 
   test("recovery when gaps exist in offset and commit log") {
-    val inputData = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData = new MemoryStreamCapture[Int](id = 0, spark)
     val ds = inputData.toDS()
 
     val checkpointLocation = Utils.createTempDir(namePrefix = "streaming.metadata").getCanonicalPath
@@ -1494,7 +1586,7 @@ class AsyncProgressTrackingMicroBatchExecutionSuite
     /**
      * start new stream
      */
-    val inputData2 = new MemoryStreamCapture[Int](id = 0, sqlContext = sqlContext)
+    val inputData2 = new MemoryStreamCapture[Int](id = 0, spark)
     val ds2 = inputData2.toDS()
     testStream(ds2, extraOptions = Map(
       ASYNC_PROGRESS_TRACKING_ENABLED -> "true",

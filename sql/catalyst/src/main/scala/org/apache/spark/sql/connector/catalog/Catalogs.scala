@@ -22,6 +22,7 @@ import java.util
 import java.util.regex.Pattern
 
 import org.apache.spark.SparkException
+import org.apache.spark.internal.config.ConfigReader
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
@@ -63,6 +64,7 @@ private[sql] object Catalogs {
       }
       val plugin = pluginClass.getDeclaredConstructor().newInstance().asInstanceOf[CatalogPlugin]
       plugin.initialize(name, catalogOptions(name, conf))
+      validateRelationCatalog(name, plugin)
       plugin
     } catch {
       case e: ClassNotFoundException =>
@@ -93,11 +95,34 @@ private[sql] object Catalogs {
   private def catalogOptions(name: String, conf: SQLConf) = {
     val prefix = Pattern.compile("^spark\\.sql\\.catalog\\." + name + "\\.(.+)")
     val options = new util.HashMap[String, String]
+    val reader = new ConfigReader(options)
     conf.getAllConfs.foreach {
       case (key, value) =>
         val matcher = prefix.matcher(key)
-        if (matcher.matches && matcher.groupCount > 0) options.put(matcher.group(1), value)
+        if (matcher.matches && matcher.groupCount > 0) {
+          // pass config entries through default ConfigReader mechanics,
+          // substituting prefixes from bindings: ${env:XYZ} -> sys.env.get("XYZ")
+          options.put(matcher.group(1), reader.substitute(value))
+        }
     }
     new CaseInsensitiveStringMap(options)
+  }
+
+  /**
+   * Reject catalogs that implement both [[TableCatalog]] and [[ViewCatalog]] without
+   * extending [[RelationCatalog]]. The combined case has cross-cutting rules (single namespace,
+   * cross-type collision rejection, perf opt-ins) that live on [[RelationCatalog]]; implementing
+   * the two interfaces directly would skip that contract.
+   */
+  private def validateRelationCatalog(name: String, plugin: CatalogPlugin): Unit = {
+    if (plugin.isInstanceOf[TableCatalog] && plugin.isInstanceOf[ViewCatalog] &&
+        !plugin.isInstanceOf[RelationCatalog]) {
+      throw new IllegalArgumentException(
+        s"Catalog '$name' (${plugin.getClass.getName}) implements both TableCatalog and " +
+          s"ViewCatalog directly. Catalogs that expose both tables and views must implement " +
+          s"RelationCatalog instead, which centralizes the cross-cutting rules (shared " +
+          s"identifier namespace, cross-type collision rejection, single-RPC perf entry " +
+          s"points).")
+    }
   }
 }

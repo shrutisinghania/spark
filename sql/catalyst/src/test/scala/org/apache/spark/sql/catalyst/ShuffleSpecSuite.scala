@@ -19,11 +19,15 @@ package org.apache.spark.sql.catalyst
 
 import org.apache.spark.{SparkFunSuite, SparkUnsupportedOperationException}
 import org.apache.spark.sql.catalyst.dsl.expressions._
+import org.apache.spark.sql.catalyst.expressions.DirectShufflePartitionID
 import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.internal.SQLConf
 
 class ShuffleSpecSuite extends SparkFunSuite with SQLHelper {
+  private val passThrough_a_10 = ShufflePartitionIdPassThrough(DirectShufflePartitionID($"a"), 10)
+  private val passThrough_b_10 = ShufflePartitionIdPassThrough(DirectShufflePartitionID($"b"), 10)
+  private val passThrough_c_10 = ShufflePartitionIdPassThrough(DirectShufflePartitionID($"c"), 10)
   protected def checkCompatible(
       left: ShuffleSpec,
       right: ShuffleSpec,
@@ -449,6 +453,66 @@ class ShuffleSpecSuite extends SparkFunSuite with SQLHelper {
     )
   }
 
+  test("compatibility: NullAwareHashShuffleSpec") {
+    val spreadAB = ClusteredDistribution(Seq($"a", $"b"), allowNullKeySpreading = true)
+    val spreadCD = ClusteredDistribution(Seq($"c", $"d"), allowNullKeySpreading = true)
+    val regularAB = ClusteredDistribution(Seq($"a", $"b"))
+
+    val nullAwareAB = NullAwareHashShuffleSpec(
+      NullAwareHashPartitioning(Seq($"a", $"b"), 10), spreadAB)
+    val nullAwareCD = NullAwareHashShuffleSpec(
+      NullAwareHashPartitioning(Seq($"c", $"d"), 10), spreadCD)
+    val regularABSpec = HashShuffleSpec(
+      HashPartitioning(Seq($"a", $"b"), 10), regularAB)
+    val spreadABHashSpec = HashShuffleSpec(
+      HashPartitioning(Seq($"a", $"b"), 10), spreadAB)
+
+    checkCompatible(nullAwareAB, nullAwareCD, expected = true)
+    checkCompatible(nullAwareAB, SinglePartitionShuffleSpec, expected = false)
+    checkCompatible(
+      NullAwareHashShuffleSpec(NullAwareHashPartitioning(Seq($"a", $"b"), 1), spreadAB),
+      SinglePartitionShuffleSpec,
+      expected = true)
+    checkCompatible(nullAwareAB, regularABSpec, expected = false)
+    checkCompatible(nullAwareAB, spreadABHashSpec, expected = true)
+    checkCompatible(spreadABHashSpec, nullAwareAB, expected = true)
+  }
+
+  test("canCreatePartitioning: NullAwareHashShuffleSpec") {
+    val spreadDistribution =
+      ClusteredDistribution(Seq($"a", $"b"), allowNullKeySpreading = true)
+    val partialSpec = NullAwareHashShuffleSpec(
+      NullAwareHashPartitioning(Seq($"a"), 10), spreadDistribution)
+    val fullSpec = NullAwareHashShuffleSpec(
+      NullAwareHashPartitioning(Seq($"a", $"b"), 10), spreadDistribution)
+
+    withSQLConf(SQLConf.REQUIRE_ALL_CLUSTER_KEYS_FOR_CO_PARTITION.key -> "false") {
+      assert(partialSpec.canCreatePartitioning)
+    }
+    withSQLConf(SQLConf.REQUIRE_ALL_CLUSTER_KEYS_FOR_CO_PARTITION.key -> "true") {
+      assert(!partialSpec.canCreatePartitioning)
+      assert(fullSpec.canCreatePartitioning)
+    }
+  }
+
+  test("createPartitioning: NullAwareHashShuffleSpec") {
+    checkCreatePartitioning(
+      NullAwareHashShuffleSpec(
+        NullAwareHashPartitioning(Seq($"a"), 10),
+        ClusteredDistribution(Seq($"a", $"b"), allowNullKeySpreading = true)),
+      ClusteredDistribution(Seq($"c", $"d"), allowNullKeySpreading = true),
+      NullAwareHashPartitioning(Seq($"c"), 10)
+    )
+
+    checkCreatePartitioning(
+      HashShuffleSpec(
+        HashPartitioning(Seq($"a"), 10),
+        ClusteredDistribution(Seq($"a", $"b"), allowNullKeySpreading = true)),
+      ClusteredDistribution(Seq($"c", $"d"), allowNullKeySpreading = true),
+      NullAwareHashPartitioning(Seq($"c"), 10)
+    )
+  }
+
   test("createPartitioning: other specs") {
     val distribution = ClusteredDistribution(Seq($"a", $"b"))
     checkCreatePartitioning(SinglePartitionShuffleSpec,
@@ -478,5 +542,64 @@ class ShuffleSpecSuite extends SparkFunSuite with SQLHelper {
       parameters = Map(
         "methodName" -> "createPartitioning$",
         "className" -> "org.apache.spark.sql.catalyst.plans.physical.ShuffleSpec"))
+  }
+
+  test("compatibility: ShufflePartitionIdPassThroughSpec on both sides") {
+    val ab = ClusteredDistribution(Seq($"a", $"b"))
+    val cd = ClusteredDistribution(Seq($"c", $"d"))
+
+    // Identical specs should be compatible
+    checkCompatible(
+      passThrough_a_10.createShuffleSpec(ab),
+      passThrough_c_10.createShuffleSpec(cd),
+      expected = true
+    )
+
+    // Different number of partitions should be incompatible
+    checkCompatible(
+      passThrough_a_10.createShuffleSpec(ab),
+      ShufflePartitionIdPassThrough(DirectShufflePartitionID($"c"), 5).createShuffleSpec(cd),
+      expected = false
+    )
+
+    // Mismatched key positions should be incompatible
+    checkCompatible(
+      passThrough_b_10.createShuffleSpec(ab),
+      passThrough_c_10.createShuffleSpec(cd),
+      expected = false
+    )
+
+    // Mismatched clustering keys
+    checkCompatible(
+      passThrough_a_10.createShuffleSpec(ClusteredDistribution(Seq($"e", $"b"))),
+      passThrough_c_10.createShuffleSpec(ab),
+      expected = false
+    )
+  }
+
+  test("compatibility: ShufflePartitionIdPassThroughSpec vs other specs") {
+    val ab = ClusteredDistribution(Seq($"a", $"b"))
+    val cd = ClusteredDistribution(Seq($"c", $"d"))
+
+    // Compatibility with SinglePartitionShuffleSpec when numPartitions is 1
+    checkCompatible(
+      ShufflePartitionIdPassThrough(DirectShufflePartitionID($"a"), 1).createShuffleSpec(ab),
+      SinglePartitionShuffleSpec,
+      expected = true
+    )
+
+    // Incompatible with SinglePartitionShuffleSpec when numPartitions > 1
+    checkCompatible(
+      passThrough_a_10.createShuffleSpec(ab),
+      SinglePartitionShuffleSpec,
+      expected = false
+    )
+
+    // Incompatible with HashShuffleSpec
+    checkCompatible(
+      passThrough_a_10.createShuffleSpec(ab),
+      HashShuffleSpec(HashPartitioning(Seq($"c"), 10), cd),
+      expected = false
+    )
   }
 }

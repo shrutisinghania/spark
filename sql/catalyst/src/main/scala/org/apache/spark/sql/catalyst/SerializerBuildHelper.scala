@@ -22,11 +22,12 @@ import scala.language.existentials
 import org.apache.spark.sql.catalyst.{expressions => exprs}
 import org.apache.spark.sql.catalyst.DeserializerBuildHelper.expressionWithNullSafety
 import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoder, AgnosticEncoders, AgnosticExpressionPathEncoder, Codec, JavaSerializationCodec, KryoSerializationCodec}
-import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{ArrayEncoder, BoxedBooleanEncoder, BoxedByteEncoder, BoxedDoubleEncoder, BoxedFloatEncoder, BoxedIntEncoder, BoxedLeafEncoder, BoxedLongEncoder, BoxedShortEncoder, CharEncoder, DateEncoder, DayTimeIntervalEncoder, InstantEncoder, IterableEncoder, JavaBeanEncoder, JavaBigIntEncoder, JavaDecimalEncoder, JavaEnumEncoder, LocalDateEncoder, LocalDateTimeEncoder, LocalTimeEncoder, MapEncoder, OptionEncoder, PrimitiveLeafEncoder, ProductEncoder, ScalaBigIntEncoder, ScalaDecimalEncoder, ScalaEnumEncoder, StringEncoder, TimestampEncoder, TransformingEncoder, UDTEncoder, VarcharEncoder, YearMonthIntervalEncoder}
+import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{ArrayEncoder, BoxedBooleanEncoder, BoxedByteEncoder, BoxedDoubleEncoder, BoxedFloatEncoder, BoxedIntEncoder, BoxedLeafEncoder, BoxedLongEncoder, BoxedShortEncoder, CharEncoder, DateEncoder, DayTimeIntervalEncoder, GeographyEncoder, GeometryEncoder, InstantEncoder, IterableEncoder, JavaBeanEncoder, JavaBigIntEncoder, JavaDecimalEncoder, JavaEnumEncoder, LocalDateEncoder, LocalDateTimeEncoder, MapEncoder, OptionEncoder, PrimitiveLeafEncoder, ProductEncoder, ScalaBigIntEncoder, ScalaDecimalEncoder, ScalaEnumEncoder, StringEncoder, TimestampEncoder, TransformingEncoder, UDTEncoder, VarcharEncoder, YearMonthIntervalEncoder}
 import org.apache.spark.sql.catalyst.encoders.EncoderUtils.{externalDataTypeFor, isNativeEncoder, lenientExternalDataTypeFor}
 import org.apache.spark.sql.catalyst.expressions.{BoundReference, CheckOverflow, CreateNamedStruct, Expression, IsNull, KnownNotNull, Literal, UnsafeArrayData}
 import org.apache.spark.sql.catalyst.expressions.objects._
-import org.apache.spark.sql.catalyst.util.{ArrayData, CharVarcharCodegenUtils, DateTimeUtils, GenericArrayData, IntervalUtils}
+import org.apache.spark.sql.catalyst.types.ops.TypeOps
+import org.apache.spark.sql.catalyst.util.{ArrayData, CharVarcharCodegenUtils, DateTimeUtils, GenericArrayData, IntervalUtils, STUtils}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -63,6 +64,24 @@ object SerializerBuildHelper {
     Invoke(inputObject, "doubleValue", DoubleType)
   }
 
+  def createSerializerForGeographyType(inputObject: Expression, gt: GeographyType): Expression = {
+    StaticInvoke(
+      classOf[STUtils],
+      gt,
+      "serializeGeogFromWKB",
+      inputObject :: Literal.fromObject(gt) :: Nil,
+      returnNullable = false)
+  }
+
+  def createSerializerForGeometryType(inputObject: Expression, gt: GeometryType): Expression = {
+    StaticInvoke(
+      classOf[STUtils],
+      gt,
+      "serializeGeomFromWKB",
+      inputObject :: Literal.fromObject(gt) :: Nil,
+      returnNullable = false)
+  }
+
   def createSerializerForChar(inputObject: Expression, length: Int): Expression = {
     StaticInvoke(
       classOf[CharVarcharCodegenUtils],
@@ -95,15 +114,6 @@ object SerializerBuildHelper {
       DateTimeUtils.getClass,
       TimestampType,
       "instantToMicros",
-      inputObject :: Nil,
-      returnNullable = false)
-  }
-
-  def createSerializerForLocalTime(inputObject: Expression): Expression = {
-    StaticInvoke(
-      DateTimeUtils.getClass,
-      TimeType(),
-      "localTimeToNanos",
       inputObject :: Nil,
       returnNullable = false)
   }
@@ -315,6 +325,22 @@ object SerializerBuildHelper {
    * by encoder `enc`.
    */
   private def createSerializer(enc: AgnosticEncoder[_], input: Expression): Expression = enc match {
+    // OptionEncoder and TransformingEncoder proxy `dataType` to the wrapped encoder, so the
+    // framework dispatch below (which keys off `enc.dataType`) would otherwise fire on the wrapper
+    // and skip Option unwrapping / the transforming codec. Route these wrappers through the default
+    // path first, so the framework leaf dispatch only ever sees unwrapped leaf encoders.
+    case _: OptionEncoder[_] | _: TransformingEncoder[_, _] =>
+      createSerializerDefault(enc, input)
+    // Framework dispatch runs before encoder-type checks (AgnosticExpressionPathEncoder,
+    // isNativeEncoder) in the default path. This is safe because framework types use dedicated
+    // leaf encoders (e.g., LocalTimeEncoder), never migration shims or native primitives.
+    case _ =>
+      TypeOps(enc.dataType).flatMap(_.createSerializer(input))
+        .getOrElse(createSerializerDefault(enc, input))
+  }
+
+  private def createSerializerDefault(
+      enc: AgnosticEncoder[_], input: Expression): Expression = enc match {
     case ae: AgnosticExpressionPathEncoder[_] => ae.toCatalyst(input)
     case _ if isNativeEncoder(enc) => input
     case BoxedBooleanEncoder => createSerializerForBoolean(input)
@@ -326,8 +352,14 @@ object SerializerBuildHelper {
     case BoxedDoubleEncoder => createSerializerForDouble(input)
     case JavaEnumEncoder(_) => createSerializerForJavaEnum(input)
     case ScalaEnumEncoder(_, _) => createSerializerForScalaEnum(input)
-    case CharEncoder(length) => createSerializerForChar(input, length)
-    case VarcharEncoder(length) => createSerializerForVarchar(input, length)
+    case _ @ (_: GeographyEncoder | _: GeometryEncoder) if !SQLConf.get.geospatialEnabled =>
+      throw new org.apache.spark.sql.AnalysisException(
+        errorClass = "UNSUPPORTED_FEATURE.GEOSPATIAL_DISABLED",
+        messageParameters = scala.collection.immutable.Map.empty)
+    case g: GeographyEncoder => createSerializerForGeographyType(input, g.dt)
+    case g: GeometryEncoder => createSerializerForGeometryType(input, g.dt)
+    case CharEncoder(dt) => createSerializerForChar(input, dt.length)
+    case VarcharEncoder(dt) => createSerializerForVarchar(input, dt.length)
     case StringEncoder => createSerializerForString(input)
     case ScalaDecimalEncoder(dt) => createSerializerForBigDecimal(input, dt)
     case JavaDecimalEncoder(dt, false) => createSerializerForBigDecimal(input, dt)
@@ -343,7 +375,6 @@ object SerializerBuildHelper {
     case TimestampEncoder(false) => createSerializerForSqlTimestamp(input)
     case InstantEncoder(false) => createSerializerForJavaInstant(input)
     case LocalDateTimeEncoder => createSerializerForLocalDateTime(input)
-    case LocalTimeEncoder => createSerializerForLocalTime(input)
     case UDTEncoder(udt, udtClass) => createSerializerForUserDefinedType(input, udt, udtClass)
     case OptionEncoder(valueEnc) =>
       createSerializer(valueEnc, UnwrapOption(externalDataTypeFor(valueEnc), input))

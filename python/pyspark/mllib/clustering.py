@@ -15,25 +15,26 @@
 # limitations under the License.
 #
 
-import sys
 import array as pyarray
-from math import exp, log
+import sys
 from collections import namedtuple
-from typing import Any, List, Optional, Tuple, TypeVar, Union, overload, TYPE_CHECKING
+from math import exp, log
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeVar, Union, overload
 
 import numpy as np
 from numpy import array, random, tile
 
 from pyspark import SparkContext, since
 from pyspark.core.rdd import RDD
-from pyspark.mllib.common import JavaModelWrapper, callMLlibFunc, callJavaFunc, _py2java, _java2py
-from pyspark.mllib.linalg import SparseVector, _convert_to_vector, DenseVector  # noqa: F401
+from pyspark.mllib.common import JavaModelWrapper, _java2py, _py2java, callJavaFunc, callMLlibFunc
+from pyspark.mllib.linalg import DenseVector, SparseVector, _convert_to_vector  # noqa: F401
 from pyspark.mllib.stat.distribution import MultivariateGaussian
-from pyspark.mllib.util import Saveable, Loader, inherit_doc, JavaLoader, JavaSaveable
+from pyspark.mllib.util import JavaLoader, JavaSaveable, Loader, Saveable, inherit_doc
 from pyspark.streaming import DStream
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
+
     from pyspark.mllib._typing import VectorLike
 
 T = TypeVar("T")
@@ -76,7 +77,7 @@ class BisectingKMeansModel(JavaModelWrapper):
     """
 
     def __init__(self, java_model: "JavaObject"):
-        super(BisectingKMeansModel, self).__init__(java_model)
+        super().__init__(java_model)
         self.centers = [c.toArray() for c in self.call("clusterCenters")]
 
     @property
@@ -93,12 +94,10 @@ class BisectingKMeansModel(JavaModelWrapper):
         return self.call("k")
 
     @overload
-    def predict(self, x: "VectorLike") -> int:
-        ...
+    def predict(self, x: "VectorLike") -> int: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[int]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[int]: ...
 
     def predict(self, x: Union["VectorLike", RDD["VectorLike"]]) -> Union[int, RDD[int]]:
         """
@@ -137,7 +136,7 @@ class BisectingKMeansModel(JavaModelWrapper):
 
         Parameters
         ----------
-        point : :py:class:`pyspark.mllib.linalg.Vector` or :py:class:`pyspark.RDD`
+        x : :py:class:`pyspark.mllib.linalg.Vector` or :py:class:`pyspark.RDD`
             A data point (or RDD of points) to compute the cost(s).
             :py:class:`pyspark.mllib.linalg.Vector` can be replaced with equivalent
             objects (list, tuple, numpy.ndarray).
@@ -221,7 +220,6 @@ class BisectingKMeans:
 
 @inherit_doc
 class KMeansModel(Saveable, Loader["KMeansModel"]):
-
     """A clustering model derived from the k-means method.
 
     .. versionadded:: 0.9.0
@@ -294,12 +292,10 @@ class KMeansModel(Saveable, Loader["KMeansModel"]):
         return len(self.centers)
 
     @overload
-    def predict(self, x: "VectorLike") -> int:
-        ...
+    def predict(self, x: "VectorLike") -> int: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[int]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[int]: ...
 
     def predict(self, x: Union["VectorLike", RDD["VectorLike"]]) -> Union[int, RDD[int]]:
         """
@@ -464,7 +460,6 @@ class KMeans:
 
 @inherit_doc
 class GaussianMixtureModel(JavaModelWrapper, JavaSaveable, JavaLoader["GaussianMixtureModel"]):
-
     """
     A clustering model derived from the Gaussian Mixture Model method.
 
@@ -559,12 +554,10 @@ class GaussianMixtureModel(JavaModelWrapper, JavaSaveable, JavaLoader["GaussianM
         return len(self.weights)
 
     @overload
-    def predict(self, x: "VectorLike") -> np.int64:
-        ...
+    def predict(self, x: "VectorLike") -> np.int64: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[int]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[int]: ...
 
     def predict(self, x: Union["VectorLike", RDD["VectorLike"]]) -> Union[np.int64, RDD[int]]:
         """
@@ -592,12 +585,10 @@ class GaussianMixtureModel(JavaModelWrapper, JavaSaveable, JavaLoader["GaussianM
             return z.argmax()
 
     @overload
-    def predictSoft(self, x: "VectorLike") -> np.ndarray:
-        ...
+    def predictSoft(self, x: "VectorLike") -> np.ndarray: ...
 
     @overload
-    def predictSoft(self, x: RDD["VectorLike"]) -> RDD[pyarray.array]:
-        ...
+    def predictSoft(self, x: RDD["VectorLike"]) -> RDD[pyarray.array]: ...
 
     def predictSoft(
         self, x: Union["VectorLike", RDD["VectorLike"]]
@@ -724,7 +715,6 @@ class GaussianMixture:
 class PowerIterationClusteringModel(
     JavaModelWrapper, JavaSaveable, JavaLoader["PowerIterationClusteringModel"]
 ):
-
     """
     Model produced by :py:class:`PowerIterationClustering`.
 
@@ -943,7 +933,7 @@ class StreamingKMeansModel(KMeansModel):
     """
 
     def __init__(self, clusterCenters: List["VectorLike"], clusterWeights: "VectorLike"):
-        super(StreamingKMeansModel, self).__init__(centers=clusterCenters)
+        super().__init__(centers=clusterCenters)
         self._clusterWeights = list(clusterWeights)  # type: ignore[arg-type]
 
     @property
@@ -1031,12 +1021,10 @@ class StreamingKMeans:
     def _validate(self, dstream: Any) -> None:
         if self._model is None:
             raise ValueError(
-                "Initial centers should be set either by setInitialCenters " "or setRandomCenters."
+                "Initial centers should be set either by setInitialCenters or setRandomCenters."
             )
         if not isinstance(dstream, DStream):
-            raise TypeError(
-                "Expected dstream to be of type DStream, " "got type %s" % type(dstream)
-            )
+            raise TypeError("Expected dstream to be of type DStream, got type %s" % type(dstream))
 
     @since("1.5.0")
     def setK(self, k: int) -> "StreamingKMeans":
@@ -1088,7 +1076,8 @@ class StreamingKMeans:
         self._validate(dstream)
 
         def update(rdd: RDD["VectorLike"]) -> None:
-            self._model.update(rdd, self._decayFactor, self._timeUnit)  # type: ignore[union-attr]
+            assert self._model is not None
+            self._model.update(rdd, self._decayFactor, self._timeUnit)
 
         dstream.foreachRDD(update)
 
@@ -1112,7 +1101,6 @@ class StreamingKMeans:
 
 
 class LDAModel(JavaModelWrapper, JavaSaveable, Loader["LDAModel"]):
-
     """A clustering model derived from the LDA method.
 
     Latent Dirichlet Allocation (LDA), a topic model designed for text documents.
@@ -1298,7 +1286,9 @@ class LDA:
 
 def _test() -> None:
     import doctest
+
     import numpy
+
     import pyspark.mllib.clustering
 
     try:
@@ -1308,7 +1298,7 @@ def _test() -> None:
         pass
     globs = pyspark.mllib.clustering.__dict__.copy()
     globs["sc"] = SparkContext("local[4]", "PythonTest", batchSize=2)
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     globs["sc"].stop()
     if failure_count:
         sys.exit(-1)

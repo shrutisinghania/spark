@@ -16,13 +16,12 @@
 #
 
 from math import sqrt
-import unittest
 
-from numpy import array, abs, tile
+from numpy import abs, array, tile
 
-from pyspark.mllib.linalg import SparseVector, DenseVector, Vectors
+from pyspark.mllib.feature import IDF, ElementwiseProduct, HashingTF, StandardScaler, Word2Vec
+from pyspark.mllib.linalg import DenseVector, SparseVector, Vectors
 from pyspark.mllib.linalg.distributed import RowMatrix
-from pyspark.mllib.feature import HashingTF, IDF, StandardScaler, ElementwiseProduct, Word2Vec
 from pyspark.testing.mllibutils import MLlibTestCase
 
 
@@ -180,12 +179,6 @@ class DimensionalityReductionTests(MLlibTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.mllib.tests.test_feature import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

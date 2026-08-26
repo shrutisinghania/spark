@@ -16,32 +16,32 @@
 #
 
 import sys
-from abc import abstractmethod, ABCMeta
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from abc import ABCMeta, abstractmethod
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from pyspark import since, keyword_only
-from pyspark.ml.wrapper import JavaParams
+from pyspark import keyword_only, since
+from pyspark.ml.common import inherit_doc
 from pyspark.ml.param import Param, Params, TypeConverters
 from pyspark.ml.param.shared import (
+    HasFeaturesCol,
     HasLabelCol,
     HasPredictionCol,
     HasProbabilityCol,
     HasRawPredictionCol,
-    HasFeaturesCol,
     HasWeightCol,
 )
-from pyspark.ml.common import inherit_doc
 from pyspark.ml.util import JavaMLReadable, JavaMLWritable, try_remote_evaluate
+from pyspark.ml.wrapper import JavaParams
 from pyspark.sql.dataframe import DataFrame
 
 if TYPE_CHECKING:
     from pyspark.ml._typing import (
-        ParamMap,
         BinaryClassificationEvaluatorMetricType,
         ClusteringEvaluatorDistanceMeasureType,
         ClusteringEvaluatorMetricType,
         MulticlassClassificationEvaluatorMetricType,
         MultilabelClassificationEvaluatorMetricType,
+        ParamMap,
         RankingEvaluatorMetricType,
         RegressionEvaluatorMetricType,
     )
@@ -235,7 +235,7 @@ class BinaryClassificationEvaluator(
         __init__(self, \\*, rawPredictionCol="rawPrediction", labelCol="label", \
                  metricName="areaUnderROC", weightCol=None, numBins=1000)
         """
-        super(BinaryClassificationEvaluator, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.evaluation.BinaryClassificationEvaluator", self.uid
         )
@@ -397,7 +397,7 @@ class RegressionEvaluator(
         __init__(self, \\*, predictionCol="prediction", labelCol="label", \
                  metricName="rmse", weightCol=None, throughOrigin=False)
         """
-        super(RegressionEvaluator, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.evaluation.RegressionEvaluator", self.uid
         )
@@ -593,7 +593,7 @@ class MulticlassClassificationEvaluator(
                  metricName="f1", weightCol=None, metricLabel=0.0, beta=1.0, \
                  probabilityCol="probability", eps=1e-15)
         """
-        super(MulticlassClassificationEvaluator, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator", self.uid
         )
@@ -710,7 +710,7 @@ class MulticlassClassificationEvaluator(
 
     def isLargerBetter(self) -> bool:
         """Override this function to make it run on connect"""
-        return not self.getMetricName() in [
+        return self.getMetricName() not in [
             "weightedFalsePositiveRate",
             "falsePositiveRateByLabel",
             "logLoss",
@@ -790,7 +790,7 @@ class MultilabelClassificationEvaluator(
         __init__(self, \\*, predictionCol="prediction", labelCol="label", \
                  metricName="f1Measure", metricLabel=0.0)
         """
-        super(MultilabelClassificationEvaluator, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.evaluation.MultilabelClassificationEvaluator", self.uid
         )
@@ -947,7 +947,7 @@ class ClusteringEvaluator(
         __init__(self, \\*, predictionCol="prediction", featuresCol="features", \
                  metricName="silhouette", distanceMeasure="squaredEuclidean", weightCol=None)
         """
-        super(ClusteringEvaluator, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.evaluation.ClusteringEvaluator", self.uid
         )
@@ -1095,7 +1095,7 @@ class RankingEvaluator(
         __init__(self, \\*, predictionCol="prediction", labelCol="label", \
                  metricName="meanAveragePrecision", k=10)
         """
-        super(RankingEvaluator, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.evaluation.RankingEvaluator", self.uid
         )
@@ -1171,6 +1171,7 @@ class RankingEvaluator(
 if __name__ == "__main__":
     import doctest
     import tempfile
+
     import pyspark.ml.evaluation
     from pyspark.sql import SparkSession
 
@@ -1182,7 +1183,7 @@ if __name__ == "__main__":
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

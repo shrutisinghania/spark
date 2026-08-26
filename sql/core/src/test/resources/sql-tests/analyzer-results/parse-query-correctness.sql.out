@@ -938,7 +938,7 @@ Project [num#x, a#x]
 -- !query
 DROP VIEW v1
 -- !query analysis
-DropTempViewCommand v1
+DropTempViewCommand v1, false
 
 
 -- !query
@@ -1115,7 +1115,7 @@ DropTableCommand `spark_catalog`.`default`.`v1`, false, true, false
 -- !query
 DECLARE v1 INT
 -- !query analysis
-CreateVariable defaultvalueexpression(null, null), false
+CreateVariable default(null, sql='null'), false
 +- ResolvedIdentifier org.apache.spark.sql.catalyst.analysis.FakeSystemCatalog$@xxxxxxxx, session.v1
 
 
@@ -1257,11 +1257,11 @@ org.apache.spark.sql.catalyst.parser.ParseException
     "hint" : ""
   },
   "queryContext" : [ {
-    "objectType" : "",
+    "objectType" : "EXECUTE IMMEDIATE",
     "objectName" : "",
     "startIndex" : 1,
-    "stopIndex" : 50,
-    "fragment" : "EXECUTE IMMEDIATE 'SELECT 1 JOIN SELECT 2' INTO v1"
+    "stopIndex" : 22,
+    "fragment" : "SELECT 1 JOIN SELECT 2"
   } ]
 }
 
@@ -1285,11 +1285,11 @@ org.apache.spark.sql.catalyst.parser.ParseException
     "hint" : ""
   },
   "queryContext" : [ {
-    "objectType" : "",
+    "objectType" : "EXECUTE IMMEDIATE",
     "objectName" : "",
     "startIndex" : 1,
-    "stopIndex" : 47,
-    "fragment" : "EXECUTE IMMEDIATE 'SELECT 1 VALUES (1)' INTO v1"
+    "stopIndex" : 19,
+    "fragment" : "SELECT 1 VALUES (1)"
   } ]
 }
 
@@ -1313,11 +1313,11 @@ org.apache.spark.sql.catalyst.parser.ParseException
     "hint" : ""
   },
   "queryContext" : [ {
-    "objectType" : "",
+    "objectType" : "EXECUTE IMMEDIATE",
     "objectName" : "",
     "startIndex" : 1,
-    "stopIndex" : 66,
-    "fragment" : "EXECUTE IMMEDIATE 'SELECT 1 alias garbage garbage garbage' INTO v1"
+    "stopIndex" : 38,
+    "fragment" : "SELECT 1 alias garbage garbage garbage"
   } ]
 }
 
@@ -1341,11 +1341,11 @@ org.apache.spark.sql.catalyst.parser.ParseException
     "hint" : ": extra input 'abc'"
   },
   "queryContext" : [ {
-    "objectType" : "",
+    "objectType" : "EXECUTE IMMEDIATE",
     "objectName" : "",
     "startIndex" : 1,
-    "stopIndex" : 45,
-    "fragment" : "EXECUTE IMMEDIATE 'SELECT 1 WITH abc' INTO v1"
+    "stopIndex" : 17,
+    "fragment" : "SELECT 1 WITH abc"
   } ]
 }
 

@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 from typing import List, Optional
+
 from pyspark.errors import PySparkTypeError
 
 
@@ -33,9 +34,10 @@ def validate_optional_list_of_str_arg(arg_name: str, arg_value: Optional[List[st
 
     if not isinstance(arg_value, list):
         raise PySparkTypeError(
-            errorClass="NOT_LIST_OF_STR",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
                 "arg_name": arg_name,
+                "expected_type": "list[str]",
                 "arg_type": type(arg_value).__name__,
             },
         )
@@ -43,9 +45,10 @@ def validate_optional_list_of_str_arg(arg_name: str, arg_value: Optional[List[st
     for el in arg_value:
         if not isinstance(el, str):
             raise PySparkTypeError(
-                errorClass="NOT_LIST_OF_STR",
+                errorClass="NOT_EXPECTED_TYPE",
                 messageParameters={
                     "arg_name": arg_name,
+                    "expected_type": "list[str]",
                     "arg_type": type(arg_value).__name__,
                 },
             )

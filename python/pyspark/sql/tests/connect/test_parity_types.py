@@ -35,6 +35,10 @@ class TypesParityTests(TypesTestsMixin, ReusedConnectTestCase):
         super().test_apply_schema_to_row()
 
     @unittest.skip("Spark Connect does not support RDD but the tests depend on them.")
+    def test_geospatial_create_dataframe_rdd(self):
+        super().test_geospatial_create_dataframe_rdd()
+
+    @unittest.skip("Spark Connect does not support RDD but the tests depend on them.")
     def test_create_dataframe_schema_mismatch(self):
         super().test_create_dataframe_schema_mismatch()
 
@@ -94,7 +98,13 @@ class TypesParityTests(TypesTestsMixin, ReusedConnectTestCase):
     def test_schema_with_collations_json_ser_de(self):
         super().test_schema_with_collations_json_ser_de()
 
-    @unittest.skip("This test is dedicated for PySpark Classic.")
+    @unittest.skip(
+        "The inherited Classic contract also asserts that PYSPARK_YM_INTERVAL_LEGACY=1 returns "
+        "the integer months (Row(interval=128)), which Spark Connect cannot satisfy: PyArrow has "
+        "no INTERVAL_MONTHS array support, so the legacy flag is not honored and collect raises "
+        "NOT_IMPLEMENTED regardless. The default-raise behavior Connect does match is covered by "
+        "test_connect_error.SparkConnectErrorTests.test_ym_interval_in_collect."
+    )
     def test_ym_interval_in_collect(self):
         super().test_ym_interval_in_collect()
 
@@ -104,13 +114,6 @@ class TypesParityTests(TypesTestsMixin, ReusedConnectTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.connect.test_parity_types import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

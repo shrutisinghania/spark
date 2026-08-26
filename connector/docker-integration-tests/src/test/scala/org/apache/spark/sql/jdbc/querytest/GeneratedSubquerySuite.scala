@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.spark.sql.jdbc
+package org.apache.spark.sql.jdbc.querytest
 
 import java.sql.{Connection, ResultSet, Statement}
 import java.util.Locale
@@ -24,13 +24,14 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.spark.sql.{QueryGeneratorHelper, QueryTest}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.jdbc.{DockerJDBCIntegrationSuite, PostgresDatabaseOnDocker}
 import org.apache.spark.tags.DockerTest
 
 /**
  * This suite is used to generate subqueries, and test Spark against Postgres.
- * To run this test suite for a specific version (e.g., postgres:17.2-alpine):
+ * To run this test suite for a specific version (e.g., postgres:18.2-alpine):
  * {{{
- *   ENABLE_DOCKER_INTEGRATION_TESTS=1 POSTGRES_DOCKER_IMAGE_NAME=postgres:17.2-alpine
+ *   ENABLE_DOCKER_INTEGRATION_TESTS=1 POSTGRES_DOCKER_IMAGE_NAME=postgres:18.2-alpine
  *     ./build/sbt -Pdocker-integration-tests
  *     "docker-integration-tests/testOnly org.apache.spark.sql.jdbc.GeneratedSubquerySuite"
  * }}}

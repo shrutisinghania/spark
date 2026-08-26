@@ -39,7 +39,7 @@ import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types._
 import org.apache.spark.types.variant._
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String, VariantVal}
+import org.apache.spark.unsafe.types.{CalendarInterval, TimestampNanosVal, UTF8String, VariantVal}
 import org.apache.spark.util.Utils
 
 /**
@@ -80,6 +80,7 @@ class JacksonParser(
     options.locale,
     legacyFormat = FAST_DATE_FORMAT,
     isParsing = true)
+  private lazy val timeFormatter = TimeFormatter(options.timeFormatInRead, isParsing = true)
 
   // Flags to signal if we need to fall back to the backward compatible behavior of parsing
   // dates and timestamps.
@@ -114,6 +115,11 @@ class JacksonParser(
       case _: StructType if options.singleVariantColumn.isDefined => (parser: JsonParser) => {
         Some(InternalRow(parseVariant(parser)))
       }
+      // Each embedded array element is parsed into a single variant column, like
+      // `singleVariantColumn`. The elements have already been split out by the data source.
+      case _: StructType if options.explodeEmbeddedArray.isDefined => (parser: JsonParser) => {
+        Some(InternalRow(parseVariant(parser)))
+      }
       case st: StructType => makeStructRootConverter(st)
       case mt: MapType => makeMapRootConverter(mt)
       case at: ArrayType => makeArrayRootConverter(at)
@@ -121,6 +127,8 @@ class JacksonParser(
   }
 
   private val variantAllowDuplicateKeys = SQLConf.get.getConf(SQLConf.VARIANT_ALLOW_DUPLICATE_KEYS)
+  private val variantValidateUnicodeInJsonParsing =
+    SQLConf.get.getConf(SQLConf.VARIANT_VALIDATE_UNICODE_IN_JSON_PARSING)
 
   protected final def parseVariant(parser: JsonParser): VariantVal = {
     // Skips `FIELD_NAME` at the beginning. This check is adapted from `parseJsonToken`, but we
@@ -130,7 +138,8 @@ class JacksonParser(
       parser.nextToken()
     }
     try {
-      val v = VariantBuilder.parseJson(parser, variantAllowDuplicateKeys)
+      val v = VariantBuilder.parseJson(
+        parser, variantAllowDuplicateKeys, variantValidateUnicodeInJsonParsing)
       new VariantVal(v.getValue, v.getMetadata)
     } catch {
       case _: VariantSizeLimitException =>
@@ -376,6 +385,21 @@ class JacksonParser(
           timestampNTZFormatter.parseWithoutTimeZone(parser.getText, false)
       }
 
+    case t: TimestampLTZNanosType =>
+      (parser: JsonParser) => parseJsonToken[TimestampNanosVal](parser, dataType) {
+        // Unlike the microsecond TimestampType, the nanosecond types accept only string input.
+        // The numeric-epoch shorthand (a JSON integer read as epoch seconds) is legacy
+        // TimestampType behavior and is intentionally not carried over to the nanos types.
+        case VALUE_STRING if parser.getTextLength >= 1 =>
+          timestampFormatter.parseNanos(parser.getText, t.precision)
+      }
+
+    case t: TimestampNTZNanosType =>
+      (parser: JsonParser) => parseJsonToken[TimestampNanosVal](parser, dataType) {
+        case VALUE_STRING if parser.getTextLength >= 1 =>
+          timestampNTZFormatter.parseWithoutTimeZoneNanos(parser.getText, t.precision, false)
+      }
+
     case DateType =>
       (parser: JsonParser) => parseJsonToken[java.lang.Integer](parser, dataType) {
         case VALUE_STRING if parser.getTextLength >= 1 =>
@@ -433,6 +457,12 @@ class JacksonParser(
         case VALUE_STRING =>
           val expr = Cast(Literal(parser.getText), dt)
           java.lang.Long.valueOf(expr.eval(EmptyRow).asInstanceOf[Long])
+      }
+
+    case _: TimeType => (parser: JsonParser) =>
+      parseJsonToken[java.lang.Long](parser, dataType) {
+        case VALUE_STRING if parser.getTextLength >= 1 =>
+          timeFormatter.parse(parser.getText)
       }
 
     case st: StructType =>

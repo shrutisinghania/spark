@@ -38,17 +38,29 @@ import java.util.Set;
  * The default implementation of {@link #partitioning()} returns an empty array of partitions, and
  * the default implementation of {@link #properties()} returns an empty map. These should be
  * overridden by implementations that support partitioning and table properties.
+ * <p>
+ * A {@code Table} is one kind of {@link Relation}; the other is {@link View}.
  *
  * @since 3.0.0
  */
 @Evolving
-public interface Table {
+public interface Table extends Relation {
 
   /**
    * A name to identify this table. Implementations should provide a meaningful name, like the
    * database and table name from catalog, or the location of files for this table.
    */
   String name();
+
+  /**
+   * An ID of the table that can be used to reliably check if two table objects refer to the same
+   * metastore entity. If a table is dropped and recreated again with the same name, the new table
+   * ID must be different. This method must return null if connectors don't support the notion of
+   * table ID.
+   */
+  default String id() {
+    return null;
+  }
 
   /**
    * Returns the schema of this table. If the table is not readable and doesn't have a schema, an
@@ -66,7 +78,7 @@ public interface Table {
    * empty array can be returned here.
    */
   default Column[] columns() {
-    return CatalogV2Util.structTypeToV2Columns(schema());
+    return CatalogV2Util.structTypeToV2Columns(schema(), true /* keep IDs */);
   }
 
   /**
@@ -94,8 +106,10 @@ public interface Table {
   default Constraint[] constraints() { return new Constraint[0]; }
 
   /**
-   * Returns the current table version if implementation supports versioning.
-   * If the table is not versioned, null can be returned here.
+   * Returns the version of this table if versioning is supported, null otherwise.
+   * <p>
+   * This method must not trigger a refresh of the table metadata. It should return
+   * the version that corresponds to the current state of this table instance.
    */
-  default String currentVersion() { return null; }
+  default String version() { return null; }
 }

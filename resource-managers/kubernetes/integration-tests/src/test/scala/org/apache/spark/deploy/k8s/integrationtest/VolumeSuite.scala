@@ -23,20 +23,24 @@ import org.scalatest.concurrent.PatienceConfiguration
 import org.scalatest.time.{Seconds, Span}
 
 import org.apache.spark.deploy.k8s.integrationtest.KubernetesSuite._
+import org.apache.spark.deploy.k8s.integrationtest.backend.docker.RancherDesktopBackend
 import org.apache.spark.deploy.k8s.integrationtest.backend.minikube.MinikubeTestBackend
 
 private[spark] trait VolumeSuite { k8sSuite: KubernetesSuite =>
   val IGNORE = Some((Some(PatienceConfiguration.Interval(Span(0, Seconds))), None))
 
   private def checkDisk(pod: Pod, path: String, expected: String) = {
-    eventually(PatienceConfiguration.Timeout(Span(10, Seconds)), INTERVAL) {
+    // Use the shared TIMEOUT rather than a short fixed timeout: when the volume is an OnDemand
+    // PVC, dynamic provisioning and mounting can keep the driver container in ContainerCreating
+    // for more than a few seconds, so the in-pod `df` command may not be runnable immediately.
+    eventually(TIMEOUT, INTERVAL) {
       implicit val podName: String = pod.getMetadata.getName
       implicit val components: KubernetesTestComponents = kubernetesTestComponents
       assert(Utils.executeCommand("df", path).contains(expected))
     }
   }
 
-  test("A driver-only Spark job with a tmpfs-backed localDir volume", k8sTestTag) {
+  test("A driver-only Spark job with a tmpfs-backed localDir volume", k8sTestTag, commandTestTag) {
     sparkAppConf
       .set("spark.kubernetes.driver.master", "local[10]")
       .set("spark.kubernetes.local.dirs.tmpfs", "true")
@@ -57,7 +61,8 @@ private[spark] trait VolumeSuite { k8sSuite: KubernetesSuite =>
       executorPatience = IGNORE)
   }
 
-  test("A driver-only Spark job with a tmpfs-backed emptyDir data volume", k8sTestTag) {
+  test("A driver-only Spark job with a tmpfs-backed emptyDir data volume", k8sTestTag,
+      commandTestTag) {
     sparkAppConf
       .set("spark.kubernetes.driver.master", "local[10]")
       .set("spark.kubernetes.driver.volumes.emptyDir.data.mount.path", "/data")
@@ -78,7 +83,7 @@ private[spark] trait VolumeSuite { k8sSuite: KubernetesSuite =>
       executorPatience = IGNORE)
   }
 
-  test("A driver-only Spark job with a disk-backed emptyDir volume", k8sTestTag) {
+  test("A driver-only Spark job with a disk-backed emptyDir volume", k8sTestTag, commandTestTag) {
     sparkAppConf
       .set("spark.kubernetes.driver.master", "local[10]")
       .set("spark.kubernetes.driver.volumes.emptyDir.data.mount.path", "/data")
@@ -98,8 +103,12 @@ private[spark] trait VolumeSuite { k8sSuite: KubernetesSuite =>
       executorPatience = IGNORE)
   }
 
-  test("A driver-only Spark job with an OnDemand PVC volume", k8sTestTag) {
-    val storageClassName = if (testBackend == MinikubeTestBackend) "standard" else "hostpath"
+  test("A driver-only Spark job with an OnDemand PVC volume", k8sTestTag, commandTestTag) {
+    val storageClassName = testBackend match {
+      case MinikubeTestBackend => "standard"
+      case RancherDesktopBackend => "local-path"
+      case _ => "hostpath"
+    }
     val DRIVER_PREFIX = "spark.kubernetes.driver.volumes.persistentVolumeClaim"
     sparkAppConf
       .set("spark.kubernetes.driver.master", "local[10]")
@@ -123,7 +132,7 @@ private[spark] trait VolumeSuite { k8sSuite: KubernetesSuite =>
       executorPatience = IGNORE)
   }
 
-  test("A Spark job with tmpfs-backed localDir volumes", k8sTestTag) {
+  test("A Spark job with tmpfs-backed localDir volumes", k8sTestTag, commandTestTag) {
     sparkAppConf
       .set("spark.kubernetes.local.dirs.tmpfs", "true")
     runSparkApplicationAndVerifyCompletion(
@@ -147,8 +156,12 @@ private[spark] trait VolumeSuite { k8sSuite: KubernetesSuite =>
       isJVM = true)
   }
 
-  test("A Spark job with two executors with OnDemand PVC volumes", k8sTestTag) {
-    val storageClassName = if (testBackend == MinikubeTestBackend) "standard" else "hostpath"
+  test("A Spark job with two executors with OnDemand PVC volumes", k8sTestTag, commandTestTag) {
+    val storageClassName = testBackend match {
+      case MinikubeTestBackend => "standard"
+      case RancherDesktopBackend => "local-path"
+      case _ => "hostpath"
+    }
     val EXECUTOR_PREFIX = "spark.kubernetes.executor.volumes.persistentVolumeClaim"
     sparkAppConf
       .set("spark.executor.instances", "2")

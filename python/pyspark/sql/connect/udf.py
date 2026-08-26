@@ -17,16 +17,14 @@
 """
 User-defined function related classes and functions
 """
-from pyspark.sql.connect.utils import check_dependencies
 
-check_dependencies(__name__)
-
-import warnings
-import sys
 import functools
-from typing import cast, Callable, Any, List, TYPE_CHECKING, Optional, Union
+import sys
+import warnings
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union, cast
 
-from pyspark.util import PythonEvalType
+from pyspark.errors import PySparkRuntimeError, PySparkTypeError
+from pyspark.sql.connect.column import Column
 from pyspark.sql.connect.expressions import (
     ColumnReference,
     CommonInlineUserDefinedFunction,
@@ -34,14 +32,15 @@ from pyspark.sql.connect.expressions import (
     NamedArgumentExpression,
     PythonUDF,
 )
-from pyspark.sql.connect.column import Column
-from pyspark.sql.types import DataType, StringType, _parse_datatype_string
+from pyspark.sql.pandas.utils import require_minimum_pandas_version, require_minimum_pyarrow_version
+from pyspark.sql.types import DataType, StringType, StructType, _parse_datatype_string
 from pyspark.sql.udf import (
     UDFRegistration as PySparkUDFRegistration,
+)
+from pyspark.sql.udf import (
     UserDefinedFunction as PySparkUserDefinedFunction,
 )
-from pyspark.sql.pandas.utils import require_minimum_pyarrow_version, require_minimum_pandas_version
-from pyspark.errors import PySparkTypeError, PySparkRuntimeError
+from pyspark.util import PythonEvalType
 
 if TYPE_CHECKING:
     from pyspark.sql.connect._typing import (
@@ -50,7 +49,6 @@ if TYPE_CHECKING:
         UserDefinedFunctionLike,
     )
     from pyspark.sql.connect.session import SparkSession
-    from pyspark.sql.types import StringType
 
 
 def _create_py_udf(
@@ -77,10 +75,7 @@ def _create_py_udf(
     else:
         is_arrow_enabled = useArrow
 
-    eval_type: int = PythonEvalType.SQL_BATCHED_UDF
-
     if is_arrow_enabled:
-        eval_type = PythonEvalType.SQL_ARROW_BATCHED_UDF
         try:
             require_minimum_pandas_version()
             require_minimum_pyarrow_version()
@@ -92,6 +87,25 @@ def _create_py_udf(
                 RuntimeWarning,
             )
 
+    eval_type: Optional[int] = None
+    if useArrow is None:
+        # If the user doesn't explicitly set useArrow
+        from pyspark.sql.pandas.typehints import infer_eval_type_for_udf
+
+        try:
+            # Try to infer the eval type from type hints
+            eval_type = infer_eval_type_for_udf(f)
+        except Exception:
+            warnings.warn("Cannot infer the eval type from type hints. ", UserWarning)
+
+    if eval_type is None:
+        if is_arrow_enabled:
+            # Arrow optimized Python UDF
+            eval_type = PythonEvalType.SQL_ARROW_BATCHED_UDF
+        else:
+            # Fallback to Regular Python UDF
+            eval_type = PythonEvalType.SQL_BATCHED_UDF
+
     return _create_udf(f, returnType, eval_type)
 
 
@@ -101,10 +115,16 @@ def _create_udf(
     evalType: int,
     name: Optional[str] = None,
     deterministic: bool = True,
+    bufferSchema: Optional[StructType] = None,
 ) -> "UserDefinedFunctionLike":
     # Set the name of the UserDefinedFunction object to be the name of function f
     udf_obj = UserDefinedFunction(
-        f, returnType=returnType, name=name, evalType=evalType, deterministic=deterministic
+        f,
+        returnType=returnType,
+        name=name,
+        evalType=evalType,
+        deterministic=deterministic,
+        bufferSchema=bufferSchema,
     )
     return udf_obj._wrapped()
 
@@ -127,17 +147,23 @@ class UserDefinedFunction:
         name: Optional[str] = None,
         evalType: int = PythonEvalType.SQL_BATCHED_UDF,
         deterministic: bool = True,
+        bufferSchema: Optional[StructType] = None,
     ):
         if not callable(func):
             raise PySparkTypeError(
-                errorClass="NOT_CALLABLE",
-                messageParameters={"arg_name": "func", "arg_type": type(func).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "callable",
+                    "arg_name": "func",
+                    "arg_type": type(func).__name__,
+                },
             )
 
         if not isinstance(returnType, (DataType, str)):
             raise PySparkTypeError(
-                errorClass="NOT_DATATYPE_OR_STR",
+                errorClass="NOT_EXPECTED_TYPE",
                 messageParameters={
+                    "expected_type": "DataType or str",
                     "arg_name": "returnType",
                     "arg_type": type(returnType).__name__,
                 },
@@ -145,8 +171,12 @@ class UserDefinedFunction:
 
         if not isinstance(evalType, int):
             raise PySparkTypeError(
-                errorClass="NOT_INT",
-                messageParameters={"arg_name": "evalType", "arg_type": type(evalType).__name__},
+                errorClass="NOT_EXPECTED_TYPE",
+                messageParameters={
+                    "expected_type": "int",
+                    "arg_name": "evalType",
+                    "arg_type": type(evalType).__name__,
+                },
             )
 
         self.func = func
@@ -157,6 +187,10 @@ class UserDefinedFunction:
         )
         self.evalType = evalType
         self.deterministic = deterministic
+        # Intermediate aggregation buffer schema, set only for an incremental Python aggregator
+        # (see :class:`pyspark.sql.aggregator.Aggregator`); ``None`` otherwise. A first-class field
+        # so it survives ``_wrapped()``, ``asNondeterministic()`` and ``spark.udf.register``.
+        self.bufferSchema = bufferSchema
 
     @property
     def returnType(self) -> DataType:
@@ -189,6 +223,8 @@ class UserDefinedFunction:
             eval_type=self.evalType,
             func=self.func,
             python_ver="%d.%d" % sys.version_info[:2],
+            # Set for incremental Python aggregators (see pyspark.sql.aggregator).
+            buffer_type=self.bufferSchema,
         )
         return CommonInlineUserDefinedFunction(
             function_name=self._name,
@@ -232,6 +268,7 @@ class UserDefinedFunction:
         wrapper.returnType = self.returnType  # type: ignore[attr-defined]
         wrapper.evalType = self.evalType  # type: ignore[attr-defined]
         wrapper.deterministic = self.deterministic  # type: ignore[attr-defined]
+        wrapper.bufferSchema = self.bufferSchema  # type: ignore[attr-defined]
         wrapper.asNondeterministic = functools.wraps(  # type: ignore[attr-defined]
             self.asNondeterministic
         )(lambda: self.asNondeterministic()._wrapped())
@@ -280,6 +317,9 @@ class UDFRegistration:
                 PythonEvalType.SQL_SCALAR_ARROW_ITER_UDF,
                 PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
                 PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF,
+                PythonEvalType.SQL_GROUPED_AGG_PANDAS_ITER_UDF,
+                PythonEvalType.SQL_GROUPED_AGG_ARROW_ITER_UDF,
+                PythonEvalType.SQL_GROUPED_AGG_ARROW_INCREMENTAL_FINAL_UDF,
             ]:
                 raise PySparkTypeError(
                     errorClass="INVALID_UDF_EVAL_TYPE",
@@ -287,11 +327,19 @@ class UDFRegistration:
                         "eval_type": "SQL_BATCHED_UDF, SQL_ARROW_BATCHED_UDF, "
                         "SQL_SCALAR_PANDAS_UDF, SQL_SCALAR_ARROW_UDF, "
                         "SQL_SCALAR_PANDAS_ITER_UDF, SQL_SCALAR_ARROW_ITER_UDF, "
-                        "SQL_GROUPED_AGG_PANDAS_UDF or SQL_GROUPED_AGG_ARROW_UDF"
+                        "SQL_GROUPED_AGG_PANDAS_UDF, SQL_GROUPED_AGG_ARROW_UDF, "
+                        "SQL_GROUPED_AGG_PANDAS_ITER_UDF, SQL_GROUPED_AGG_ARROW_ITER_UDF "
+                        "or SQL_GROUPED_AGG_ARROW_INCREMENTAL_FINAL_UDF"
                     },
                 )
             self.sparkSession._client.register_udf(
-                f.func, f.returnType, name, f.evalType, f.deterministic
+                f.func,
+                f.returnType,
+                name,
+                f.evalType,
+                f.deterministic,
+                # Set for the incremental aggregator (see pyspark.sql.aggregator).
+                buffer_type=getattr(f, "bufferSchema", None),
             )
             return f
         else:

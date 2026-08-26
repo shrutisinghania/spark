@@ -39,8 +39,8 @@ along with if you launch Spark's interactive shell -- either `bin/spark-shell` f
 
 <div data-lang="python"  markdown="1">
 
-Spark {{site.SPARK_VERSION}} works with Python 3.10+. It can use the standard CPython interpreter,
-so C libraries like NumPy can be used. It also works with PyPy 7.3.6+.
+Spark {{site.SPARK_VERSION}} works with Python 3.11+. It can use the standard CPython interpreter,
+so C libraries like NumPy can be used.
 
 Spark applications in Python can either be run with the `bin/spark-submit` script which includes Spark at runtime, or by including it in your setup.py as:
 
@@ -70,8 +70,7 @@ PySpark requires the same minor version of Python in both driver and workers. It
 you can specify which version of Python you want to use by `PYSPARK_PYTHON`, for example:
 
 {% highlight bash %}
-$ PYSPARK_PYTHON=python3.8 bin/pyspark
-$ PYSPARK_PYTHON=/path-to-your-pypy/pypy bin/spark-submit examples/src/main/python/pi.py
+$ PYSPARK_PYTHON=python3.11 bin/pyspark
 {% endhighlight %}
 
 </div>
@@ -207,7 +206,7 @@ In the PySpark shell, a special interpreter-aware SparkContext is already create
 variable called `sc`. Making your own SparkContext will not work. You can set which master the
 context connects to using the `--master` argument, and you can add Python .zip, .egg or .py files
 to the runtime path by passing a comma-separated list to `--py-files`. For third-party Python dependencies,
-see [Python Package Management](api/python/user_guide/python_packaging.html). You can also add dependencies
+see [Python Package Management](api/python/tutorial/python_packaging.html). You can also add dependencies
 (e.g. Spark Packages) to your shell session by supplying a comma-separated list of Maven coordinates
 to the `--packages` argument. Any additional repositories where dependencies might exist (e.g. Sonatype)
 can be passed to the `--repositories` argument. For example, to run

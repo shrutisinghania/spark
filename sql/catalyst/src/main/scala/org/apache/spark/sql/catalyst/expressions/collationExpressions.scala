@@ -24,7 +24,6 @@ import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, UNRESOLVED_COLLATION}
 import org.apache.spark.sql.catalyst.util.{AttributeNameParser, CollationFactory}
 import org.apache.spark.sql.errors.QueryCompilationErrors
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.types.StringTypeWithCollation
 import org.apache.spark.sql.types._
 
@@ -54,10 +53,6 @@ object CollateExpressionBuilder extends ExpressionBuilder {
             if (evalCollation == null) {
               throw QueryCompilationErrors.unexpectedNullError("collation", collationExpr)
             } else {
-              if (!SQLConf.get.trimCollationEnabled &&
-                evalCollation.toString.toUpperCase().contains("TRIM")) {
-                throw QueryCompilationErrors.trimCollationNotEnabledError()
-              }
               Collate(e, UnresolvedCollation(
                 AttributeNameParser.parseAttributeName(evalCollation.toString)))
             }
@@ -125,7 +120,7 @@ case class UnresolvedCollation(collationName: Seq[String])
 /**
  * An expression that represents a resolved collation name.
  */
-case class ResolvedCollation(collationName: String) extends LeafExpression with Unevaluable {
+case class ResolvedCollation(collationName: String) extends LeafExpression {
   override def nullable: Boolean = false
 
   override def dataType: DataType = StringType(CollationFactory.collationNameToId(collationName))
@@ -133,6 +128,15 @@ case class ResolvedCollation(collationName: String) extends LeafExpression with 
   override def toString: String = collationName
 
   override def sql: String = collationName
+
+  override def eval(input: InternalRow): Any = Literal.create(collationName, dataType).eval(input)
+
+  /** Just a simple passthrough for code generation. */
+  override def genCode(ctx: CodegenContext): ExprCode =
+    Literal.create(collationName, dataType).genCode(ctx)
+  override protected def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    throw SparkException.internalError("ResolvedCollation.doGenCode should not be called.")
+  }
 }
 
 // scalastyle:off line.contains.tab
@@ -141,6 +145,7 @@ case class ResolvedCollation(collationName: String) extends LeafExpression with 
   arguments = """
     Arguments:
       * expr - String expression to perform collation on.
+        An expression that evaluates to a string.
   """,
   examples = """
     Examples:

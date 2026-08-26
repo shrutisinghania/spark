@@ -18,12 +18,12 @@
 import os
 import unittest
 
-from numpy import array, random, exp, dot, all, mean, abs
+from numpy import abs, all, array, dot, exp, mean, random
 from numpy import sum as array_sum
 
 from pyspark import SparkContext
-from pyspark.mllib.clustering import StreamingKMeans, StreamingKMeansModel
 from pyspark.mllib.classification import StreamingLogisticRegressionWithSGD
+from pyspark.mllib.clustering import StreamingKMeans, StreamingKMeansModel
 from pyspark.mllib.linalg import Vectors
 from pyspark.mllib.regression import LabeledPoint, StreamingLinearRegressionWithSGD
 from pyspark.mllib.util import LinearDataGenerator
@@ -238,7 +238,12 @@ class StreamingLogisticRegressionWithSGDTests(MLLibStreamingTestCase):
         slr = StreamingLogisticRegressionWithSGD(stepSize=0.2, numIterations=25)
         slr.setInitialWeights([0.0])
         slr.trainOn(input_stream)
-        input_stream.foreachRDD(lambda x: models.append(slr.latestModel().weights[0]))
+
+        def update_models(x):
+            if not x.isEmpty():
+                models.append(slr.latestModel().weights[0])
+
+        input_stream.foreachRDD(update_models)
 
         self.ssc.start()
 
@@ -460,12 +465,6 @@ class StreamingLinearRegressionWithTests(MLLibStreamingTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.mllib.tests.test_streaming_algorithms import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -18,7 +18,6 @@
 import os
 import tempfile
 from shutil import rmtree
-import unittest
 
 from numpy import array, array_equal
 from py4j.protocol import Py4JJavaError
@@ -32,7 +31,6 @@ from pyspark.testing.utils import eventually
 
 
 class ListTests(MLlibTestCase):
-
     """
     Test MLlib algorithms on plain lists, to make sure they're passed through
     as NumPy arrays.
@@ -143,14 +141,14 @@ class ListTests(MLlibTestCase):
         self.assertAlmostEqual((gmm1.weights - gmm2.weights).sum(), 0.0)
 
     def test_classification(self):
-        from pyspark.mllib.classification import LogisticRegressionWithSGD, SVMWithSGD, NaiveBayes
+        from pyspark.mllib.classification import LogisticRegressionWithSGD, NaiveBayes, SVMWithSGD
         from pyspark.mllib.tree import (
             DecisionTree,
             DecisionTreeModel,
-            RandomForest,
-            RandomForestModel,
             GradientBoostedTrees,
             GradientBoostedTreesModel,
+            RandomForest,
+            RandomForestModel,
         )
 
         data = [
@@ -234,11 +232,11 @@ class ListTests(MLlibTestCase):
 
     def test_regression(self):
         from pyspark.mllib.regression import (
-            LinearRegressionWithSGD,
             LassoWithSGD,
+            LinearRegressionWithSGD,
             RidgeRegressionWithSGD,
         )
-        from pyspark.mllib.tree import DecisionTree, RandomForest, GradientBoostedTrees
+        from pyspark.mllib.tree import DecisionTree, GradientBoostedTrees, RandomForest
 
         data = [
             LabeledPoint(-1.0, [0, -1]),
@@ -343,12 +341,6 @@ class FPGrowthTest(MLlibTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.mllib.tests.test_algorithms import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

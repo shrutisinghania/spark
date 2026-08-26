@@ -25,7 +25,6 @@ import scala.util.Random
 import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.hadoop.mapreduce.{JobContext, TaskAttemptContext}
 
-import org.apache.spark.SparkConf
 import org.apache.spark.internal.io.FileCommitProtocol
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Final, Partial}
@@ -105,6 +104,42 @@ class SQLMetricsSuite extends SharedSparkSession with SQLMetricsTestUtils
       val expected = Map("number of output rows" -> 2L)
       testSparkPlanMetrics(df, 0, Map(
         0L -> (("CommandResult", expected))))
+    }
+  }
+
+  test("SPARK-54749: OneRowRelation metrics") {
+    Seq((1L, "false"), (2L, "true")).foreach { case (nodeId, enableWholeStage) =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> enableWholeStage) {
+        val df = spark.sql("select 1 as c1")
+        val oneRowRelation = df.queryExecution.executedPlan.collect {
+          case oneRowRelation: OneRowRelationExec => oneRowRelation
+        }
+        df.collect()
+        sparkContext.listenerBus.waitUntilEmpty()
+        assert(oneRowRelation.size == 1)
+
+        val expected = Map("number of output rows" -> 1L)
+        testSparkPlanMetrics(df.toDF(), 1, Map(
+          nodeId -> (("Scan OneRowRelation", expected))))
+      }
+    }
+  }
+
+  test("SPARK-57313: Sample numOutputRows metric") {
+    Seq(false, true).foreach { withReplacement =>
+      Seq("false", "true").foreach { enableWholeStage =>
+        withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> enableWholeStage) {
+          val df = spark.range(0, 1000, 1, 1)
+            .sample(withReplacement = withReplacement, fraction = 0.5, seed = 1)
+          val expectedRows = df.collect().length
+          sparkContext.listenerBus.waitUntilEmpty()
+          val sample = df.queryExecution.executedPlan.collect {
+            case s: SampleExec => s
+          }
+          assert(sample.size == 1)
+          assert(sample.head.metrics("numOutputRows").value == expectedRows)
+        }
+      }
     }
   }
 
@@ -304,6 +339,26 @@ class SQLMetricsSuite extends SharedSparkSession with SQLMetricsTestUtils
         0L -> (("ObjectHashAggregate", Map(
           "spill size" -> {
             _.toString.matches(sizeMetricPattern)
+          }))))
+      )
+    }
+  }
+
+  test("SortAggregate metrics") {
+    // Force use SortAggregateExec instead of HashAggregateExec
+    withSQLConf(SQLConf.USE_HASH_AGG.key -> "false") {
+      // Assume the execution plan is
+      // -> SortAggregate(nodeId = 0)
+      //     -> Sort(nodeId = 1)
+      //       -> Exchange(nodeId = 2)
+      //          -> SortAggregate(...)
+      val df = testData2.groupBy($"a").count()
+
+      // Test aggTime metric for grouped aggregate
+      testSparkPlanMetricsWithPredicates(df, 1, Map(
+        0L -> (("SortAggregate", Map(
+          "time in aggregation build" -> {
+            _.toString.matches(timingMetricPattern)
           }))))
       )
     }
@@ -634,10 +689,9 @@ class SQLMetricsSuite extends SharedSparkSession with SQLMetricsTestUtils
     // After serializing to JSON, the original value type is lost, but we can still
     // identify that it's a SQL metric from the metadata
     val mapper = new ObjectMapper()
-    val jsonProtocol = new JsonProtocol(new SparkConf())
-    val metricInfoJson = jsonProtocol.toJsonString(
-      jsonProtocol.accumulableInfoToJson(metricInfo, _))
-    val metricInfoDeser = jsonProtocol.accumulableInfoFromJson(mapper.readTree(metricInfoJson))
+    val metricInfoJson = JsonProtocol.toJsonString(
+      JsonProtocol.accumulableInfoToJson(metricInfo, _))
+    val metricInfoDeser = JsonProtocol.accumulableInfoFromJson(mapper.readTree(metricInfoJson))
     metricInfoDeser.update match {
       case Some(v: String) => assert(v.toLong === 10L)
       case Some(v) => fail(s"deserialized metric value was not a string: ${v.getClass.getName}")
@@ -689,16 +743,33 @@ class SQLMetricsSuite extends SharedSparkSession with SQLMetricsTestUtils
   }
 
   test("SPARK-25278: output metrics are wrong for plans repeated in the query") {
-    val name = "demo_view"
-    withView(name) {
-      sql(s"CREATE OR REPLACE VIEW $name AS VALUES 1,2")
-      val view = spark.table(name)
-      val union = view.union(view)
-      testSparkPlanMetrics(union, 1, Map(
-        0L -> ("Union" -> Map()),
-        1L -> ("Project" -> Map()),
-        2L -> ("LocalTableScan" -> Map("number of output rows" -> 2L)),
-        3L -> ("LocalTableScan" -> Map("number of output rows" -> 2L))))
+    withSQLConf(SQLConf.WHOLESTAGE_UNION_CODEGEN_ENABLED.key -> "false") {
+      val name = "demo_view"
+      withView(name) {
+        sql(s"CREATE OR REPLACE VIEW $name AS VALUES 1,2")
+        val view = spark.table(name)
+        val union = view.union(view)
+        testSparkPlanMetrics(union, 1, Map(
+          0L -> ("Union" -> Map()),
+          1L -> ("Project" -> Map()),
+          2L -> ("LocalTableScan" -> Map("number of output rows" -> 2L)),
+          3L -> ("LocalTableScan" -> Map("number of output rows" -> 2L))))
+      }
+    }
+  }
+
+  test("UnionExec.numOutputRows reports total row count under fusion") {
+    withSQLConf(SQLConf.WHOLESTAGE_UNION_CODEGEN_ENABLED.key -> "true") {
+      val name = "demo_view"
+      withView(name) {
+        sql(s"CREATE OR REPLACE VIEW $name AS VALUES 1,2")
+        val union = spark.table(name).union(spark.table(name))
+        union.collect()
+        val unionExec = union.queryExecution.executedPlan.collectFirst {
+          case u: UnionExec => u
+        }.get
+        assert(unionExec.metrics("numOutputRows").value == 4L)
+      }
     }
   }
 
@@ -759,7 +830,9 @@ class SQLMetricsSuite extends SharedSparkSession with SQLMetricsTestUtils
   }
 
   test("SPARK-25497: LIMIT within whole stage codegen should not consume all the inputs") {
-    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+    withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+        SQLConf.COMBINE_ADJACENT_AGGREGATION_ENABLED.key -> "false",
+        SQLConf.REPLACE_HASH_WITH_SORT_AGG_ENABLED.key -> "false") {
       // A special query that only has one partition, so there is no shuffle and the entire query
       // can be whole-stage-codegened.
       val df = spark.range(0, 1500, 1, 1).limit(10).groupBy($"id")
@@ -917,16 +990,27 @@ class SQLMetricsSuite extends SharedSparkSession with SQLMetricsTestUtils
           withTable("t1", "t2") {
             spark.range(4).write.saveAsTable("t1")
             spark.range(2).write.saveAsTable("t2")
-            val df = sql("SELECT * FROM t1 WHERE id NOT IN (SELECT id FROM t2)")
-            df.collect()
-            val plan = df.queryExecution.executedPlan
+            val df1 = sql("SELECT * FROM t1 WHERE id NOT IN (SELECT id FROM t2)")
+            df1.collect()
+            val plan1 = df1.queryExecution.executedPlan
 
-            val joins = plan.collect {
+            val joins1 = plan1.collect {
               case s: BroadcastHashJoinExec => s
             }
 
-            assert(joins.size === 1)
-            testMetricsInSparkPlanOperator(joins.head, Map("numOutputRows" -> 2))
+            assert(joins1.size === 1)
+            testMetricsInSparkPlanOperator(joins1.head, Map("numOutputRows" -> 2))
+
+            val df2 = sql("SELECT * FROM t1 WHERE id NOT IN (SELECT id FROM t2 WHERE 1 = 2)")
+            df2.collect()
+            val plan2 = df2.queryExecution.executedPlan
+
+            val joins2 = plan2.collect {
+              case s: BroadcastHashJoinExec => s
+            }
+
+            assert(joins2.size === 1)
+            testMetricsInSparkPlanOperator(joins2.head, Map("numOutputRows" -> 4))
           }
         }
       }

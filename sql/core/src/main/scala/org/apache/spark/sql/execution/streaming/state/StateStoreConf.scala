@@ -31,14 +31,26 @@ class StateStoreConf(
   def this() = this(new SQLConf)
 
   /**
-   * Size of MaintenanceThreadPool to perform maintenance tasks for StateStore
+   * Total number of maintenance threads. Split evenly between the snapshot
+   * and cleanup thread pools. Each pool needs at least 1 thread, so the
+   * minimum is 2.
    */
   val numStateStoreMaintenanceThreads: Int = sqlConf.numStateStoreMaintenanceThreads
+
+  /** Ratio of threads for snapshot pool. Remainder goes to cleanup.
+   *  Each pool gets at least 1 thread and the total is never exceeded. */
+  val snapshotToCleanupThreadRatio: Double = sqlConf.snapshotToCleanupThreadRatio
 
   /**
    * Timeout for state store maintenance operations to complete on shutdown
    */
   val stateStoreMaintenanceShutdownTimeout: Long = sqlConf.stateStoreMaintenanceShutdownTimeout
+
+  /**
+   * Timeout to wait for tasks to respond to cancellation after force shutdown is initiated
+   */
+  val stateStoreMaintenanceForceShutdownTimeout: Long =
+    sqlConf.stateStoreMaintenanceForceShutdownTimeout
 
   val stateStoreMaintenanceProcessingTimeout: Long = sqlConf.stateStoreMaintenanceProcessingTimeout
 
@@ -47,6 +59,17 @@ class StateStoreConf(
    * consider generating a snapshot.
    */
   val minDeltasForSnapshot: Int = sqlConf.stateStoreMinDeltasForSnapshot
+
+  /** Whether we should enable automatic snapshot repair */
+  val autoSnapshotRepairEnabled: Boolean = sqlConf.stateStoreAutoSnapshotRepairEnabled
+
+  /** Number of failures before activating auto snapshot repair when enabled */
+  val autoSnapshotRepairNumFailuresBeforeActivating: Int =
+    sqlConf.stateStoreAutoSnapshotRepairNumFailuresBeforeActivating
+
+  /** Maximum number of change files allowed to be replayed when auto snapshot repair is enabled */
+  val autoSnapshotRepairMaxChangeFileReplay: Int =
+    sqlConf.stateStoreAutoSnapshotRepairMaxChangeFileReplay
 
   /** Minimum versions a State Store implementation should retain to allow rollbacks */
   val minVersionsToRetain: Int = sqlConf.minBatchesToRetain
@@ -61,6 +84,9 @@ class StateStoreConf(
 
   /** Maximum count of versions a State Store implementation should retain in memory */
   val maxVersionsToRetainInMemory: Int = sqlConf.maxBatchesToRetainInMemory
+
+  /** Maximum number of versions to delete per maintenance operation */
+  val maxVersionsToDeletePerMaintenance: Int = sqlConf.maxVersionsToDeletePerMaintenance
 
   /**
    * Optional fully qualified name of the subclass of [[StateStoreProvider]]
@@ -93,6 +119,13 @@ class StateStoreConf(
   /** The compression codec used to compress delta and snapshot files. */
   val compressionCodec: String = sqlConf.stateStoreCompressionCodec
 
+  /** Whether file checksum generation and verification is enabled. */
+  val checkpointFileChecksumEnabled: Boolean =
+    sqlConf.checkpointFileChecksumEnabled && sqlConf.stateStoreCheckpointFormatVersion >= 2
+
+  /** Number of threads for the file checksum thread pool (0 to disable). */
+  val fileChecksumThreadPoolSize: Int = sqlConf.stateStoreFileChecksumThreadPoolSize
+
   /** whether to validate state schema during query run. */
   val stateSchemaCheckEnabled = sqlConf.isStateSchemaCheckEnabled
 
@@ -109,6 +142,20 @@ class StateStoreConf(
     StatefulOperatorStateInfo.enableStateStoreCheckpointIds(sqlConf)
 
   /**
+   * Whether to skip checksum creation if file missing checksum.
+   *
+   * Consider the case using STATE_STORE_CHECKPOINT_FORMAT_VERSION = 1 when a batch fails but state
+   * files are written. If on the next run, we try to upload both a new state file and a file
+   * checksum, the file could fail to be uploaded but the file checksum is uploaded successfully.
+   * This would lead to a situation where the old file could be loaded and compared with the new
+   * file checksum, which would fail the checksum verification. This issue does not happen when
+   * STATE_STORE_CHECKPOINT_FORMAT_VERSION = 2 since each batch run unique ids will be created.
+   */
+  val checkpointFileChecksumSkipCreationIfFileMissingChecksum: Boolean =
+    sqlConf.checkpointFileChecksumSkipCreationIfFileMissingChecksum &&
+    !enableStateStoreCheckpointIds
+
+  /**
    * Whether the coordinator is reporting state stores trailing behind in snapshot uploads.
    */
   val reportSnapshotUploadLag: Boolean =
@@ -116,6 +163,12 @@ class StateStoreConf(
 
   /** Whether to unload the store on task completion. */
   val unloadOnCommit = sqlConf.stateStoreUnloadOnCommit
+
+  /** whether to enable checksum for state store rows. */
+  val rowChecksumEnabled = sqlConf.stateStoreRowChecksumEnabled
+
+  /** How often should we do row checksum verification when rows are read from the state store. */
+  val rowChecksumReadVerificationRatio: Long = sqlConf.stateStoreRowChecksumReadVerificationRatio
 
   /** The version of the state store checkpoint format. */
   val stateStoreCheckpointFormatVersion: Int = sqlConf.stateStoreCheckpointFormatVersion

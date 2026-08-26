@@ -24,31 +24,37 @@ import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.functions.expr
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming._
+import org.apache.spark.tags.ExtendedSQLTest
 
 // RocksDBSkipMaintenanceOnCertainPartitionsProvider is a test-only provider that skips running
 // maintenance for partitions 0 and 1 (these are arbitrary choices). This is used to test
 // snapshot upload lag can be observed through StreamingQueryProgress metrics.
 class RocksDBSkipMaintenanceOnCertainPartitionsProvider extends RocksDBStateStoreProvider {
-  override def doMaintenance(): Unit = {
-    if (stateStoreId.partitionId == 0 || stateStoreId.partitionId == 1) {
-      return
-    }
-    super.doMaintenance()
-  }
+  private def shouldSkip: Boolean =
+    stateStoreId.partitionId == 0 || stateStoreId.partitionId == 1
+
+  override def doSnapshotMaintenance(): Unit =
+    if (!shouldSkip) super.doSnapshotMaintenance()
+
+  override def doCleanupMaintenance(): Unit =
+    if (!shouldSkip) super.doCleanupMaintenance()
 }
 
 // HDFSBackedSkipMaintenanceOnCertainPartitionsProvider is a test-only provider that skips running
 // maintenance for partitions 0 and 1 (these are arbitrary choices). This is used to test
 // snapshot upload lag can be observed through StreamingQueryProgress metrics.
 class HDFSBackedSkipMaintenanceOnCertainPartitionsProvider extends HDFSBackedStateStoreProvider {
-  override def doMaintenance(): Unit = {
-    if (stateStoreId.partitionId == 0 || stateStoreId.partitionId == 1) {
-      return
-    }
-    super.doMaintenance()
-  }
+  private def shouldSkip: Boolean =
+    stateStoreId.partitionId == 0 || stateStoreId.partitionId == 1
+
+  override def doSnapshotMaintenance(): Unit =
+    if (!shouldSkip) super.doSnapshotMaintenance()
+
+  override def doCleanupMaintenance(): Unit =
+    if (!shouldSkip) super.doCleanupMaintenance()
 }
 
+@ExtendedSQLTest
 class StateStoreInstanceMetricSuite extends StreamTest with AlsoTestWithRocksDBFeatures {
   import testImplicits._
 
@@ -73,6 +79,7 @@ class StateStoreInstanceMetricSuite extends StreamTest with AlsoTestWithRocksDBF
           SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100",
           SQLConf.STREAMING_NO_DATA_PROGRESS_EVENT_INTERVAL.key -> "10",
           SQLConf.STATE_STORE_MAINTENANCE_SHUTDOWN_TIMEOUT.key -> "3",
+          SQLConf.STATE_STORE_MAINTENANCE_FORCE_SHUTDOWN_TIMEOUT.key -> "5",
           SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "1",
           SQLConf.STATE_STORE_INSTANCE_METRICS_REPORT_LIMIT.key -> "3"
         ) {
@@ -137,6 +144,7 @@ class StateStoreInstanceMetricSuite extends StreamTest with AlsoTestWithRocksDBF
           SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100",
           SQLConf.STREAMING_NO_DATA_PROGRESS_EVENT_INTERVAL.key -> "10",
           SQLConf.STATE_STORE_MAINTENANCE_SHUTDOWN_TIMEOUT.key -> "3",
+          SQLConf.STATE_STORE_MAINTENANCE_FORCE_SHUTDOWN_TIMEOUT.key -> "5",
           SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "1",
           SQLConf.STATE_STORE_INSTANCE_METRICS_REPORT_LIMIT.key -> "3"
         ) {
@@ -212,6 +220,7 @@ class StateStoreInstanceMetricSuite extends StreamTest with AlsoTestWithRocksDBF
           SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100",
           SQLConf.STREAMING_NO_DATA_PROGRESS_EVENT_INTERVAL.key -> "10",
           SQLConf.STATE_STORE_MAINTENANCE_SHUTDOWN_TIMEOUT.key -> "3",
+          SQLConf.STATE_STORE_MAINTENANCE_FORCE_SHUTDOWN_TIMEOUT.key -> "5",
           SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "1",
           SQLConf.STATE_STORE_INSTANCE_METRICS_REPORT_LIMIT.key -> "10",
           SQLConf.SHUFFLE_PARTITIONS.key -> "3"
@@ -289,6 +298,7 @@ class StateStoreInstanceMetricSuite extends StreamTest with AlsoTestWithRocksDBF
           SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100",
           SQLConf.STREAMING_NO_DATA_PROGRESS_EVENT_INTERVAL.key -> "10",
           SQLConf.STATE_STORE_MAINTENANCE_SHUTDOWN_TIMEOUT.key -> "3",
+          SQLConf.STATE_STORE_MAINTENANCE_FORCE_SHUTDOWN_TIMEOUT.key -> "5",
           SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "1",
           SQLConf.STATE_STORE_INSTANCE_METRICS_REPORT_LIMIT.key -> "10"
         ) {
@@ -363,6 +373,7 @@ class StateStoreInstanceMetricSuite extends StreamTest with AlsoTestWithRocksDBF
       SQLConf.STREAMING_MAINTENANCE_INTERVAL.key -> "100",
       SQLConf.STREAMING_NO_DATA_PROGRESS_EVENT_INTERVAL.key -> "10",
       SQLConf.STATE_STORE_MAINTENANCE_SHUTDOWN_TIMEOUT.key -> "3",
+      SQLConf.STATE_STORE_MAINTENANCE_FORCE_SHUTDOWN_TIMEOUT.key -> "5",
       SQLConf.STATE_STORE_MIN_DELTAS_FOR_SNAPSHOT.key -> "1",
       SQLConf.STATE_STORE_INSTANCE_METRICS_REPORT_LIMIT.key -> "4",
       SQLConf.STREAMING_JOIN_STATE_FORMAT_VERSION.key -> "3"
@@ -476,3 +487,9 @@ class StateStoreInstanceMetricSuite extends StreamTest with AlsoTestWithRocksDBF
       }
   }
 }
+
+/**
+ * Test suite that runs all StateStoreInstanceMetricSuite tests with row checksum enabled.
+ */
+class StateStoreInstanceMetricSuiteWithRowChecksum
+  extends StateStoreInstanceMetricSuite with EnableStateStoreRowChecksum

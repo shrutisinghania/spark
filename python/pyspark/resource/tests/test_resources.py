@@ -15,11 +15,10 @@
 # limitations under the License.
 #
 import unittest
-from typing import cast
 
 from pyspark.resource import ExecutorResourceRequests, ResourceProfileBuilder, TaskResourceRequests
 from pyspark.sql import SparkSession
-from pyspark.testing.sqlutils import (
+from pyspark.testing.utils import (
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
@@ -28,6 +27,12 @@ from pyspark.testing.sqlutils import (
 
 
 class ResourceProfileTests(unittest.TestCase):
+    def test_fractional_cpus_request(self):
+        # SPARK-58192: fractional cpus amounts are preserved instead of being truncated to int
+        for amount in [0.5, 1.5]:
+            treqs = TaskResourceRequests().cpus(amount)
+            self.assertEqual(treqs.requests["cpus"].amount, amount)
+
     def test_profile_before_sc(self):
         rpb = ResourceProfileBuilder()
         ereqs = ExecutorResourceRequests().cores(2).memory("6g").memoryOverhead("1g")
@@ -52,7 +57,7 @@ class ResourceProfileTests(unittest.TestCase):
         assert_request_contents(ereqs.requests, treqs.requests)
         rp = rpb.require(ereqs).require(treqs).build
         assert_request_contents(rp.executorResources, rp.taskResources)
-        from pyspark import SparkContext, SparkConf
+        from pyspark import SparkConf, SparkContext
 
         sc = SparkContext(conf=SparkConf())
         rdd = sc.parallelize(range(10)).withResources(rp)
@@ -80,7 +85,7 @@ class ResourceProfileTests(unittest.TestCase):
 
     @unittest.skipIf(
         not have_pandas or not have_pyarrow,
-        cast(str, pandas_requirement_message or pyarrow_requirement_message),
+        pandas_requirement_message or pyarrow_requirement_message,
     )
     def test_profile_before_sc_for_sql(self):
         rpb = ResourceProfileBuilder()
@@ -96,12 +101,6 @@ class ResourceProfileTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.resource.tests.test_resources import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

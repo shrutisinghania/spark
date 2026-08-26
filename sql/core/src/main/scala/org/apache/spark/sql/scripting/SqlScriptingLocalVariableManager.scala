@@ -21,6 +21,7 @@ import org.apache.spark.SparkException
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis.{FakeLocalCatalog, ResolvedIdentifier}
 import org.apache.spark.sql.catalyst.catalog.{VariableDefinition, VariableManager}
+import org.apache.spark.sql.catalyst.trees.Origin
 import org.apache.spark.sql.connector.catalog.Identifier
 import org.apache.spark.sql.errors.DataTypeErrorsBase
 import org.apache.spark.sql.errors.QueryCompilationErrors.unresolvedVariableError
@@ -28,32 +29,37 @@ import org.apache.spark.sql.errors.QueryCompilationErrors.unresolvedVariableErro
 class SqlScriptingLocalVariableManager(context: SqlScriptingExecutionContext)
   extends VariableManager with DataTypeErrorsBase {
 
+  override def getVariableNameForError(variableName: String): String =
+    toSQLId(Seq(context.currentScope.label, variableName))
+
   override def create(
       nameParts: Seq[String],
       varDef: VariableDefinition,
       overrideIfExists: Boolean): Unit = {
     val name = nameParts.last
 
-    // overrideIfExists should not be supported because local variables don't support
-    // DECLARE OR REPLACE. However ForStatementExec currently uses this to handle local vars,
-    // so we support it for now.
-    // TODO [SPARK-50785]: Refactor ForStatementExec to use local variables properly.
-    if (!overrideIfExists && context.currentScope.variables.contains(name)) {
+    // Sanity check, this should already be thrown by CreateVariableExec.run
+    if (context.currentScope.variables.contains(name)) {
       throw new AnalysisException(
         errorClass = "VARIABLE_ALREADY_EXISTS",
         messageParameters = Map(
-          "variableName" -> toSQLId(Seq(context.currentScope.label, name))))
+          "variableName" -> getVariableNameForError(name)))
     }
     context.currentScope.variables.put(name, varDef)
   }
 
-  override def set(nameParts: Seq[String], varDef: VariableDefinition): Unit = {
+  override def set(
+      nameParts: Seq[String],
+      varDef: VariableDefinition,
+      origin: Origin): Unit = {
     val scope = findScopeOfVariable(nameParts)
       .getOrElse(
-        throw unresolvedVariableError(nameParts, varDef.identifier.namespace().toIndexedSeq))
+        throw unresolvedVariableError(
+          nameParts, Seq(varDef.identifier.namespace().toIndexedSeq), origin))
 
     if (!scope.variables.contains(nameParts.last)) {
-      throw unresolvedVariableError(nameParts, varDef.identifier.namespace().toIndexedSeq)
+      throw unresolvedVariableError(
+        nameParts, Seq(varDef.identifier.namespace().toIndexedSeq), origin)
     }
 
     scope.variables.put(nameParts.last, varDef)
@@ -76,39 +82,13 @@ class SqlScriptingLocalVariableManager(context: SqlScriptingExecutionContext)
         throw SparkException.internalError("ScriptingVariableManager expects 1 or 2 nameParts.")
     }
 
-    // First search for variable in entire current frame.
-    val resCurrentFrame = context.currentFrame.scopes
-      .findLast(scope => isScopeOfVar(nameParts, scope))
-    if (resCurrentFrame.isDefined) {
-      return resCurrentFrame
-    }
-
-    // When searching in previous frames, for each frame we have to check only scopes before and
-    // including the scope where the previously checked exception handler frame is defined.
-    // Exception handler frames should not have access to variables from scopes
-    // which are nested below the scope where the handler is defined.
-    var previousFrameDefinitionLabel = context.currentFrame.scopeLabel
-
-    // dropRight(1) removes the current frame, which we already checked above.
-    context.frames.dropRight(1).reverseIterator.foreach(frame => {
-      // Drop scopes until we encounter the scope in which the previously checked
-      // frame was defined. If it was not defined in this scope candidateScopes will be
-      // empty.
-      val candidateScopes = frame.scopes.reverse.dropWhile(
-        scope => !previousFrameDefinitionLabel.contains(scope.label))
-
-      val scope = candidateScopes.findLast(scope => isScopeOfVar(nameParts, scope))
-      if (scope.isDefined) {
-        return scope
-      }
-      // If candidateScopes is nonEmpty that means that we found the previous frame definition
-      // in this frame. If we still have not found the variable, we now have to find the definition
-      // of this new frame, so we reassign the frame definition label to search for.
-      if (candidateScopes.nonEmpty) {
-        previousFrameDefinitionLabel = frame.scopeLabel
-      }
-    })
-    None
+    // Use the shared searchAcrossFrames helper to maintain consistent logic with cursors
+    context.searchAcrossFrames(
+      searchInCurrentFrame = frame =>
+        frame.scopes.findLast(scope => isScopeOfVar(nameParts, scope)),
+      searchInScopes = scopes =>
+        scopes.findLast(scope => isScopeOfVar(nameParts, scope))
+    )
   }
 
   override def qualify(name: String): ResolvedIdentifier =

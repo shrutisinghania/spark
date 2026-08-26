@@ -131,7 +131,20 @@ abstract class EventLogFileWriter(
   }
 
   protected def closeWriter(): Unit = {
+    // 1. Flush first to check the errors
+    writer.foreach(_.flush())
+    if (writer.exists(_.checkError())) {
+      logError("Spark detects errors while flushing event logs.")
+    }
+    hadoopDataStream.foreach(_.hflush())
+
+    // 2. Try to close and check the errors
     writer.foreach(_.close())
+    if (writer.exists(_.checkError())) {
+      logError("Spark detects errors while closing event logs.")
+      // 3. Ensuring the underlying stream is closed at least (best-effort).
+      hadoopDataStream.foreach(_.close())
+    }
   }
 
   protected def renameFile(src: Path, dest: Path, overwrite: Boolean): Unit = {
@@ -237,12 +250,22 @@ class SingleEventLogFileWriter(
    * ".inprogress" suffix.
    */
   override def stop(): Unit = {
+    logInfo(log"Stopping event writer for ${MDC(PATH, logPath)}")
     closeWriter()
     renameFile(new Path(inProgressPath), new Path(logPath), shouldOverwrite)
   }
 }
 
 object SingleEventLogFileWriter {
+  /** Returns names for completed and in-progress single event logs. */
+  private[history] def getLogFileNames(appId: String, appAttemptId: Option[String]): Seq[String] = {
+    val logBaseName = EventLogFileWriter.nameForAppAndAttempt(appId, appAttemptId)
+    val names = logBaseName +: CompressionCodec.shortCompressionCodecNames.keys.toSeq.map {
+      codec => s"$logBaseName.$codec"
+    }
+    names ++ names.map(_ + EventLogFileWriter.IN_PROGRESS)
+  }
+
   /**
    * Return a file-system-safe path to the log file for the given application.
    *
@@ -354,6 +377,7 @@ class RollingEventLogFilesWriter(
   }
 
   override def stop(): Unit = {
+    logInfo(log"Stopping event writer for ${MDC(PATH, logPath)}")
     closeWriter()
     val appStatusPathIncomplete = getAppStatusFilePath(logDirForAppPath, appId, appAttemptId,
       inProgress = true)

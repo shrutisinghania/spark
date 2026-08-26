@@ -23,9 +23,9 @@ import time
 import unittest
 from collections import namedtuple
 
-from pyspark import SparkConf, SparkFiles, SparkContext
+from pyspark import SparkConf, SparkContext, SparkFiles
 from pyspark.testing.sqlutils import SPARK_HOME
-from pyspark.testing.utils import ReusedPySparkTestCase, PySparkTestCase, QuietTest
+from pyspark.testing.utils import PySparkTestCase, QuietTest, ReusedPySparkTestCase
 
 
 class CheckpointTests(ReusedPySparkTestCase):
@@ -263,6 +263,24 @@ class ContextTests(unittest.TestCase):
 
             sc.stop()
 
+    def test_executor_infos(self):
+        with SparkContext() as sc:
+            tracker = sc.statusTracker()
+            executorInfos = tracker.getExecutorInfos()
+            # In local mode there should be at least one executor (the driver)
+            self.assertGreaterEqual(len(executorInfos), 1)
+            for info in executorInfos:
+                self.assertIsNotNone(info.host)
+                self.assertGreaterEqual(info.port, 0)
+                self.assertGreaterEqual(info.cacheSize, 0)
+                self.assertGreaterEqual(info.numRunningTasks, 0)
+                self.assertGreaterEqual(info.usedOnHeapStorageMemory, 0)
+                self.assertGreaterEqual(info.usedOffHeapStorageMemory, 0)
+                self.assertGreaterEqual(info.totalOnHeapStorageMemory, 0)
+                self.assertGreaterEqual(info.totalOffHeapStorageMemory, 0)
+
+            sc.stop()
+
     def test_startTime(self):
         with SparkContext() as sc:
             self.assertGreater(sc.startTime, 0)
@@ -303,6 +321,33 @@ class ContextTests(unittest.TestCase):
         with SparkContext("local-cluster[3, 1, 1024]") as sc:
             sc.range(2).foreach(lambda _: create_spark_context())
 
+    def test_cancel_all_jobs_reason_reaches_the_job_failure(self):
+        # SPARK-58616: the reason must survive the trip to the JVM and land in the cancelled
+        # job's error, instead of the generic "as part of cancellation of all jobs".
+        with SparkContext() as sc:
+            errors = []
+
+            def run_job():
+                try:
+                    sc.parallelize(range(4), 4).map(lambda x: time.sleep(60)).collect()
+                except Exception as e:
+                    errors.append(str(e))
+
+            job = threading.Thread(target=run_job)
+            job.start()
+            # Wait for the job to reach the scheduler before cancelling it.
+            deadline = time.time() + 60
+            while not sc.statusTracker().getActiveJobsIds():
+                self.assertLess(time.time(), deadline, "job never reached the scheduler")
+                time.sleep(0.1)
+
+            sc.cancelAllJobs(reason="because the test asked for it")
+            job.join(60)
+
+            self.assertEqual(len(errors), 1)
+            self.assertIn("because the test asked for it", errors[0])
+            self.assertNotIn("as part of cancellation of all jobs", errors[0])
+
 
 class ContextTestsWithResources(unittest.TestCase):
     def setUp(self):
@@ -336,12 +381,6 @@ class ContextTestsWithResources(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_context import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

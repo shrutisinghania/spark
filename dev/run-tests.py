@@ -18,21 +18,23 @@
 #
 
 import itertools
-from argparse import ArgumentParser
 import os
 import re
-import sys
 import subprocess
+import sys
+import tempfile
+from argparse import ArgumentParser
+from contextlib import contextmanager
 
-from sparktestsupport import SPARK_HOME, USER_HOME, ERROR_CODES
-from sparktestsupport.shellutils import exit_from_command_with_retcode, run_cmd, rm_r, which
+import sparktestsupport.modules as modules
+from sparktestsupport import SPARK_HOME, USER_HOME
+from sparktestsupport.shellutils import exit_from_command_with_retcode, rm_r, run_cmd, which
 from sparktestsupport.utils import (
+    determine_dangling_python_tests,
     determine_modules_for_files,
     determine_modules_to_test,
-    determine_tags_to_exclude,
     identify_changed_files_from_git_commits,
 )
-import sparktestsupport.modules as modules
 
 
 def setup_test_environ(environ):
@@ -68,31 +70,38 @@ def determine_java_executable():
 # -------------------------------------------------------------------------------------------------
 
 
-def set_title_and_block(title, err_block):
-    os.environ["CURRENT_BLOCK"] = str(ERROR_CODES[err_block])
+@contextmanager
+def titled_block(title):
+    if getattr(titled_block, "_entered", False):
+        raise RuntimeError(f"titled_block({title!r}) cannot be nested")
+    titled_block._entered = True
     line_str = "=" * 72
-
+    if "GITHUB_ACTIONS" in os.environ:
+        print(f"::group::{title}", flush=True)
     print("")
     print(line_str)
     print(title)
     print(line_str)
+    try:
+        yield
+    finally:
+        titled_block._entered = False
+        if "GITHUB_ACTIONS" in os.environ:
+            print("::endgroup::", flush=True)
 
 
 def run_apache_rat_checks():
-    set_title_and_block("Running Apache RAT checks", "BLOCK_RAT")
     run_cmd([os.path.join(SPARK_HOME, "dev", "check-license")])
 
 
 def run_scala_style_checks(extra_profiles):
     build_profiles = extra_profiles + modules.root.build_profile_flags
-    set_title_and_block("Running Scala style checks", "BLOCK_SCALA_STYLE")
     profiles = " ".join(build_profiles)
     print("[info] Checking Scala style using SBT with these profiles: ", profiles)
     run_cmd([os.path.join(SPARK_HOME, "dev", "lint-scala"), profiles])
 
 
 def run_java_style_checks(build_profiles):
-    set_title_and_block("Running Java style checks", "BLOCK_JAVA_STYLE")
     # The same profiles used for building are used to run Checkstyle by SBT as well because
     # the previous build looks reused for Checkstyle and affecting Checkstyle. See SPARK-27130.
     profiles = " ".join(build_profiles)
@@ -101,13 +110,10 @@ def run_java_style_checks(build_profiles):
 
 
 def run_python_style_checks():
-    set_title_and_block("Running Python style checks", "BLOCK_PYTHON_STYLE")
     run_cmd([os.path.join(SPARK_HOME, "dev", "lint-python")])
 
 
 def run_sparkr_style_checks():
-    set_title_and_block("Running R style checks", "BLOCK_R_STYLE")
-
     if which("R"):
         # R style check should be executed after `install-dev.sh`.
         # Since warnings about `no visible global function definition` appear
@@ -115,27 +121,6 @@ def run_sparkr_style_checks():
         run_cmd([os.path.join(SPARK_HOME, "dev", "lint-r")])
     else:
         print("Ignoring SparkR style check as R was not found in PATH")
-
-
-def build_spark_documentation():
-    set_title_and_block("Building Spark Documentation", "BLOCK_DOCUMENTATION")
-    os.environ["PRODUCTION"] = "1"
-
-    os.chdir(os.path.join(SPARK_HOME, "docs"))
-
-    bundle_bin = which("bundle")
-
-    if not bundle_bin:
-        print(
-            "[error] Cannot find a version of `bundle` on the system; please",
-            " install one with `gem install bundler` and retry to build documentation.",
-        )
-        sys.exit(int(os.environ.get("CURRENT_BLOCK", 255)))
-    else:
-        run_cmd([bundle_bin, "install"])
-        run_cmd([bundle_bin, "exec", "jekyll", "build"])
-
-    os.chdir(SPARK_HOME)
 
 
 def exec_maven(mvn_args=()):
@@ -166,6 +151,7 @@ def exec_sbt(sbt_args=()):
     for line in iter(sbt_proc.stdout.readline, b""):
         if not sbt_output_filter.match(line):
             print(line.decode("utf-8"), end="")
+    print()  # print a new line because the code above does not guarantee a new line
     retcode = sbt_proc.wait()
 
     if retcode != 0:
@@ -194,15 +180,13 @@ def get_scala_profiles(scala_version):
             " are",
             sbt_maven_scala_profiles.keys(),
         )
-        sys.exit(int(os.environ.get("CURRENT_BLOCK", 255)))
+        sys.exit(1)
 
 
 def switch_scala_version(scala_version):
     """
     Switch the code base to use the given Scala version.
     """
-    set_title_and_block("Switch the Scala version to %s" % scala_version, "BLOCK_SCALA_VERSION")
-
     assert scala_version is not None
     ver_num = scala_version[-4:]  # Simply extract. e.g.) 2.13 from scala2.13
     command = [os.path.join(SPARK_HOME, "dev", "change-scala-version.sh"), ver_num]
@@ -229,7 +213,7 @@ def get_hadoop_profiles(hadoop_version):
             " are",
             sbt_maven_hadoop_profiles.keys(),
         )
-        sys.exit(int(os.environ.get("CURRENT_BLOCK", 255)))
+        sys.exit(1)
 
 
 def build_spark_maven(extra_profiles):
@@ -259,7 +243,6 @@ def build_spark_sbt(extra_profiles):
 
 
 def build_spark_unidoc_sbt(extra_profiles):
-    set_title_and_block("Building Unidoc API Documentation", "BLOCK_DOCUMENTATION")
     # Enable all of the profiles for the build:
     build_profiles = extra_profiles + modules.root.build_profile_flags
     sbt_goals = ["unidoc"]
@@ -273,7 +256,7 @@ def build_spark_unidoc_sbt(extra_profiles):
     exec_sbt(profiles_and_goals)
 
 
-def build_spark_assembly_sbt(extra_profiles, checkstyle=False):
+def build_spark_assembly_sbt(extra_profiles):
     # Enable all of the profiles for the build:
     build_profiles = extra_profiles + modules.root.build_profile_flags
     sbt_goals = ["assembly/package"]
@@ -282,20 +265,13 @@ def build_spark_assembly_sbt(extra_profiles, checkstyle=False):
         "[info] Building Spark assembly using SBT with these arguments: ",
         " ".join(profiles_and_goals),
     )
+
     exec_sbt(profiles_and_goals)
-
-    if checkstyle:
-        run_java_style_checks(build_profiles)
-
-    if not os.environ.get("SPARK_JENKINS") and not os.environ.get("SKIP_UNIDOC"):
-        build_spark_unidoc_sbt(extra_profiles)
 
 
 def build_apache_spark(build_tool, extra_profiles):
     """Will build Spark with the extra profiles and the passed in build tool
     (either `sbt` or `maven`). Defaults to using `sbt`."""
-
-    set_title_and_block("Building Spark", "BLOCK_BUILD")
 
     rm_r("lib_managed")
 
@@ -307,7 +283,6 @@ def build_apache_spark(build_tool, extra_profiles):
 
 def detect_binary_inop_with_mima(extra_profiles):
     build_profiles = extra_profiles + modules.root.build_profile_flags
-    set_title_and_block("Detecting binary incompatibilities with MiMa", "BLOCK_MIMA")
     profiles = " ".join(build_profiles)
     print(
         "[info] Detecting binary incompatibilities with MiMa using SBT with these profiles: ",
@@ -347,7 +322,6 @@ def run_scala_tests_sbt(test_modules, test_profiles):
 def run_scala_tests(build_tool, extra_profiles, test_modules, excluded_tags, included_tags):
     """Function to properly execute all tests passed in as a set from the
     `determine_test_suites` function"""
-    set_title_and_block("Running Spark unit tests", "BLOCK_SPARK_UNIT_TESTS")
 
     # Remove duplicates while keeping the test module order
     test_modules = list(dict.fromkeys(test_modules))
@@ -375,9 +349,9 @@ def run_scala_tests(build_tool, extra_profiles, test_modules, excluded_tags, inc
         run_scala_tests_sbt(test_modules, test_profiles)
 
 
-def run_python_tests(test_modules, test_pythons, parallelism, with_coverage=False):
-    set_title_and_block("Running PySpark tests", "BLOCK_PYSPARK_UNIT_TESTS")
-
+def run_python_tests(
+    test_modules, test_pythons, parallelism, changed_files=None, with_coverage=False
+):
     if with_coverage:
         # Coverage makes the PySpark tests flaky due to heavy parallelism.
         # When we run PySpark tests with coverage, it uses 4 for now as
@@ -391,24 +365,26 @@ def run_python_tests(test_modules, test_pythons, parallelism, with_coverage=Fals
         command.append("--modules=%s" % ",".join(m.name for m in test_modules))
     command.append("--parallelism=%i" % parallelism)
     command.append("--python-executables=%s" % test_pythons)
-    run_cmd(command)
-
-
-def run_python_packaging_tests():
-    if not os.environ.get("SPARK_JENKINS") and os.environ.get("SKIP_PACKAGING", "false") != "true":
-        set_title_and_block("Running PySpark packaging tests", "BLOCK_PYSPARK_PIP_TESTS")
-        command = [os.path.join(SPARK_HOME, "dev", "run-pip-tests")]
+    if changed_files:
+        with tempfile.NamedTemporaryFile("w") as f:
+            f.write("\n".join(changed_files))
+            f.flush()
+            command.append("--changed-files=%s" % f.name)
+            run_cmd(command)
+    else:
         run_cmd(command)
 
 
+def run_python_packaging_tests():
+    command = [os.path.join(SPARK_HOME, "dev", "run-pip-tests")]
+    run_cmd(command)
+
+
 def run_build_tests():
-    set_title_and_block("Running build tests", "BLOCK_BUILD_TESTS")
     run_cmd([os.path.join(SPARK_HOME, "dev", "test-dependencies.sh")])
 
 
 def run_sparkr_tests():
-    set_title_and_block("Running SparkR tests", "BLOCK_SPARKR_UNIT_TESTS")
-
     if which("R"):
         run_cmd([os.path.join(SPARK_HOME, "R", "run-tests.sh")])
     else:
@@ -481,8 +457,6 @@ def main():
     rm_r(os.path.join(USER_HOME, ".ivy2.5.2", "local", "org.apache.spark"))
     rm_r(os.path.join(USER_HOME, ".ivy2.5.2", "cache", "org.apache.spark"))
 
-    os.environ["CURRENT_BLOCK"] = str(ERROR_CODES["BLOCK_GENERAL"])
-
     java_exe = determine_java_executable()
 
     if not java_exe:
@@ -492,7 +466,6 @@ def main():
         )
         sys.exit(2)
 
-    # Install SparkR
     should_only_test_modules = opts.modules is not None
     test_modules = []
     if should_only_test_modules:
@@ -503,26 +476,18 @@ def main():
         # If tests modules are specified, we will not run R linter.
         # SparkR needs the manual SparkR installation.
         if which("R"):
-            run_cmd([os.path.join(SPARK_HOME, "R", "install-dev.sh")])
+            with titled_block("Installing SparkR"):
+                run_cmd([os.path.join(SPARK_HOME, "R", "install-dev.sh")])
         else:
             print("Cannot install SparkR as R was not found in PATH")
 
-    if os.environ.get("SPARK_JENKINS"):
-        # if we're on the Amplab Jenkins build servers setup variables
-        # to reflect the environment settings
-        build_tool = os.environ.get("SPARK_JENKINS_BUILD_TOOL", "sbt")
-        scala_version = os.environ.get("SPARK_JENKINS_BUILD_SCALA_PROFILE")
-        hadoop_version = os.environ.get("SPARK_JENKINS_BUILD_PROFILE", "hadoop3")
-        test_env = "spark_jenkins"
+    build_tool = "sbt"
+    scala_version = os.environ.get("SCALA_PROFILE")
+    hadoop_version = os.environ.get("HADOOP_PROFILE", "hadoop3")
+    if "GITHUB_ACTIONS" in os.environ:
+        test_env = "github_actions"
     else:
-        # else we're running locally or GitHub Actions.
-        build_tool = "sbt"
-        scala_version = os.environ.get("SCALA_PROFILE")
-        hadoop_version = os.environ.get("HADOOP_PROFILE", "hadoop3")
-        if "GITHUB_ACTIONS" in os.environ:
-            test_env = "github_actions"
-        else:
-            test_env = "local"
+        test_env = "local"
 
     extra_profiles = get_hadoop_profiles(hadoop_version) + get_scala_profiles(scala_version)
 
@@ -556,6 +521,14 @@ def main():
                     os.environ["GITHUB_SHA"], target_ref=os.environ["GITHUB_PREV_SHA"]
                 )
 
+            dangling_python_tests = determine_dangling_python_tests(changed_files)
+            if dangling_python_tests:
+                print(
+                    f"[error] Found the following dangling Python tests {', '.join(dangling_python_tests)}"
+                )
+                print("[error] Please add the tests to the appropriate module.")
+                sys.exit(1)
+
             modules_to_test = determine_modules_to_test(
                 determine_modules_for_files(changed_files), deduplicated=False
             )
@@ -569,15 +542,6 @@ def main():
         if len(changed_modules) == 0:
             print("[info] There are no modules to test, exiting without testing.")
             return
-
-    # If we're running the tests in Jenkins, calculate the diff from the targeted branch, and
-    # detect modules to test.
-    elif os.environ.get("SPARK_JENKINS_PRB"):
-        target_branch = os.environ["ghprbTargetBranch"]
-        changed_files = identify_changed_files_from_git_commits("HEAD", target_branch=target_branch)
-        changed_modules = determine_modules_for_files(changed_files)
-        test_modules = determine_modules_to_test(changed_modules)
-        excluded_tags = determine_tags_to_exclude(changed_modules)
 
     # If there is no changed module found, tests all.
     if not changed_modules:
@@ -603,18 +567,21 @@ def main():
 
     if scala_version is not None:
         # If not set, assume this is default and doesn't need to change.
-        switch_scala_version(scala_version)
+        with titled_block(f"Switching to Scala version: {scala_version}"):
+            switch_scala_version(scala_version)
 
     should_run_java_style_checks = False
     if not should_only_test_modules:
         # license checks
-        run_apache_rat_checks()
+        with titled_block("Running Apache RAT checks"):
+            run_apache_rat_checks()
 
         # style checks
         if not changed_files or any(
             f.endswith(".scala") or f.endswith("scalastyle-config.xml") for f in changed_files
         ):
-            run_scala_style_checks(extra_profiles)
+            with titled_block("Running Scala style checks"):
+                run_scala_style_checks(extra_profiles)
         if not changed_files or any(
             f.endswith(".java")
             or f.endswith("checkstyle.xml")
@@ -624,56 +591,90 @@ def main():
             # Run SBT Checkstyle after the build to prevent a side-effect to the build.
             should_run_java_style_checks = True
         if not changed_files or any(
-            f.endswith("lint-python") or f.endswith("tox.ini") or f.endswith(".py")
+            f.endswith("lint-python") or f.endswith("pyproject.toml") or f.endswith(".py")
             for f in changed_files
         ):
-            run_python_style_checks()
+            with titled_block("Running Python style checks"):
+                run_python_style_checks()
         if not changed_files or any(
             f.endswith(".R") or f.endswith("lint-r") or f.endswith(".lintr") for f in changed_files
         ):
-            run_sparkr_style_checks()
+            with titled_block("Running R style checks"):
+                run_sparkr_style_checks()
 
-    # determine if docs were changed and if we're inside the jenkins environment
-    # note - the below commented out until *all* Jenkins workers can get the Bundler gem installed
-    # if "DOCS" in changed_modules and test_env == "spark_jenkins":
-    #    build_spark_documentation()
-
-    if any(m.should_run_build_tests for m in test_modules) and test_env != "spark_jenkins":
-        run_build_tests()
+    if any(m.should_run_build_tests for m in test_modules):
+        with titled_block("Running build tests"):
+            run_build_tests()
 
     # spark build
-    build_apache_spark(build_tool, extra_profiles)
+    if os.environ.get("SKIP_SCALA_BUILD", "false") != "true":
+        with titled_block("Building Spark"):
+            build_apache_spark(build_tool, extra_profiles)
 
     # backwards compatibility checks
     if build_tool == "sbt":
         # Note: compatibility tests only supported in sbt for now
         if not os.environ.get("SKIP_MIMA"):
-            detect_binary_inop_with_mima(extra_profiles)
+            with titled_block("Detecting binary incompatibilities with MiMa"):
+                detect_binary_inop_with_mima(extra_profiles)
         # Since we did not build assembly/package before running dev/mima, we need to
         # do it here because the tests still rely on it; see SPARK-13294 for details.
-        build_spark_assembly_sbt(extra_profiles, should_run_java_style_checks)
+        if os.environ.get("SKIP_SCALA_BUILD", "false") != "true":
+            with titled_block("Building Spark assembly"):
+                build_spark_assembly_sbt(extra_profiles)
+            if should_run_java_style_checks:
+                with titled_block("Running Java style checks"):
+                    run_java_style_checks(extra_profiles + modules.root.build_profile_flags)
+            if not os.environ.get("SKIP_UNIDOC"):
+                with titled_block("Building Unidoc API Documentation"):
+                    build_spark_unidoc_sbt(extra_profiles)
 
     # run the test suites
-    run_scala_tests(build_tool, extra_profiles, test_modules, excluded_tags, included_tags)
+    with titled_block("Running Spark unit tests"):
+        run_scala_tests(build_tool, extra_profiles, test_modules, excluded_tags, included_tags)
 
     modules_with_python_tests = [m for m in test_modules if m.python_test_goals]
     if modules_with_python_tests and not os.environ.get("SKIP_PYTHON"):
-        run_python_tests(
-            modules_with_python_tests,
-            opts.python_executables,
-            opts.parallelism,
-            with_coverage=os.environ.get("PYSPARK_CODECOV", "false") == "true",
-        )
-        run_python_packaging_tests()
+        relevant_changed_files = None
+        # We only do smart test selection on push action of apache/spark
+        # If APACHE_SPARK_REF is set, we are in a forked repository.
+        # Otherwise if we have a list of changed files, we must be in post-merge CI.
+        if not os.environ.get("APACHE_SPARK_REF", "") and changed_files:
+            relevant_changed_files = [f for f in changed_files if not modules.is_ignored_file(f)]
+            # If there are relevant changed files that are not pyspark, we don't do smart test
+            if any(
+                not (f.endswith(".py") and f.startswith("python/pyspark/"))
+                for f in relevant_changed_files
+            ):
+                relevant_changed_files = None
+        with titled_block("Running PySpark tests"):
+            run_python_tests(
+                modules_with_python_tests,
+                opts.python_executables,
+                opts.parallelism,
+                changed_files=relevant_changed_files,
+                with_coverage=os.environ.get("PYSPARK_CODECOV", "false") == "true",
+            )
+        if os.environ.get("SKIP_PACKAGING", "false") != "true":
+            with titled_block("Running PySpark packaging tests"):
+                run_python_packaging_tests()
     if any(m.should_run_r_tests for m in test_modules) and not os.environ.get("SKIP_R"):
-        run_sparkr_tests()
+        with titled_block("Running SparkR tests"):
+            run_sparkr_tests()
 
 
 def _test():
     import doctest
+
+    import sparktestsupport.modules
     import sparktestsupport.utils
 
-    failure_count = doctest.testmod(sparktestsupport.utils)[0] + doctest.testmod()[0]
+    test_results = (
+        doctest.testmod(sparktestsupport.modules),
+        doctest.testmod(sparktestsupport.utils),
+        doctest.testmod(),
+    )
+    failure_count = sum([num_failures for (num_failures, num_tests) in test_results])
     if failure_count:
         sys.exit(-1)
 

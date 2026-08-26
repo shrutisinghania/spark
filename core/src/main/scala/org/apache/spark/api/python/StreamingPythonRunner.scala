@@ -73,6 +73,7 @@ private[spark] class StreamingPythonRunner(
     if (!connectUrl.isEmpty) {
       envVars.put("SPARK_CONNECT_LOCAL_URL", connectUrl)
     }
+    envVars.put("SPARK_PYTHON_RUNTIME", "PYTHON_WORKER")
 
     val workerFactory =
       new PythonWorkerFactory(pythonExec, workerModule, envVars.asScala.toMap, false)
@@ -112,9 +113,9 @@ private[spark] class StreamingPythonRunner(
       dataIn.readInt()
     } catch {
       case e: java.net.SocketTimeoutException =>
-        throw new StreamingPythonRunnerInitializationTimeoutException(e.getMessage)
+        throw new StreamingPythonRunnerInitializationTimeoutException(e.getMessage, e)
       case e: Exception =>
-        throw new StreamingPythonRunnerInitializationCommunicationException(e.getMessage)
+        throw new StreamingPythonRunnerInitializationCommunicationException(e.getMessage, e)
     }
 
     // Set timeout back to the original timeout
@@ -131,15 +132,21 @@ private[spark] class StreamingPythonRunner(
     (dataOut, dataIn)
   }
 
-  class StreamingPythonRunnerInitializationCommunicationException(errMessage: String)
+  class StreamingPythonRunnerInitializationCommunicationException(
+      errMessage: String,
+      cause: Throwable = null)
     extends SparkPythonException(
       errorClass = "STREAMING_PYTHON_RUNNER_INITIALIZATION_COMMUNICATION_FAILURE",
-      messageParameters = Map("msg" -> errMessage))
+      messageParameters = Map("msg" -> errMessage),
+      cause = cause)
 
-  class StreamingPythonRunnerInitializationTimeoutException(errMessage: String)
+  class StreamingPythonRunnerInitializationTimeoutException(
+      errMessage: String,
+      cause: Throwable = null)
     extends SparkPythonException(
       errorClass = "STREAMING_PYTHON_RUNNER_INITIALIZATION_TIMEOUT_FAILURE",
-      messageParameters = Map("msg" -> errMessage))
+      messageParameters = Map("msg" -> errMessage),
+      cause = cause)
 
   class StreamingPythonRunnerInitializationException(resFromPython: Int, errMessage: String)
     extends SparkPythonException(

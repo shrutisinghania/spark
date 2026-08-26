@@ -22,12 +22,10 @@ import org.apache.spark.sql.catalyst.expressions.{
   Add,
   BinaryArithmetic,
   Cast,
-  DateAdd,
   Divide,
   Expression,
   Multiply,
-  Subtract,
-  SubtractDates
+  Subtract
 }
 import org.apache.spark.sql.types._
 
@@ -69,8 +67,8 @@ import org.apache.spark.sql.types._
  * top-most node itself is not resolved recursively in order to avoid recursive calls to
  * [[BinaryArithmeticResolver]] and other sub-resolvers. To prevent a case where we resolve the
  * same node twice, we need to mark nodes that will act as a limit for the downwards traversal by
- * applying a [[ExpressionResolver.SINGLE_PASS_SUBTREE_BOUNDARY]] tag to them. These children
- * along with all the nodes below them are guaranteed to be resolved at this point. When
+ * applying a [[ResolverTag.SINGLE_PASS_SUBTREE_BOUNDARY]] tag to them. These children along with
+ * all the nodes below them are guaranteed to be resolved at this point. When
  * [[ExpressionResolver]] reaches one of the tagged nodes, it returns identity rather than
  * resolving it. Finally, after resolving the subtree, we need to resolve the top-most node itself,
  * which in this case means applying a timezone, if necessary.
@@ -102,34 +100,26 @@ class BinaryArithmeticResolver(expressionResolver: ExpressionResolver)
    * Transform [[BinaryArithmetic]] node by calling [[BinaryArithmeticWithDatetimeResolver]] and
    * applying type coercion. Initial node can be replaced with some other type of node or a subtree
    * of nodes.
+   *
+   * [[replaceDataType]] needs to be called twice, because [[BinaryArithmeticWithDatetimeResolver]]
+   * algorithm is two-pass - it has separate pattern matches for the left sides, and for the right
+   * sides. For example both `Subtract(_: DateType, _: StringType)` and
+   * `Subtract(_: DateType, _: StringType)` are being transformed into `SubtractDates`. Same thing
+   * is for the `TimeType` (`SubtractTimes`).
    */
   private def transformBinaryArithmeticNode(binaryArithmetic: BinaryArithmetic): Expression = {
     val binaryArithmeticWithNullReplaced: Expression = replaceNullType(binaryArithmetic)
+
     val binaryArithmeticWithDateTypeReplaced: Expression =
       replaceDateType(binaryArithmeticWithNullReplaced)
+
     val binaryArithmeticWithTypeCoercion: Expression =
       coerceExpressionTypes(
         expression = binaryArithmeticWithDateTypeReplaced,
         expressionTreeTraversal = traversals.current
       )
-    // In case that original expression's children types are DateType and StringType, fixed-point
-    // fails to resolve the expression with a single application of
-    // [[BinaryArithmeticWithDatetimeResolver]]. Therefore, single-pass resolver needs to invoke
-    // [[BinaryArithmeticWithDatetimeResolver.resolve]], type coerce and only after that fix the
-    // date/string case. Instead of invoking [[BinaryArithmeticWithDatetimeResolver]] again, we
-    // handle the case directly.
-    (
-      binaryArithmetic.left.dataType,
-      binaryArithmetic.right.dataType
-    ) match {
-      case (_: DateType, _: StringType) =>
-        binaryArithmeticWithTypeCoercion match {
-          case add: Add => DateAdd(add.left, add.right)
-          case subtract: Subtract => SubtractDates(subtract.left, subtract.right)
-          case other => other
-        }
-      case _ => binaryArithmeticWithTypeCoercion
-    }
+
+    replaceDateType(binaryArithmeticWithTypeCoercion)
   }
 
   /**
@@ -151,20 +141,22 @@ class BinaryArithmeticResolver(expressionResolver: ExpressionResolver)
    * on the following steps.
    */
   private def replaceNullType(expression: Expression): Expression = expression match {
-    case a @ Add(l, r, _) => (l.dataType, r.dataType) match {
-      case (_: DatetimeType, _: NullType) =>
-        a.copy(right = Cast(a.right, DayTimeIntervalType.DEFAULT))
-      case (_: NullType, _: DatetimeType) =>
-        a.copy(left = Cast(a.left, DayTimeIntervalType.DEFAULT))
-      case _ => a
-    }
-    case s @ Subtract(l, r, _) => (l.dataType, r.dataType) match {
-      case (_: NullType, _: DatetimeType) =>
-        s.copy(left = Cast(s.left, s.right.dataType))
-      case (_: DatetimeType, _: NullType) =>
-        s.copy(right = Cast(s.right, s.left.dataType))
-      case _ => s
-    }
+    case a @ Add(l, r, _) =>
+      (l.dataType, r.dataType) match {
+        case (_: DatetimeType, _: NullType) =>
+          a.copy(right = Cast(a.right, DayTimeIntervalType.DEFAULT))
+        case (_: NullType, _: DatetimeType) =>
+          a.copy(left = Cast(a.left, DayTimeIntervalType.DEFAULT))
+        case _ => a
+      }
+    case s @ Subtract(l, r, _) =>
+      (l.dataType, r.dataType) match {
+        case (_: NullType, _: DatetimeType) =>
+          s.copy(left = Cast(s.left, s.right.dataType))
+        case (_: DatetimeType, _: NullType) =>
+          s.copy(right = Cast(s.right, s.left.dataType))
+        case _ => s
+      }
     case other => other
   }
 }

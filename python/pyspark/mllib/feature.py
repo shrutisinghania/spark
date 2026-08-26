@@ -18,25 +18,24 @@
 """
 Python package for feature in MLlib.
 """
+
 import sys
 import warnings
-from typing import Dict, Hashable, Iterable, List, Optional, Tuple, Union, overload, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Hashable, Iterable, List, Optional, Tuple, Union, overload
 
+from py4j.java_collections import JavaMap
 from py4j.protocol import Py4JJavaError
 
 from pyspark import since
-from pyspark.core.rdd import RDD
-from pyspark.mllib.common import callMLlibFunc, JavaModelWrapper
-from pyspark.mllib.linalg import Vectors, _convert_to_vector
-from pyspark.mllib.util import JavaLoader, JavaSaveable
 from pyspark.core.context import SparkContext
-from pyspark.mllib.linalg import Vector
+from pyspark.core.rdd import RDD
+from pyspark.mllib.common import JavaModelWrapper, callMLlibFunc
+from pyspark.mllib.linalg import Vector, Vectors, _convert_to_vector
 from pyspark.mllib.regression import LabeledPoint
-from py4j.java_collections import JavaMap
+from pyspark.mllib.util import JavaLoader, JavaSaveable
 
 if TYPE_CHECKING:
     from pyspark.mllib._typing import VectorLike
-    from py4j.java_collections import JavaMap
 
 __all__ = [
     "Normalizer",
@@ -59,12 +58,10 @@ class VectorTransformer:
     """
 
     @overload
-    def transform(self, vector: "VectorLike") -> Vector:
-        ...
+    def transform(self, vector: "VectorLike") -> Vector: ...
 
     @overload
-    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]:
-        ...
+    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]: ...
 
     def transform(
         self, vector: Union["VectorLike", RDD["VectorLike"]]
@@ -119,12 +116,10 @@ class Normalizer(VectorTransformer):
         self.p = float(p)
 
     @overload
-    def transform(self, vector: "VectorLike") -> Vector:
-        ...
+    def transform(self, vector: "VectorLike") -> Vector: ...
 
     @overload
-    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]:
-        ...
+    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]: ...
 
     def transform(
         self, vector: Union["VectorLike", RDD["VectorLike"]]
@@ -158,12 +153,10 @@ class JavaVectorTransformer(JavaModelWrapper, VectorTransformer):
     """
 
     @overload
-    def transform(self, vector: "VectorLike") -> Vector:
-        ...
+    def transform(self, vector: "VectorLike") -> Vector: ...
 
     @overload
-    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]:
-        ...
+    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]: ...
 
     def transform(
         self, vector: Union["VectorLike", RDD["VectorLike"]]
@@ -197,12 +190,10 @@ class StandardScalerModel(JavaVectorTransformer):
     """
 
     @overload
-    def transform(self, vector: "VectorLike") -> Vector:
-        ...
+    def transform(self, vector: "VectorLike") -> Vector: ...
 
     @overload
-    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]:
-        ...
+    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]: ...
 
     def transform(
         self, vector: Union["VectorLike", RDD["VectorLike"]]
@@ -357,12 +348,10 @@ class ChiSqSelectorModel(JavaVectorTransformer):
     """
 
     @overload
-    def transform(self, vector: "VectorLike") -> Vector:
-        ...
+    def transform(self, vector: "VectorLike") -> Vector: ...
 
     @overload
-    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]:
-        ...
+    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]: ...
 
     def transform(
         self, vector: Union["VectorLike", RDD["VectorLike"]]
@@ -628,12 +617,10 @@ class HashingTF:
         return hash(term) % self.numFeatures
 
     @overload
-    def transform(self, document: Iterable[Hashable]) -> Vector:
-        ...
+    def transform(self, document: Iterable[Hashable]) -> Vector: ...
 
     @overload
-    def transform(self, document: RDD[Iterable[Hashable]]) -> RDD[Vector]:
-        ...
+    def transform(self, document: RDD[Iterable[Hashable]]) -> RDD[Vector]: ...
 
     @since("1.2.0")
     def transform(
@@ -662,12 +649,10 @@ class IDFModel(JavaVectorTransformer):
     """
 
     @overload
-    def transform(self, x: "VectorLike") -> Vector:
-        ...
+    def transform(self, x: "VectorLike") -> Vector: ...
 
     @overload
-    def transform(self, x: RDD["VectorLike"]) -> RDD[Vector]:
-        ...
+    def transform(self, x: RDD["VectorLike"]) -> RDD[Vector]: ...
 
     def transform(self, x: Union["VectorLike", RDD["VectorLike"]]) -> Union[Vector, RDD[Vector]]:
         """
@@ -1043,12 +1028,10 @@ class ElementwiseProduct(VectorTransformer):
         self.scalingVector = _convert_to_vector(scalingVector)
 
     @overload
-    def transform(self, vector: "VectorLike") -> Vector:
-        ...
+    def transform(self, vector: "VectorLike") -> Vector: ...
 
     @overload
-    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]:
-        ...
+    def transform(self, vector: RDD["VectorLike"]) -> RDD[Vector]: ...
 
     def transform(
         self, vector: Union["VectorLike", RDD["VectorLike"]]
@@ -1068,12 +1051,13 @@ class ElementwiseProduct(VectorTransformer):
 
 def _test() -> None:
     import doctest
+
     from pyspark.sql import SparkSession
 
     globs = globals().copy()
     spark = SparkSession.builder.master("local[4]").appName("mllib.feature tests").getOrCreate()
     globs["sc"] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     spark.stop()
     if failure_count:
         sys.exit(-1)

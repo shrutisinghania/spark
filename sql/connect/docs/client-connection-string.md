@@ -18,7 +18,7 @@ Generally, the connection string follows the standard URI definitions. The URI
 scheme is fixed and set to `sc://`. The full URI has to be a 
 [valid URI](http://www.faqs.org/rfcs/rfc2396.html) and must
 be parsed properly by most systems. For example, hostnames have to be valid and
-cannot contain arbitrary characters. Configuration parameter are passed in the 
+cannot contain arbitrary characters. Configuration parameters are passed in the 
 style of the HTTP URL Path Parameter Syntax. This is similar to the JDBC connection
 strings. The path component must be empty. All parameters are interpreted **case sensitive**.
 
@@ -51,7 +51,7 @@ sc://host:port/;param1=value;param2=value
     <td>port</td>
     <td>Numeric</td>
     <td>The port to be used when connecting to the GRPC endpoint. The
-    default values is: <b>15002</b>. Any valid port number can be used.</td>
+    default value is: <b>15002</b>. Any valid port number can be used.</td>
     <td><pre>15002</pre><pre>443</pre></td>
   </tr>
   <tr>
@@ -109,6 +109,42 @@ sc://host:port/;param1=value;param2=value
     <i>Default: </i><pre> 128 * 1024 * 1024</pre></td>
     <td><pre>grpc_max_message_size=134217728</pre></td>
   </tr>
+  <tr>
+    <td>grpc_keepalive_enabled</td>
+    <td>Boolean</td>
+    <td>Whether the client sends gRPC/HTTP2 keepalive PINGs to detect a silently-dead
+    connection (e.g. a NAT gateway or load balancer dropping an idle connection mapping
+    without closing the socket), so a blocked call fails with an error instead of hanging
+    forever. Can be turned off as an escape hatch, e.g. in environments prone to long stalls
+    (GC pauses, etc.) that could otherwise trip a false-positive disconnect.<br/>
+    <i>Default: </i><pre>true</pre></td>
+    <td><pre>grpc_keepalive_enabled=false</pre></td>
+  </tr>
+  <tr>
+    <td>grpc_keepalive_time_ms</td>
+    <td>Numeric</td>
+    <td>Idle time (in milliseconds) before the client sends a keepalive PING. A Spark Connect
+    server tolerates client PINGs no more often than every 10s; setting this below that floor
+    will get the connection torn down as "too_many_pings".<br/>
+    <i>Default: </i><pre>60000</pre></td>
+    <td><pre>grpc_keepalive_time_ms=30000</pre></td>
+  </tr>
+  <tr>
+    <td>grpc_keepalive_timeout_ms</td>
+    <td>Numeric</td>
+    <td>Time (in milliseconds) the client waits for a keepalive PING ack before considering
+    the connection dead.<br/>
+    <i>Default: </i><pre>20000</pre></td>
+    <td><pre>grpc_keepalive_timeout_ms=10000</pre></td>
+  </tr>
+  <tr>
+    <td>grpc_keepalive_without_calls</td>
+    <td>Boolean</td>
+    <td>Whether to keep sending keepalive PINGs when there are no in-flight RPCs on the
+    connection.<br/>
+    <i>Default: </i><pre>true</pre></td>
+    <td><pre>grpc_keepalive_without_calls=false</pre></td>
+  </tr>
 </table>
 
 ## Examples
@@ -130,6 +166,17 @@ server_url = "sc://myhost.com:443/;use_ssl=true"
 
 ```python
 server_url = "sc://myhost.com:443/;use_ssl=true;token=ABCDEFG"
+```
+
+The next example tunes the gRPC keepalive settings, e.g. to detect a dead connection faster
+than the 60s/20s default, or to disable it entirely.
+
+```python
+server_url = "sc://myhost.com:443/;grpc_keepalive_time_ms=30000;grpc_keepalive_timeout_ms=10000"
+```
+
+```python
+server_url = "sc://myhost.com:443/;grpc_keepalive_enabled=false"
 ```
 
 ### Invalid Examples

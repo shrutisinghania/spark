@@ -14,36 +14,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
-import uuid
 import datetime
 import decimal
 import math
+import unittest
+import uuid
+from unittest.mock import MagicMock
 
+from pyspark.errors import PySparkValueError
 from pyspark.testing.connectutils import (
     PlanOnlyTestFixture,
-    should_test_connect,
     connect_requirement_message,
+    should_test_connect,
 )
-from pyspark.errors import PySparkValueError
 
 if should_test_connect:
     import pyspark.sql.connect.proto as proto
     from pyspark.sql.connect.column import Column
     from pyspark.sql.connect.dataframe import DataFrame
-    from pyspark.sql.connect.plan import WriteOperation, Read
-    from pyspark.sql.connect.readwriter import DataFrameReader
     from pyspark.sql.connect.expressions import LiteralExpression
-    from pyspark.sql.connect.functions import col, lit, max, min, sum
+    from pyspark.sql.connect.functions import (
+        bitmap_and,
+        bitmap_andnot,
+        bitmap_or,
+        bitmap_xor,
+        col,
+        lit,
+        max,
+        min,
+        sum,
+    )
+    from pyspark.sql.connect.observation import Observation
+    from pyspark.sql.connect.plan import (
+        CollectMetrics,
+        Join,
+        LogicalPlan,
+        Read,
+        SetOperation,
+        WriteOperation,
+    )
+    from pyspark.sql.connect.readwriter import DataFrameReader
     from pyspark.sql.connect.types import pyspark_types_to_proto_types
     from pyspark.sql.types import (
-        StringType,
-        StructType,
-        StructField,
-        IntegerType,
-        MapType,
         ArrayType,
         DoubleType,
+        IntegerType,
+        MapType,
+        StringType,
+        StructField,
+        StructType,
     )
 
 
@@ -60,6 +79,20 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         plan = self.connect.readTable(table_name=self.tbl_name)._plan.to_proto(self.connect)
         self.assertIsNotNone(plan.root, "Root relation must be set")
         self.assertIsNotNone(plan.root.read)
+
+    def test_bitmap_scalar_functions(self):
+        df = self.connect.readTable(table_name=self.tbl_name)
+        plan = df.select(
+            bitmap_and(col("bytes"), col("bytes")),
+            bitmap_or(col("bytes"), col("bytes")),
+            bitmap_andnot(col("bytes"), col("bytes")),
+            bitmap_xor(col("bytes"), col("bytes")),
+        )._plan.to_proto(self.connect)
+        function_names = [
+            expression.unresolved_function.function_name
+            for expression in plan.root.project.expressions
+        ]
+        self.assertEqual(function_names, ["bitmap_and", "bitmap_or", "bitmap_andnot", "bitmap_xor"])
 
     def test_join_using_columns(self):
         left_input = self.connect.readTable(table_name=self.tbl_name)
@@ -100,6 +133,20 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         self.assertEqual(
             crossJoin_plan.root.join.join_type,
             join_plan.root.join.join_type,
+        )
+
+    def test_zip(self):
+        left_input = self.connect.readTable(table_name=self.tbl_name)
+        right_input = self.connect.readTable(table_name=self.tbl_name)
+        plan = left_input.zip(right_input)._plan.to_proto(self.connect)
+        self.assertIsNotNone(plan.root.zip)
+        self.assertEqual(
+            plan.root.zip.left.read.named_table.unparsed_identifier,
+            self.tbl_name,
+        )
+        self.assertEqual(
+            plan.root.zip.right.read.named_table.unparsed_identifier,
+            self.tbl_name,
         )
 
     def test_filter(self):
@@ -222,7 +269,7 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
             .unpivot(["id"], None, "variable", "value")
             ._plan.to_proto(self.connect)
         )
-        self.assertTrue(len(plan.root.unpivot.ids) == 1)
+        self.assertEqual(len(plan.root.unpivot.ids), 1)
         self.assertTrue(all(isinstance(c, proto.Expression) for c in plan.root.unpivot.ids))
         self.assertEqual(plan.root.unpivot.ids[0].unresolved_attribute.unparsed_identifier, "id")
         self.assertEqual(plan.root.unpivot.HasField("values"), False)
@@ -254,11 +301,11 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
             .melt(["id"], [], "variable", "value")
             ._plan.to_proto(self.connect)
         )
-        self.assertTrue(len(plan.root.unpivot.ids) == 1)
+        self.assertEqual(len(plan.root.unpivot.ids), 1)
         self.assertTrue(all(isinstance(c, proto.Expression) for c in plan.root.unpivot.ids))
         self.assertEqual(plan.root.unpivot.ids[0].unresolved_attribute.unparsed_identifier, "id")
         self.assertEqual(plan.root.unpivot.HasField("values"), True)
-        self.assertTrue(len(plan.root.unpivot.values.values) == 0)
+        self.assertEqual(len(plan.root.unpivot.values.values), 0)
         self.assertEqual(plan.root.unpivot.variable_column_name, "variable")
         self.assertEqual(plan.root.unpivot.value_column_name, "value")
 
@@ -269,7 +316,7 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         df = self.connect.readTable(table_name=self.tbl_name)
 
         def checkRelations(relations: List["DataFrame"]):
-            self.assertTrue(len(relations) == 3)
+            self.assertEqual(len(relations), 3)
 
             plan = relations[0]._plan.to_proto(self.connect)
             self.assertEqual(plan.root.sample.lower_bound, 0.0)
@@ -333,11 +380,6 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         from pyspark.sql.connect.observation import Observation
 
         class MockDF(DataFrame):
-            def __new__(cls, df: DataFrame) -> "DataFrame":
-                self = object.__new__(cls)
-                self.__init__(df)  # type: ignore[misc]
-                return self
-
             def __init__(self, df: DataFrame):
                 super().__init__(df._plan, df._session)
 
@@ -595,6 +637,72 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         self.assertEqual(len(data_source.paths), 1)
         self.assertEqual(data_source.paths[0], "test_path")
 
+    def test_relation_changes(self):
+        reader = DataFrameReader(self.connect)
+        df = reader.option("startingVersion", "1").option("endingVersion", "5").changes("myTable")
+        plan = df._plan.to_proto(self.connect)
+        relation_changes = plan.root.relation_changes
+        self.assertEqual(relation_changes.unparsed_identifier, "myTable")
+        self.assertEqual(relation_changes.options.get("startingVersion"), "1")
+        self.assertEqual(relation_changes.options.get("endingVersion"), "5")
+        self.assertFalse(relation_changes.is_streaming)
+
+    def test_relation_changes_no_options(self):
+        reader = DataFrameReader(self.connect)
+        df = reader.changes("catalog.schema.myTable")
+        plan = df._plan.to_proto(self.connect)
+        relation_changes = plan.root.relation_changes
+        self.assertEqual(relation_changes.unparsed_identifier, "catalog.schema.myTable")
+        self.assertEqual(len(relation_changes.options), 0)
+        self.assertFalse(relation_changes.is_streaming)
+
+    def test_relation_changes_with_timestamp_options(self):
+        reader = DataFrameReader(self.connect)
+        df = (
+            reader.option("startingTimestamp", "2024-01-01T00:00:00Z")
+            .option("endingTimestamp", "2024-06-01T00:00:00Z")
+            .changes("myTable")
+        )
+        plan = df._plan.to_proto(self.connect)
+        relation_changes = plan.root.relation_changes
+        self.assertEqual(relation_changes.options.get("startingTimestamp"), "2024-01-01T00:00:00Z")
+        self.assertEqual(relation_changes.options.get("endingTimestamp"), "2024-06-01T00:00:00Z")
+
+    def test_relation_changes_oneof_is_relation_changes(self):
+        reader = DataFrameReader(self.connect)
+        df = reader.option("startingVersion", "1").changes("myTable")
+        plan = df._plan.to_proto(self.connect)
+        self.assertEqual(plan.root.WhichOneof("rel_type"), "relation_changes")
+
+    def test_relation_changes_streaming(self):
+        from pyspark.sql.connect.plan import RelationChanges
+
+        plan = RelationChanges("myTable", {"startingVersion": "10"}, is_streaming=True).plan(
+            self.connect
+        )
+        relation_changes = plan.relation_changes
+        self.assertEqual(relation_changes.unparsed_identifier, "myTable")
+        self.assertEqual(relation_changes.options.get("startingVersion"), "10")
+        self.assertTrue(relation_changes.is_streaming)
+
+    def test_relation_changes_streaming_via_stream_reader(self):
+        from pyspark.sql.connect.streaming.readwriter import DataStreamReader
+
+        reader = DataStreamReader(self.connect)
+        df = reader.option("startingVersion", "1").changes("myTable")
+        plan = df._plan.to_proto(self.connect)
+        relation_changes = plan.root.relation_changes
+        self.assertEqual(relation_changes.unparsed_identifier, "myTable")
+        self.assertEqual(relation_changes.options.get("startingVersion"), "1")
+        self.assertTrue(relation_changes.is_streaming)
+
+    def test_relation_changes_plan_print(self):
+        from pyspark.sql.connect.plan import RelationChanges
+
+        rc = RelationChanges("myTable", {"startingVersion": "1"})
+        self.assertIn("RelationChanges", rc.print())
+        self.assertIn("myTable", rc.print())
+
     def test_all_the_plans(self):
         df = self.connect.readTable(table_name=self.tbl_name)
         df = df.select(df.col1).filter(df.col2 == 2).sort(df.col3.asc())
@@ -753,7 +861,7 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         self.assertIsInstance(col, Column)
         self.assertEqual("Column<'UnresolvedRegex(col_name)'>", str(col))
 
-        col_plan = col.to_plan(self.session.client)
+        col_plan = col.to_plan(None)
         self.assertIsNotNone(col_plan)
         self.assertEqual(col_plan.unresolved_regex.col_name, "col_name")
 
@@ -864,7 +972,7 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
     def test_column_literals(self):
         df = self.connect.with_plan(Read("table"))
         lit_df = df.select(lit(10))
-        self.assertIsNotNone(lit_df._plan.to_proto(None))
+        self.assertIsNotNone(lit_df._plan.to_proto(self.connect))
 
         self.assertIsNotNone(lit(10).to_plan(None))
         plan = lit(10).to_plan(None)
@@ -937,7 +1045,7 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
         self.assertEqual("Column<'a AS martin'>", str(col0))
 
         col0 = col("a").alias("martin", metadata={"pii": True})
-        plan = col0.to_plan(self.session.client)
+        plan = col0.to_plan(None)
         self.assertIsNotNone(plan)
         self.assertEqual(plan.alias.metadata, '{"pii": true}')
 
@@ -1065,13 +1173,90 @@ class SparkConnectPlanTests(PlanOnlyTestFixture):
             LiteralExpression._to_value(proto_lit, DoubleType)
 
 
+if should_test_connect:
+
+    class _StubPlan(LogicalPlan):
+        """Minimal LogicalPlan that returns a fixed observations dict."""
+
+        def __init__(self, observations=None):
+            super().__init__(None)
+            self._obs = observations or {}
+
+        @property
+        def observations(self):
+            return self._obs
+
+        def plan(self, session):
+            raise NotImplementedError
+
+        def print(self, indent=0):
+            return ""
+
+
+@unittest.skipIf(not should_test_connect, connect_requirement_message)
+class TestObservationMerging(unittest.TestCase):
+    """Verify that observations are deduplicated when plan branches share the same key."""
+
+    def test_join_with_duplicate_observation_names(self):
+        obs = MagicMock()
+        obs._name = "shared"
+        shared = {"shared": obs}
+
+        left = _StubPlan(observations=shared)
+        right = _StubPlan(observations=shared)
+
+        join = Join.__new__(Join)
+        join._child = left
+        join.right = right
+
+        result = join.observations
+        self.assertEqual(result, {"shared": obs})
+
+    def test_join_with_distinct_observations(self):
+        obs_a = MagicMock()
+        obs_a._name = "a"
+        obs_b = MagicMock()
+        obs_b._name = "b"
+
+        left = _StubPlan(observations={"a": obs_a})
+        right = _StubPlan(observations={"b": obs_b})
+
+        join = Join.__new__(Join)
+        join._child = left
+        join.right = right
+
+        result = join.observations
+        self.assertEqual(result, {"a": obs_a, "b": obs_b})
+
+    def test_set_operation_with_duplicate_observation_names(self):
+        obs = MagicMock()
+        obs._name = "shared"
+        shared = {"shared": obs}
+
+        left = _StubPlan(observations=shared)
+        right = _StubPlan(observations=shared)
+
+        set_op = SetOperation.__new__(SetOperation)
+        set_op._child = left
+        set_op.other = right
+
+        result = set_op.observations
+        self.assertEqual(result, {"shared": obs})
+
+    def test_collect_metrics_with_duplicate_observation_name(self):
+        obs = Observation("my_metric")
+        parent = _StubPlan(observations={"my_metric": obs})
+
+        cm = CollectMetrics.__new__(CollectMetrics)
+        cm._child = parent
+        cm._observation = obs
+        cm._exprs = []
+
+        result = cm.observations
+        self.assertEqual(result, {"my_metric": obs})
+
+
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_plan import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

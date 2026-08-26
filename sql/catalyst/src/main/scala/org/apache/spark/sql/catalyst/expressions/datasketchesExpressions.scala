@@ -29,12 +29,17 @@ import org.apache.spark.sql.types.{AbstractDataType, BinaryType, BooleanType, Da
   usage = """
     _FUNC_(expr) - Returns the estimated number of unique values given the binary representation
     of a Datasketches HllSketch. """,
+  arguments = """
+    Arguments:
+      * expr - A binary expression holding the serialized representation of a Datasketches
+          HllSketch.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(hll_sketch_agg(col)) FROM VALUES (1), (1), (2), (2), (3) tab(col);
        3
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "3.5.0")
 case class HllSketchEstimate(child: Expression)
   extends UnaryExpression
@@ -56,7 +61,8 @@ case class HllSketchEstimate(child: Expression)
     try {
       Math.round(HllSketch.heapify(Memory.wrap(buffer)).getEstimate)
     } catch {
-      case _: SketchesArgumentException | _: java.lang.Error =>
+      case _: SketchesArgumentException | _: java.lang.Error
+           | _: ArrayIndexOutOfBoundsException =>
         throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
     }
   }
@@ -69,12 +75,21 @@ case class HllSketchEstimate(child: Expression)
     Datasketches HllSketch objects, using a Datasketches Union object. Set
     allowDifferentLgConfigK to true to allow unions of sketches with different
     lgConfigK values (defaults to false). """,
+  arguments = """
+    Arguments:
+      * first - A binary expression holding the serialized representation of a Datasketches
+          HllSketch.
+      * second - A binary expression holding the serialized representation of a Datasketches
+          HllSketch.
+      * allowDifferentLgConfigK - A boolean. Set to true to allow unions of sketches with
+          different lgConfigK values. Defaults to false.
+  """,
   examples = """
     Examples:
       > SELECT hll_sketch_estimate(_FUNC_(hll_sketch_agg(col1), hll_sketch_agg(col2))) FROM VALUES (1, 4), (1, 4), (2, 5), (2, 5), (3, 6) tab(col1, col2);
        6
   """,
-  group = "misc_funcs",
+  group = "sketch_funcs",
   since = "3.5.0")
 // scalastyle:on line.size.limit
 case class HllUnion(first: Expression, second: Expression, third: Expression)
@@ -108,21 +123,31 @@ case class HllUnion(first: Expression, second: Expression, third: Expression)
     val sketch1 = try {
       HllSketch.heapify(Memory.wrap(value1.asInstanceOf[Array[Byte]]))
     } catch {
-      case _: SketchesArgumentException | _: java.lang.Error =>
+      case _: SketchesArgumentException | _: java.lang.Error
+           | _: ArrayIndexOutOfBoundsException =>
         throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
     }
     val sketch2 = try {
       HllSketch.heapify(Memory.wrap(value2.asInstanceOf[Array[Byte]]))
     } catch {
-      case _: SketchesArgumentException | _: java.lang.Error =>
+      case _: SketchesArgumentException | _: java.lang.Error
+           | _: ArrayIndexOutOfBoundsException =>
         throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
     }
     val allowDifferentLgConfigK = value3.asInstanceOf[Boolean]
-    if (!allowDifferentLgConfigK && sketch1.getLgConfigK != sketch2.getLgConfigK) {
+    if (!allowDifferentLgConfigK && !sketch1.isEmpty && !sketch2.isEmpty &&
+        sketch1.getLgConfigK != sketch2.getLgConfigK) {
       throw QueryExecutionErrors.hllUnionDifferentLgK(
         sketch1.getLgConfigK, sketch2.getLgConfigK, function = prettyName)
     }
-    val union = new Union(Math.min(sketch1.getLgConfigK, sketch2.getLgConfigK))
+    // An empty sketch holds no coupons, so it carries no precision: it is exempt from the
+    // lgConfigK check and does not drag the result down to its own lgConfigK.
+    val lgConfigK = (sketch1.isEmpty, sketch2.isEmpty) match {
+      case (true, false) => sketch2.getLgConfigK
+      case (false, true) => sketch1.getLgConfigK
+      case _ => Math.min(sketch1.getLgConfigK, sketch2.getLgConfigK)
+    }
+    val union = new Union(lgConfigK)
     union.update(sketch1)
     union.update(sketch2)
     union.getResult(targetType).toUpdatableByteArray

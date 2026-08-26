@@ -33,6 +33,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 import builtins
 import collections.abc
 import google.protobuf.descriptor
@@ -285,6 +286,80 @@ class DataType(google.protobuf.message.Message):
         PRECISION_FIELD_NUMBER: builtins.int
         TYPE_VARIATION_REFERENCE_FIELD_NUMBER: builtins.int
         precision: builtins.int
+        type_variation_reference: builtins.int
+        def __init__(
+            self,
+            *,
+            precision: builtins.int | None = ...,
+            type_variation_reference: builtins.int = ...,
+        ) -> None: ...
+        def HasField(
+            self,
+            field_name: typing_extensions.Literal[
+                "_precision", b"_precision", "precision", b"precision"
+            ],
+        ) -> builtins.bool: ...
+        def ClearField(
+            self,
+            field_name: typing_extensions.Literal[
+                "_precision",
+                b"_precision",
+                "precision",
+                b"precision",
+                "type_variation_reference",
+                b"type_variation_reference",
+            ],
+        ) -> None: ...
+        def WhichOneof(
+            self, oneof_group: typing_extensions.Literal["_precision", b"_precision"]
+        ) -> typing_extensions.Literal["precision"] | None: ...
+
+    class TimestampNTZNanos(google.protobuf.message.Message):
+        """Timestamp without time zone with nanosecond-capable fractional-second precision."""
+
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        PRECISION_FIELD_NUMBER: builtins.int
+        TYPE_VARIATION_REFERENCE_FIELD_NUMBER: builtins.int
+        precision: builtins.int
+        """Number of fractional-second digits. Valid values are 7, 8, and 9. If omitted, defaults to 9."""
+        type_variation_reference: builtins.int
+        def __init__(
+            self,
+            *,
+            precision: builtins.int | None = ...,
+            type_variation_reference: builtins.int = ...,
+        ) -> None: ...
+        def HasField(
+            self,
+            field_name: typing_extensions.Literal[
+                "_precision", b"_precision", "precision", b"precision"
+            ],
+        ) -> builtins.bool: ...
+        def ClearField(
+            self,
+            field_name: typing_extensions.Literal[
+                "_precision",
+                b"_precision",
+                "precision",
+                b"precision",
+                "type_variation_reference",
+                b"type_variation_reference",
+            ],
+        ) -> None: ...
+        def WhichOneof(
+            self, oneof_group: typing_extensions.Literal["_precision", b"_precision"]
+        ) -> typing_extensions.Literal["precision"] | None: ...
+
+    class TimestampLTZNanos(google.protobuf.message.Message):
+        """Timestamp with local time zone with nanosecond-capable fractional-second precision."""
+
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        PRECISION_FIELD_NUMBER: builtins.int
+        TYPE_VARIATION_REFERENCE_FIELD_NUMBER: builtins.int
+        precision: builtins.int
+        """Number of fractional-second digits. Valid values are 7, 8, and 9. If omitted, defaults to 9."""
         type_variation_reference: builtins.int
         def __init__(
             self,
@@ -674,6 +749,46 @@ class DataType(google.protobuf.message.Message):
             ],
         ) -> None: ...
 
+    class Geometry(google.protobuf.message.Message):
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        SRID_FIELD_NUMBER: builtins.int
+        TYPE_VARIATION_REFERENCE_FIELD_NUMBER: builtins.int
+        srid: builtins.int
+        type_variation_reference: builtins.int
+        def __init__(
+            self,
+            *,
+            srid: builtins.int = ...,
+            type_variation_reference: builtins.int = ...,
+        ) -> None: ...
+        def ClearField(
+            self,
+            field_name: typing_extensions.Literal[
+                "srid", b"srid", "type_variation_reference", b"type_variation_reference"
+            ],
+        ) -> None: ...
+
+    class Geography(google.protobuf.message.Message):
+        DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+        SRID_FIELD_NUMBER: builtins.int
+        TYPE_VARIATION_REFERENCE_FIELD_NUMBER: builtins.int
+        srid: builtins.int
+        type_variation_reference: builtins.int
+        def __init__(
+            self,
+            *,
+            srid: builtins.int = ...,
+            type_variation_reference: builtins.int = ...,
+        ) -> None: ...
+        def ClearField(
+            self,
+            field_name: typing_extensions.Literal[
+                "srid", b"srid", "type_variation_reference", b"type_variation_reference"
+            ],
+        ) -> None: ...
+
     class Variant(google.protobuf.message.Message):
         DESCRIPTOR: google.protobuf.descriptor.Descriptor
 
@@ -821,8 +936,12 @@ class DataType(google.protobuf.message.Message):
     MAP_FIELD_NUMBER: builtins.int
     VARIANT_FIELD_NUMBER: builtins.int
     UDT_FIELD_NUMBER: builtins.int
+    GEOMETRY_FIELD_NUMBER: builtins.int
+    GEOGRAPHY_FIELD_NUMBER: builtins.int
     UNPARSED_FIELD_NUMBER: builtins.int
     TIME_FIELD_NUMBER: builtins.int
+    TIMESTAMP_NTZ_NANOS_FIELD_NUMBER: builtins.int
+    TIMESTAMP_LTZ_NANOS_FIELD_NUMBER: builtins.int
     @property
     def null(self) -> global___DataType.NULL: ...
     @property
@@ -878,10 +997,22 @@ class DataType(google.protobuf.message.Message):
     def udt(self) -> global___DataType.UDT:
         """UserDefinedType"""
     @property
+    def geometry(self) -> global___DataType.Geometry:
+        """Geospatial types"""
+    @property
+    def geography(self) -> global___DataType.Geography: ...
+    @property
     def unparsed(self) -> global___DataType.Unparsed:
         """UnparsedDataType"""
     @property
     def time(self) -> global___DataType.Time: ...
+    @property
+    def timestamp_ntz_nanos(self) -> global___DataType.TimestampNTZNanos:
+        """Nanosecond-capable timestamp types (precision 7..9). NTZ and LTZ are distinct kinds
+        even though their physical value is identical, mirroring timestamp vs timestamp_ntz.
+        """
+    @property
+    def timestamp_ltz_nanos(self) -> global___DataType.TimestampLTZNanos: ...
     def __init__(
         self,
         *,
@@ -909,8 +1040,12 @@ class DataType(google.protobuf.message.Message):
         map: global___DataType.Map | None = ...,
         variant: global___DataType.Variant | None = ...,
         udt: global___DataType.UDT | None = ...,
+        geometry: global___DataType.Geometry | None = ...,
+        geography: global___DataType.Geography | None = ...,
         unparsed: global___DataType.Unparsed | None = ...,
         time: global___DataType.Time | None = ...,
+        timestamp_ntz_nanos: global___DataType.TimestampNTZNanos | None = ...,
+        timestamp_ltz_nanos: global___DataType.TimestampLTZNanos | None = ...,
     ) -> None: ...
     def HasField(
         self,
@@ -937,6 +1072,10 @@ class DataType(google.protobuf.message.Message):
             b"double",
             "float",
             b"float",
+            "geography",
+            b"geography",
+            "geometry",
+            b"geometry",
             "integer",
             b"integer",
             "kind",
@@ -957,8 +1096,12 @@ class DataType(google.protobuf.message.Message):
             b"time",
             "timestamp",
             b"timestamp",
+            "timestamp_ltz_nanos",
+            b"timestamp_ltz_nanos",
             "timestamp_ntz",
             b"timestamp_ntz",
+            "timestamp_ntz_nanos",
+            b"timestamp_ntz_nanos",
             "udt",
             b"udt",
             "unparsed",
@@ -996,6 +1139,10 @@ class DataType(google.protobuf.message.Message):
             b"double",
             "float",
             b"float",
+            "geography",
+            b"geography",
+            "geometry",
+            b"geometry",
             "integer",
             b"integer",
             "kind",
@@ -1016,8 +1163,12 @@ class DataType(google.protobuf.message.Message):
             b"time",
             "timestamp",
             b"timestamp",
+            "timestamp_ltz_nanos",
+            b"timestamp_ltz_nanos",
             "timestamp_ntz",
             b"timestamp_ntz",
+            "timestamp_ntz_nanos",
+            b"timestamp_ntz_nanos",
             "udt",
             b"udt",
             "unparsed",
@@ -1058,8 +1209,12 @@ class DataType(google.protobuf.message.Message):
             "map",
             "variant",
             "udt",
+            "geometry",
+            "geography",
             "unparsed",
             "time",
+            "timestamp_ntz_nanos",
+            "timestamp_ltz_nanos",
         ]
         | None
     ): ...

@@ -23,7 +23,7 @@ import io.fabric8.kubernetes.api.model.Pod
 import io.fabric8.kubernetes.client.KubernetesClient
 import io.fabric8.kubernetes.client.dsl.PodResource
 
-import org.apache.spark.SparkConf
+import org.apache.spark.{SparkConf, SparkMasterRegex}
 import org.apache.spark.deploy.SparkSubmitOperation
 import org.apache.spark.deploy.k8s.{KubernetesUtils, SparkKubernetesClientFactory}
 import org.apache.spark.deploy.k8s.Config.{KUBERNETES_AUTH_SUBMISSION_CONF_PREFIX, KUBERNETES_SUBMIT_GRACE_PERIOD}
@@ -50,7 +50,11 @@ private class KillApplication extends K8sSubmitOp  {
       (implicit client: KubernetesClient): Unit = {
     val podToDelete = getPod(namespace, pName)
 
-    if (Option(podToDelete).isDefined) {
+    // `getPod` returns a request handle, which is never null; only resolving it reports whether
+    // the pod exists. Without the `get()` the check below is always true, so a name that is not
+    // in the cluster would issue a delete that the API server answers with a swallowed 404 and
+    // report nothing to the user. `ListStatus.executeOnPod` resolves it the same way.
+    if (Option(podToDelete.get()).isDefined) {
       getGracePeriod(sparkConf) match {
         case Some(period) => podToDelete.withGracePeriod(period).delete()
         case _ => podToDelete.delete()
@@ -165,7 +169,7 @@ private[spark] class K8SSparkSubmitOperation extends SparkSubmitOperation
   }
 
   override def supports(master: String): Boolean = {
-    master.startsWith("k8s://")
+    SparkMasterRegex.isK8s(master)
   }
 }
 

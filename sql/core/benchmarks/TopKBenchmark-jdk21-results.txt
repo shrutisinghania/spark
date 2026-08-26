@@ -2,21 +2,21 @@
 Top-K Computation
 ================================================================================================
 
-OpenJDK 64-Bit Server VM 21.0.8+9-LTS on Linux 6.11.0-1018-azure
-AMD EPYC 7763 64-Core Processor
+OpenJDK 64-Bit Server VM 21.0.12+8-LTS on Linux 6.17.0-1020-azure
+INTEL(R) XEON(R) PLATINUM 8573C
 Benchmark Top-K:                                                 Best Time(ms)   Avg Time(ms)   Stdev(ms)    Rate(M/s)   Per Row(ns)   Relative
 -----------------------------------------------------------------------------------------------------------------------------------------------
-ROW_NUMBER (PARTITION: , WindowGroupLimit: false)                         8842           8986          82          2.4         421.6       1.0X
-ROW_NUMBER (PARTITION: , WindowGroupLimit: true)                          1947           1970          12         10.8          92.8       4.5X
-ROW_NUMBER (PARTITION: PARTITION BY b, WindowGroupLimit: false)          11322          11472          78          1.9         539.9       0.8X
-ROW_NUMBER (PARTITION: PARTITION BY b, WindowGroupLimit: true)            4914           5102          88          4.3         234.3       1.8X
-RANK (PARTITION: , WindowGroupLimit: false)                               9422           9698         196          2.2         449.3       0.9X
-RANK (PARTITION: , WindowGroupLimit: true)                                1720           1752          20         12.2          82.0       5.1X
-RANK (PARTITION: PARTITION BY b, WindowGroupLimit: false)                11841          11996         120          1.8         564.6       0.7X
-RANK (PARTITION: PARTITION BY b, WindowGroupLimit: true)                  4790           4991         130          4.4         228.4       1.8X
-DENSE_RANK (PARTITION: , WindowGroupLimit: false)                         9185           9356         136          2.3         438.0       1.0X
-DENSE_RANK (PARTITION: , WindowGroupLimit: true)                          1756           1917         121         11.9          83.7       5.0X
-DENSE_RANK (PARTITION: PARTITION BY b, WindowGroupLimit: false)          11572          11776         154          1.8         551.8       0.8X
-DENSE_RANK (PARTITION: PARTITION BY b, WindowGroupLimit: true)            4749           4917         118          4.4         226.5       1.9X
+ROW_NUMBER (PARTITION: , WindowGroupLimit: false)                        11531          11849         137          1.8         549.8       1.0X
+ROW_NUMBER (PARTITION: , WindowGroupLimit: true)                          1358           1424          74         15.4          64.7       8.5X
+ROW_NUMBER (PARTITION: PARTITION BY b, WindowGroupLimit: false)          11293          11451         115          1.9         538.5       1.0X
+ROW_NUMBER (PARTITION: PARTITION BY b, WindowGroupLimit: true)            4933           5062          69          4.3         235.2       2.3X
+RANK (PARTITION: , WindowGroupLimit: false)                              12028          12350         242          1.7         573.6       1.0X
+RANK (PARTITION: , WindowGroupLimit: true)                                4970           5048          55          4.2         237.0       2.3X
+RANK (PARTITION: PARTITION BY b, WindowGroupLimit: false)                11387          11633         156          1.8         543.0       1.0X
+RANK (PARTITION: PARTITION BY b, WindowGroupLimit: true)                  4923           4996          68          4.3         234.8       2.3X
+DENSE_RANK (PARTITION: , WindowGroupLimit: false)                        11850          12087         132          1.8         565.1       1.0X
+DENSE_RANK (PARTITION: , WindowGroupLimit: true)                          4956           5030          49          4.2         236.3       2.3X
+DENSE_RANK (PARTITION: PARTITION BY b, WindowGroupLimit: false)          11354          11686         201          1.8         541.4       1.0X
+DENSE_RANK (PARTITION: PARTITION BY b, WindowGroupLimit: true)            4880           5058          98          4.3         232.7       2.4X
 
 

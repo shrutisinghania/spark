@@ -15,16 +15,19 @@
 # limitations under the License.
 #
 import sys
-from typing import cast, Iterable, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Iterable, Sequence, Tuple, Union, cast
 
+from pyspark.sql.utils import get_active_spark_context
 from pyspark.sql.window import (
     Window as ParentWindow,
+)
+from pyspark.sql.window import (
     WindowSpec as ParentWindowSpec,
 )
-from pyspark.sql.utils import get_active_spark_context
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
+
     from pyspark.sql._typing import ColumnOrName
 
 
@@ -32,9 +35,9 @@ __all__ = ["Window", "WindowSpec"]
 
 
 def _to_java_cols(
-    cols: Tuple[Union["ColumnOrName", Sequence["ColumnOrName"]], ...]
+    cols: Tuple[Union["ColumnOrName", Sequence["ColumnOrName"]], ...],
 ) -> "JavaObject":
-    from pyspark.sql.classic.column import _to_seq, _to_java_column
+    from pyspark.sql.classic.column import _to_java_column, _to_seq
 
     if len(cols) == 1 and isinstance(cols[0], list):
         cols = cols[0]  # type: ignore[assignment]
@@ -95,7 +98,6 @@ class Window(ParentWindow):
 class WindowSpec(ParentWindowSpec):
     def __new__(cls, jspec: "JavaObject") -> "WindowSpec":
         self = object.__new__(cls)
-        self.__init__(jspec)  # type: ignore[misc]
         return self
 
     def __init__(self, jspec: "JavaObject") -> None:
@@ -126,8 +128,9 @@ class WindowSpec(ParentWindowSpec):
 
 def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.sql.window
+    from pyspark.sql import SparkSession
 
     # It inherits docstrings but doctests cannot detect them so we run
     # the parent classe's doctests here directly.
@@ -136,7 +139,7 @@ def _test() -> None:
         SparkSession.builder.master("local[4]").appName("sql.classic.window tests").getOrCreate()
     )
     globs["spark"] = spark
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.window,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE | doctest.REPORT_NDIFF,

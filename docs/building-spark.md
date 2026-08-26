@@ -27,7 +27,7 @@ license: |
 ## Apache Maven
 
 The Maven-based build is the build of reference for Apache Spark.
-Building Spark using Maven requires Maven 3.9.9 and Java 17/21.
+Building Spark using Maven requires Maven 3.9.16 and Java 17/21/25.
 Spark requires Scala 2.13; support for Scala 2.12 was removed in Spark 4.0.0.
 
 ### Setting up Maven's Memory Usage
@@ -35,7 +35,7 @@ Spark requires Scala 2.13; support for Scala 2.12 was removed in Spark 4.0.0.
 You'll need to configure Maven to use more memory than usual by setting `MAVEN_OPTS`:
 
 ```sh
-export MAVEN_OPTS="-Xss64m -Xmx2g -XX:ReservedCodeCacheSize=1g"
+export MAVEN_OPTS="-Xss64m -Xmx4g -Xms4g -XX:ReservedCodeCacheSize=128m"
 ```
 
 (The `ReservedCodeCacheSize` setting is optional but recommended.)
@@ -80,10 +80,11 @@ For more information on usage, run `./dev/make-distribution.sh --help`
 ## Specifying the Hadoop Version and Enabling YARN
 
 You can enable the `yarn` profile and specify the exact version of Hadoop to compile against through the `hadoop.version` property.
+Spark requires Hadoop 3.4.0 or later; building against older Hadoop versions is not supported.
 
 Example:
 
-    ./build/mvn -Pyarn -Dhadoop.version=3.4.1 -DskipTests clean package
+    ./build/mvn -Pyarn -Dhadoop.version=3.5.0 -DskipTests clean package
 
 ## Building With Hive and JDBC Support
 
@@ -250,7 +251,7 @@ The run-tests script also can be limited to a specific Python version or a speci
 
 To run the SparkR tests you will need to install the [knitr](https://cran.r-project.org/package=knitr), [rmarkdown](https://cran.r-project.org/package=rmarkdown), [testthat](https://cran.r-project.org/package=testthat), [e1071](https://cran.r-project.org/package=e1071) and [survival](https://cran.r-project.org/package=survival) packages first:
 
-    Rscript -e "install.packages(c('knitr', 'rmarkdown', 'devtools', 'testthat', 'e1071', 'survival'), repos='https://cloud.r-project.org/')"
+    Rscript -e "install.packages(c('knitr', 'rmarkdown', 'testthat', 'e1071', 'survival'), repos='https://cloud.r-project.org/')"
 
 You can run just the SparkR tests using the command:
 
@@ -269,6 +270,15 @@ On Linux, this can be done by `sudo service docker start`.
 or
 
     ./build/sbt -Pdocker-integration-tests docker-integration-tests/test
+
+## Local network binding
+
+On a machine with multiple network interfaces (for example a VPN), Spark may bind to a
+non-loopback address, causing local tests to fail with errors such as
+`RemoteClassLoaderError` or Netty `Connection reset by peer`. Forcing the loopback
+interface usually resolves this:
+
+    export SPARK_LOCAL_IP=localhost
 
 <!---
 ## Change Scala Version

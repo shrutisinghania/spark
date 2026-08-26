@@ -22,11 +22,43 @@ license: |
 * Table of contents
 {:toc}
 
+## Upgrading from Core 4.2 to 4.3
+
+- Since Spark 4.3, Spark compresses serialized RDD partitions by default. To restore the legacy behavior, you can set `spark.rdd.compress` to `false`.
+
+- Since Spark 4.3, Spark executor pods connect to the driver via the driver pod IP directly instead of the driver's Kubernetes Service. To restore the legacy behavior, you can set `spark.kubernetes.executor.useDriverPodIP` to `false`.
+
+- Since Spark 4.3, Spark sets `allowPrivilegeEscalation` to `false` on the driver and executor containers' security context by default. To restore the legacy behavior, you can set `spark.kubernetes.securityContext.allowPrivilegeEscalation` to `true`.
+
+- Since Spark 4.3, Spark sets the HTTP `Content-Security-Policy` (CSP) response header for the Spark UI by default, restricting the sources from which the browser is allowed to load resources. To restore the legacy behavior, you can set `spark.ui.contentSecurityPolicy.enabled` to `false`.
+
+- Since Spark 4.3, the default value of `spark.ui.xXssProtection` has been changed from `1; mode=block` to `0`. The XSS Auditor has been removed from Chrome and Edge, and was never implemented in Firefox. It can introduce side-channel vulnerabilities in browsers that still support it (Safari). To restore the legacy behavior, you can set `spark.ui.xXssProtection` to `1; mode=block`.
+
+- Since Spark 4.3, `spark.ui.allowFramingFrom` now uses CSP `frame-ancestors` instead of the deprecated `X-Frame-Options: ALLOW-FROM` (which was ignored by all modern browsers). This setting only takes effect when `spark.ui.contentSecurityPolicy.enabled=true` (the default). When CSP is disabled, `X-Frame-Options: SAMEORIGIN` is always used regardless of the `allowFramingFrom` value.
+
+- Since Spark 4.3, the Spark Master REST API rejects a submission whose request body exceeds `spark.master.rest.maxRequestBodySize` (default `100m`) with HTTP 413. To allow larger request bodies, increase `spark.master.rest.maxRequestBodySize`.
+
+- Since Spark 4.3, `spark.task.cpus` accepts fractional values, and the executor-wide `spark.executor.pyspark.memory` allocation is split across the executor's concurrent task capacity instead of its raw core count. Each Python worker's memory limit can therefore change for existing configurations: with `spark.task.cpus` greater than 1 each worker receives a proportionally larger share, and with dynamic allocation enabled, when a custom resource (e.g. GPUs) limits concurrency the fewer concurrently running workers share the whole allocation. With dynamic allocation disabled, shares stay proportional to each task's cpus so that mixed workloads sharing one executor stay within the budget. In addition, a stage whose resource profile does not request `pysparkMemory` explicitly now inherits the default profile's allocation, matching how its executors are sized; Python workers that previously ran without any memory limit under such profiles are now capped. The aggregate limit across concurrently running workers stays within the configured allocation.
+
+- Since Spark 4.3, a positive `spark.executor.pyspark.memory` allocation that is too small to give each concurrent task slot at least 1 MiB fails the Python task with an error instead of silently running the workers without any memory limit. Setting `spark.executor.pyspark.memory=0` still disables the limit. To restore a working memory limit, increase `spark.executor.pyspark.memory` or reduce the executor's concurrent task capacity.
+
+## Upgrading from Core 4.1 to 4.2
+
+- Since Spark 4.2, Spark Master REST API uses Java 21 virtual threads by default when running on Java 21 or later. To restore the legacy behavior, you can set `spark.master.rest.virtualThread.enabled` to `false`.
+
+- Since Spark 4.2, Spark will allocate executor pods with a batch size of `20`. To restore the legacy behavior, you can set `spark.kubernetes.allocation.batch.size` to `10`.
+
+- Since Spark 4.2, Spark configures a `NetworkPolicy` by default so that executor pods only accept ingress traffic from the driver and peer executors within the same job. To disable this and restore the legacy behavior, set `spark.kubernetes.driver.pod.excludedFeatureSteps` to `org.apache.spark.deploy.k8s.features.NetworkPolicyFeatureStep`.
+
 ## Upgrading from Core 4.0 to 4.1
 
-- Since Spark 4.1, Spark Master deamon provides REST API by default. To restore the behavior before Spark 4.1, you can set `spark.master.rest.enabled` to `false`.
+- Since Spark 4.1, Spark Master daemon provides REST API by default. To restore the behavior before Spark 4.1, you can set `spark.master.rest.enabled` to `false`.
 - Since Spark 4.1, Spark will compress RDD checkpoints by default. To restore the behavior before Spark 4.1, you can set `spark.checkpoint.compress` to `false`.
 - Since Spark 4.1, Spark uses Apache Hadoop Magic Committer for all S3 buckets by default. To restore the behavior before Spark 4.0, you can set `spark.hadoop.fs.s3a.committer.magic.enabled=false`.
+- Since Spark 4.1, `java.lang.InternalError` encountered during file reading will no longer fail the task if the configuration `spark.sql.files.ignoreCorruptFiles` or the data source option `ignoreCorruptFiles` is set to `true`. 
+- Since Spark 4.1, Spark ignores `*.blacklist.*` alternative configuration names. To restore the behavior before Spark 4.1, you can use the corresponding configuration names instead which exists since Spark 3.1.0.
+- Since Spark 4.1, Spark will use multiple threads for LZF compression to compress data in parallel. To restore the behavior before Spark 4.1, you can set `spark.io.compression.lzf.parallel.enabled` to `false`.
+- Since Spark 4.1, Spark uses native Netty IO mode by default. To restore the behavior before Spark 4.1, you can set `spark.io.mode.default` to `NIO`.
 
 ## Upgrading from Core 3.5 to 4.0
 
@@ -58,7 +90,7 @@ license: |
 
 - Since Spark 4.0, `spark.shuffle.unsafe.file.output.buffer` is deprecated though still works. Use `spark.shuffle.localDisk.file.output.buffer` instead.
 
-- Since Spark 4.0, when reading files hits `org.apache.hadoop.security.AccessControlException` and `org.apache.hadoop.hdfs.BlockMissingException`, the exception will be thrown and fail the task, even if `spark.files.ignoreCorruptFiles` is set to `true`.
+- Since Spark 4.0, `org.apache.hadoop.security.AccessControlException` or `org.apache.hadoop.hdfs.BlockMissingException` encountered during file reading will fail the task even if the configuration `spark.sql.files.ignoreCorruptFiles` or the data source option `ignoreCorruptFiles` is set to `true`.
 
 ## Upgrading from Core 3.5.3 to 3.5.4
 

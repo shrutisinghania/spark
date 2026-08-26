@@ -20,7 +20,7 @@ package org.apache.spark.ui
 import java.util.Date
 
 import jakarta.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
-import org.eclipse.jetty.servlet.ServletContextHandler
+import org.eclipse.jetty.ee10.servlet.ServletContextHandler
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
@@ -54,6 +54,8 @@ private[spark] class SparkUI private (
   with UIRoot {
 
   val killEnabled = sc.map(_.conf.get(UI_KILL_ENABLED)).getOrElse(false)
+
+  val holdEnabled = sc.map(_.conf.get(UI_HOLD_ENABLED)).getOrElse(false)
 
   var appId: String = _
 
@@ -94,9 +96,11 @@ private[spark] class SparkUI private (
     }
   }
 
+  private var jobsTab: JobsTab = _
+
   /** Initialize all components of the server. */
   def initialize(): Unit = {
-    val jobsTab = new JobsTab(this, store)
+    jobsTab = new JobsTab(this, store)
     attachTab(jobsTab)
     val stagesTab = new StagesTab(this, store)
     attachTab(stagesTab)
@@ -123,6 +127,10 @@ private[spark] class SparkUI private (
     attachHandler(createRedirectHandler(
       "/stages/stage/kill", "/stages/", stagesTab.handleKillRequest,
       httpMethods = Set("GET", "POST")))
+    attachHandler(createRedirectHandler(
+      "/jobs/hold", "/jobs/", jobsTab.handleHoldRequest, httpMethods = Set("GET", "POST")))
+    attachHandler(createRedirectHandler(
+      "/jobs/resume", "/jobs/", jobsTab.handleResumeRequest, httpMethods = Set("GET", "POST")))
   }
 
   initialize()
@@ -164,6 +172,7 @@ private[spark] class SparkUI private (
   /** Stop the server behind this web interface. Only valid after bind(). */
   override def stop(): Unit = {
     super.stop()
+    Option(jobsTab).foreach(_.stop())
     logInfo(log"Stopped Spark web UI at ${MDC(WEB_URL, webUrl)}")
   }
 
@@ -227,6 +236,16 @@ private[spark] abstract class SparkUITab(parent: SparkUI, prefix: String)
   def appName: String = parent.appName
 
   def appSparkVersion: String = parent.appSparkVersion
+
+  def sparkUser: String = parent.getSparkUser
+
+  def appStartTime: Long = {
+    try {
+      parent.store.applicationInfo().attempts.head.startTime.getTime
+    } catch {
+      case _: Exception => System.currentTimeMillis()
+    }
+  }
 }
 
 private[spark] object SparkUI {

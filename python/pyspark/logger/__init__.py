@@ -18,6 +18,7 @@
 """
 PySpark logging
 """
-from pyspark.logger.logger import PySparkLogger, SPARK_LOG_SCHEMA  # noqa: F401
+
+from pyspark.logger.logger import SPARK_LOG_SCHEMA, PySparkLogger
 
 __all__ = ["PySparkLogger", "SPARK_LOG_SCHEMA"]

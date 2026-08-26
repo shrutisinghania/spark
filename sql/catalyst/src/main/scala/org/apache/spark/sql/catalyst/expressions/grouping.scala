@@ -196,6 +196,11 @@ object GroupingSets {
     _FUNC_(col) - indicates whether a specified column in a GROUP BY is aggregated or
       not, returns 1 for aggregated or 0 for not aggregated in the result set.",
   """,
+  arguments = """
+    Arguments:
+      * col - A grouping column referenced in the GROUP BY clause. It must exactly match one
+          of the grouping expressions of the query.
+  """,
   examples = """
     Examples:
       > SELECT name, _FUNC_(name), sum(age) FROM VALUES (2, 'Alice'), (5, 'Bob') people(age, name) GROUP BY cube(name);
@@ -228,6 +233,12 @@ case class Grouping(child: Expression) extends Expression with Unevaluable
   usage = """
     _FUNC_([col1[, col2 ..]]) - returns the level of grouping, equals to
       `(grouping(c1) << (n-1)) + (grouping(c2) << (n-2)) + ... + grouping(cn)`
+  """,
+  arguments = """
+    Arguments:
+      * colN - An optional grouping column referenced in the GROUP BY clause. Zero or more
+          columns can be given; when provided, they must match the grouping columns exactly,
+          and when omitted all grouping columns are used.
   """,
   examples = """
     Examples:
@@ -267,32 +278,22 @@ object GroupingID {
   }
 }
 
-object GroupingAnalytics {
+object GroupingAnalytics extends AliasHelper {
   def unapply(exprs: Seq[Expression])
   : Option[(Seq[Seq[Expression]], Seq[Expression])] = {
-    if (!exprs.exists(_.isInstanceOf[BaseGroupingSets])) {
+    val exprsNoAlias = exprs.map(trimAliases)
+
+    if (!exprsNoAlias.exists(_.isInstanceOf[BaseGroupingSets])) {
       None
     } else {
-      val resolved = exprs.forall {
+      val resolved = exprsNoAlias.forall {
         case gs: BaseGroupingSets => gs.childrenResolved
         case other => other.resolved
       }
       if (!resolved) {
         None
       } else {
-        val groups = exprs.flatMap {
-          case gs: BaseGroupingSets => gs.groupByExprs
-          case other: Expression => other :: Nil
-        }
-        val unmergedSelectedGroupByExprs = exprs.map {
-          case gs: BaseGroupingSets => gs.selectedGroupByExprs
-          case other: Expression => Seq(Seq(other))
-        }
-        val selectedGroupByExprs = unmergedSelectedGroupByExprs.tail
-          .foldLeft(unmergedSelectedGroupByExprs.head) { (x, y) =>
-            for (a <- x; b <- y) yield a ++ b
-          }
-        Some(selectedGroupByExprs, BaseGroupingSets.distinctGroupByExprs(groups))
+        GroupingAnalyticsExtractor(exprsNoAlias)
       }
     }
   }

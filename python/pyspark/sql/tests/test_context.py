@@ -25,7 +25,7 @@ import py4j
 
 from pyspark import SparkContext, SQLContext
 from pyspark.sql import Row, SparkSession
-from pyspark.sql.types import StructType, StringType, StructField
+from pyspark.sql.types import StringType, StructField, StructType
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
 
@@ -187,12 +187,6 @@ class SQLContextTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_context import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

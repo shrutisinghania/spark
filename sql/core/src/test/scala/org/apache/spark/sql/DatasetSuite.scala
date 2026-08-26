@@ -19,6 +19,7 @@ package org.apache.spark.sql
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
 import java.sql.{Date, Timestamp}
+import java.time.{Instant, LocalDateTime}
 
 import scala.collection.immutable.HashSet
 import scala.collection.mutable
@@ -71,8 +72,7 @@ object TestForTypeAlias {
   def aliasedArrayInTuple: (Int, IntArray) = (1, Array(1))
 }
 
-class DatasetSuite extends QueryTest
-  with SharedSparkSession
+class DatasetSuite extends SharedSparkSession
   with AdaptiveSparkPlanHelper {
   import testImplicits._
 
@@ -857,6 +857,90 @@ class DatasetSuite extends QueryTest
       1 -> "a", 2 -> "bc", 3 -> "d")
   }
 
+  test("cogroup with complex key types") {
+    // Test cogroup with nested structure as key using existing ClassData
+    val ds1 = Seq(
+      (ClassData("x", 1), "left1"),
+      (ClassData("x", 1), "left2"),
+      (ClassData("y", 2), "left3")
+    ).toDS()
+
+    val ds2 = Seq(
+      (ClassData("x", 1), 100),
+      (ClassData("z", 3), 200)
+    ).toDS()
+
+    val cogrouped = ds1.groupByKey(_._1).cogroup(ds2.groupByKey(_._1)) {
+      case (key, left, right) =>
+        Iterator((key.a, key.b, left.size, right.size))
+    }
+
+    checkDatasetUnorderly(
+      cogrouped,
+      ("x", 1, 2, 1),  // ClassData("x", 1): 2 left, 1 right
+      ("y", 2, 1, 0),  // ClassData("y", 2): 1 left, 0 right
+      ("z", 3, 0, 1)   // ClassData("z", 3): 0 left, 1 right
+    )
+  }
+
+  test("cogroup with null keys") {
+    // Test that null keys are handled correctly - rows with null keys should be grouped together.
+    val ds1 = Seq(
+      (Some(1), "a"),
+      (Some(1), "b"),
+      (None, "c"),
+      (None, "d"),
+      (Some(2), "e")
+    ).toDS()
+    val ds2 = Seq(
+      (Some(1), 10),
+      (None, 20),
+      (Some(3), 30)
+    ).toDS()
+
+    val cogrouped = ds1.groupByKey(_._1).cogroup(ds2.groupByKey(_._1)) {
+      case (key, left, right) =>
+        Iterator((key, left.size, right.size))
+    }
+
+    checkDatasetUnorderly(
+      cogrouped,
+      (Some(1), 2, 1),  // key=1: 2 left ("a","b"), 1 right (10)
+      (None, 2, 1),     // key=null: 2 left ("c","d"), 1 right (20)
+      (Some(2), 1, 0),  // key=2: 1 left ("e"), 0 right
+      (Some(3), 0, 1)   // key=3: 0 left, 1 right (30)
+    )
+  }
+
+  test("cogroup with empty datasets") {
+    val ds1 = Seq(1 -> "a", 2 -> "b").toDS()
+    val ds2 = Seq(2 -> 100, 3 -> 200).toDS()
+    val emptyDs = spark.emptyDataset[(Int, String)]
+    val emptyDs2 = spark.emptyDataset[(Int, Long)]
+
+    // Helper function to count elements from each side
+    def countElements[L, R](left: Iterator[L], right: Iterator[R]): (Int, Int) =
+      (left.size, right.size)
+
+    // Empty left: all keys come from right, left iterator is always empty
+    val emptyLeftResult = emptyDs.groupByKey(_._1).cogroup(ds2.groupByKey(_._1)) {
+      case (key, left, right) => Iterator((key, countElements(left, right)))
+    }.collect().sortBy(_._1)
+    assert(emptyLeftResult === Array((2, (0, 1)), (3, (0, 1))))
+
+    // Empty right: all keys come from left, right iterator is always empty
+    val emptyRightResult = ds1.groupByKey(_._1).cogroup(emptyDs.groupByKey(_._1)) {
+      case (key, left, right) => Iterator((key, countElements(left, right)))
+    }.collect().sortBy(_._1)
+    assert(emptyRightResult === Array((1, (1, 0)), (2, (1, 0))))
+
+    // Both empty: result should be empty
+    val bothEmptyResult = emptyDs.groupByKey(_._1).cogroup(emptyDs2.groupByKey(_._1)) {
+      case (key, left, right) => Iterator((key, countElements(left, right)))
+    }.collect()
+    assert(bothEmptyResult.isEmpty)
+  }
+
   test("cogroup with groupBy and sorted") {
     val left = Seq(1 -> "a", 3 -> "xyz", 5 -> "hello", 3 -> "abc", 3 -> "ijk").toDS()
     val right = Seq(2 -> "q", 3 -> "w", 5 -> "x", 5 -> "z", 3 -> "a", 5 -> "y").toDS()
@@ -1012,7 +1096,7 @@ class DatasetSuite extends QueryTest
     assert(err.getMessage.contains("An Observation can be used with a Dataset only once"))
 
     // streaming datasets are not supported
-    val streamDf = new MemoryStream[Int](0, sqlContext).toDF()
+    val streamDf = new MemoryStream[Int](0, spark).toDF()
     val streamObservation = Observation("stream")
     val streamErr = intercept[IllegalArgumentException] {
       streamDf.observe(streamObservation, avg($"value").cast("int").as("avg_val"))
@@ -1073,6 +1157,24 @@ class DatasetSuite extends QueryTest
 
     assert(namedObservation1.get === expected1)
     assert(namedObservation2.get === expected2)
+  }
+
+  test("SPARK-55150: observation errors are thrown in Observation.get in classic mode") {
+    val observation = Observation("test_observation")
+    val observed_df = spark.range(10).observe(
+      observation,
+      sum($"id").as("sum_id"),
+      raise_error(lit("test error")).as("raise_error")
+    )
+
+    val actual = observed_df.collect()
+    assert(actual.toSeq === (0 until 10).map(_.toLong))
+
+    val exception = intercept[SparkRuntimeException] {
+      observation.get
+    }
+
+    assert(exception.getMessage.contains("test error"))
   }
 
   test("sample with replacement") {
@@ -1806,6 +1908,7 @@ class DatasetSuite extends QueryTest
             val treeString = cp.logicalPlan.treeString(verbose = true)
             fail(s"Expecting a LogicalRDD, but got\n$treeString")
         }
+        assert(logicalRDD.isCheckpointedInput === eager)
 
         val dsPhysicalPlan = ds.queryExecution.executedPlan
         val cpPhysicalPlan = cp.queryExecution.executedPlan
@@ -1826,6 +1929,7 @@ class DatasetSuite extends QueryTest
 
         // For a lazy checkpoint() call, the first check also materializes the checkpoint.
         checkDataset(cp, (9L to 6L by -1L).map(java.lang.Long.valueOf): _*)
+        assert(logicalRDD.isCheckpointedInput)
 
         // Reads back from checkpointed data and check again.
         checkDataset(cp, (9L to 6L by -1L).map(java.lang.Long.valueOf): _*)
@@ -1838,7 +1942,7 @@ class DatasetSuite extends QueryTest
         val agg = cp.groupBy($"id" % 2).agg(count($"id"))
 
         agg.queryExecution.executedPlan.collectFirst {
-          case ShuffleExchangeExec(_, _: RDDScanExec, _, _) =>
+          case ShuffleExchangeExec(_, _: RDDScanExec, _, _, _) =>
           case BroadcastExchangeExec(_, _: RDDScanExec) =>
         }.foreach { _ =>
           fail(
@@ -2530,6 +2634,49 @@ class DatasetSuite extends QueryTest
     assert(Seq(localDateTime).toDS().head() === localDateTime)
   }
 
+  test("SPARK-57033: Dataset[Row] roundtrip preserves nanosecond precision") {
+    val schema = new StructType()
+      .add("ntz", TimestampNTZNanosType(9), nullable = true)
+      .add("ltz", TimestampLTZNanosType(9), nullable = true)
+    val rows = Seq(
+      Row(
+        LocalDateTime.parse("2019-02-26T16:56:00.123456789"),
+        Instant.parse("2019-02-26T16:56:00.987654321Z")),
+      Row(
+        LocalDateTime.parse("9999-12-31T23:59:59.999999999"),
+        Instant.parse("9999-12-31T23:59:59.999999999Z")),
+      Row(null, null))
+    val df = spark.createDataFrame(rows.asJava, schema)
+    assert(df.schema === schema)
+    checkAnswer(df, rows)
+  }
+
+  test("SPARK-57033: Dataset[Row] roundtrip truncates sub-micro to declared precision") {
+    val ldt = LocalDateTime.parse("2019-02-26T16:56:00.123456789")
+    val instant = Instant.parse("2019-02-26T16:56:00.123456789Z")
+    val negativeEpochLdt = LocalDateTime.parse("1969-12-31T23:59:59.123456789")
+    val negativeEpochInstant = Instant.parse("1969-12-31T23:59:59.123456789Z")
+    // At p=7 the last two sub-micro digits are dropped (789 -> 700);
+    // at p=8 only the last one is dropped (789 -> 780).
+    val expectedSubMicro = Map(7 -> 700, 8 -> 780)
+
+    for (p <- 7 to 8) {
+      val schema = new StructType()
+        .add("ntz", TimestampNTZNanosType(p), nullable = true)
+        .add("ltz", TimestampLTZNanosType(p), nullable = true)
+      val rows = Seq(
+        Row(ldt, instant),
+        Row(negativeEpochLdt, negativeEpochInstant))
+      val df = spark.createDataFrame(rows.asJava, schema)
+      assert(df.schema === schema)
+      val drop = 789 - expectedSubMicro(p)
+      val expected = Seq(
+        Row(ldt.minusNanos(drop), instant.minusNanos(drop)),
+        Row(negativeEpochLdt.minusNanos(drop), negativeEpochInstant.minusNanos(drop)))
+      checkAnswer(df, expected)
+    }
+  }
+
   test("SPARK-34605: implicit encoder for java.time.Duration") {
     val duration = java.time.Duration.ofMinutes(10)
     assert(spark.range(1).map { _ => duration }.head() === duration)
@@ -2878,6 +3025,66 @@ class DatasetSuite extends QueryTest
     checkDataset(Seq(seqMutableSet).toDS(), seqMutableSet)
     checkDataset(Seq(mapMutableSet).toDS(), mapMutableSet)
   }
+
+  test("SPARK-54620: Observation should not blocking forever") {
+    val observation = Observation("row_count")
+
+    var df = Seq.empty[(Int, Int)].toDF("v1", "v2")
+    df = df.observe(observation,
+      functions.count(functions.lit(1)).alias("record_cnt"))
+    df = df.repartition($"v1")
+      .select($"v1" + 1 as "v1", $"v2" + 1 as "v2")
+      .join(
+        Seq((1, 2), (3, 4)).toDF("v1", "v2").repartition($"v2"),
+        Seq("v1"),
+        "inner")
+    df.collect()
+
+    val metrics = observation.get
+    assert(metrics.isEmpty)
+  }
+
+  test("zipWithIndex should append consecutive 0-based indices") {
+    val ds = Seq(("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)).toDS().repartition(3)
+    val result = ds.zipWithIndex()
+
+    // Index column should be the last column
+    assert(result.columns === Array("_1", "_2", "index"))
+    assert(result.schema.last.dataType === LongType)
+
+    // Indices should be consecutive 0-based
+    val indices = result.collect().map(_.getLong(2)).sorted
+    assert(indices === (0L until 5L).toArray)
+  }
+
+  test("zipWithIndex with custom column name") {
+    val ds = Seq(1, 2, 3, 4, 5).toDS()
+    val result = ds.zipWithIndex("row_num")
+
+    assert(result.columns === Array("value", "row_num"))
+    val indices = result.collect().map(_.getLong(1)).sorted
+    assert(indices === (0L until 5L).toArray)
+  }
+
+  test("zipWithIndex should throw AMBIGUOUS_REFERENCE when selecting duplicate column") {
+    val ds = Seq(("a", 1), ("b", 2)).toDF("_1", "index")
+    val result = ds.zipWithIndex() // Creates df with two "index" columns
+    val ex = intercept[AnalysisException] {
+      result.select("index").collect()
+    }
+    assert(ex.getCondition == "AMBIGUOUS_REFERENCE")
+  }
+
+  test("zipWithIndex should throw COLUMN_ALREADY_EXISTS when writing duplicate columns") {
+    val ds = Seq(("a", 1), ("b", 2)).toDF("_1", "index")
+    val result = ds.zipWithIndex() // Creates df with two "index" columns
+    withTempPath { path =>
+      val ex = intercept[AnalysisException] {
+        result.write.parquet(path.getAbsolutePath)
+      }
+      assert(ex.getCondition == "COLUMN_ALREADY_EXISTS")
+    }
+  }
 }
 
 /**
@@ -2912,8 +3119,7 @@ object CustomPathEncoder {
   )
 }
 
-class DatasetLargeResultCollectingSuite extends QueryTest
-  with SharedSparkSession {
+class DatasetLargeResultCollectingSuite extends SharedSparkSession {
 
   override protected def sparkConf: SparkConf = super.sparkConf.set(MAX_RESULT_SIZE.key, "4g")
   // SPARK-41193: Ignore this suite because it cannot run successfully with Spark

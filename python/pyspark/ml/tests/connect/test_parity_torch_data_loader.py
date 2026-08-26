@@ -17,8 +17,8 @@
 
 import unittest
 
-from pyspark.util import is_remote_only
 from pyspark.sql import SparkSession
+from pyspark.util import is_remote_only
 
 if not is_remote_only():
     from pyspark.ml.torch.tests.test_data_loader import TorchDistributorDataLoaderUnitTests
@@ -38,12 +38,6 @@ if not is_remote_only():
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.connect.test_parity_torch_data_loader import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

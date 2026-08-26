@@ -249,14 +249,14 @@ test("range with invalid long value") {
   }
 
   test("sample estimation") {
-    val sample = Sample(0.0, 0.5, withReplacement = false, (math.random() * 1000).toLong, plan)
+    val sample = Sample(0.0, 0.5, withReplacement = false, Sample.resolveSeed(None), plan)
     checkStats(sample, Statistics(sizeInBytes = 60, rowCount = Some(5)))
 
     // Child doesn't have rowCount in stats
     val childStats = Statistics(sizeInBytes = 120)
     val childPlan = DummyLogicalPlan(childStats, childStats)
     val sample2 =
-      Sample(0.0, 0.11, withReplacement = false, (math.random() * 1000).toLong, childPlan)
+      Sample(0.0, 0.11, withReplacement = false, Sample.resolveSeed(None), childPlan)
     checkStats(sample2, Statistics(sizeInBytes = 14))
   }
 
@@ -318,7 +318,8 @@ test("range with invalid long value") {
     val rowCount = Some(plan.rowCount * childrenSize)
     val attributeStats = AttributeMap(
       Seq(
-        attribute -> ColumnStat(min = Some(1), max = Some(10), nullCount = Some(0))))
+        attribute -> ColumnStat(
+          distinctCount = Some(10), min = Some(1), max = Some(10), nullCount = Some(0))))
     checkStats(
       union,
       expectedStatsCboOn = Statistics(sizeInBytes = sizeInBytes,

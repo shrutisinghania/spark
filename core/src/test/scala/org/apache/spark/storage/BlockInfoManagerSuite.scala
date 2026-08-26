@@ -313,9 +313,12 @@ class BlockInfoManagerSuite extends SparkFunSuite {
 
   test("removing a non-existent block throws SparkException") {
     withTaskId(0) {
-      intercept[SparkException] {
-        blockInfoManager.removeBlock("non-existent-block")
-      }
+      checkError(
+        exception = intercept[SparkException] {
+          blockInfoManager.removeBlock("non-existent-block")
+        },
+        condition = "INTERNAL_ERROR_STORAGE",
+        parameters = Map("message" -> "Block test_non-existent-block does not exist."))
     }
   }
 
@@ -400,6 +403,26 @@ class BlockInfoManagerSuite extends SparkFunSuite {
 
         // Wait until all futures complete for the next iteration
         futures.foreach(ThreadUtils.awaitReady(_, 100.millis))
+      }
+    }
+  }
+
+  test("SPARK-53807 - concurrent unlock and releaseAllLocksForTask for write should not fail") {
+    val blockId = TestBlockId("block")
+    assert(blockInfoManager.lockNewBlockForWriting(blockId, newBlockInfo()))
+    blockInfoManager.unlock(blockId)
+
+    // Without the fix the block below almost always fails.
+    (0 to 10).foreach { task =>
+      withTaskId(task) {
+        blockInfoManager.registerTask(task)
+
+        assert(blockInfoManager.lockForWriting(blockId).isDefined)
+
+        val future = Future(blockInfoManager.unlock(blockId, Option(task)))
+        blockInfoManager.releaseAllLocksForTask(task)
+
+        ThreadUtils.awaitReady(future, 100.millis)
       }
     }
   }

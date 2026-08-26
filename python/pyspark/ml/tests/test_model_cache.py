@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 from uuid import uuid4
 
 from pyspark.ml.model_cache import ModelCache
@@ -23,7 +22,7 @@ from pyspark.testing.mlutils import SparkSessionTestCase
 
 class ModelCacheTests(SparkSessionTestCase):
     def setUp(self):
-        super(ModelCacheTests, self).setUp()
+        super().setUp()
 
     def test_cache(self):
         def predict_fn(inputs):
@@ -34,22 +33,16 @@ class ModelCacheTests(SparkSessionTestCase):
         for uuid in uuids:
             ModelCache.add(uuid, predict_fn)
 
-        self.assertTrue(len(ModelCache._models) == 3)
-        self.assertTrue(list(ModelCache._models.keys()) == uuids[7:10])
+        self.assertEqual(len(ModelCache._models), 3)
+        self.assertEqual(list(ModelCache._models.keys()), uuids[7:10])
 
         # get item, expect it to become most recently used
         _ = ModelCache.get(uuids[8])
         expected_uuids = uuids[7:8] + uuids[9:10] + [uuids[8]]
-        self.assertTrue(list(ModelCache._models.keys()) == expected_uuids)
+        self.assertEqual(list(ModelCache._models.keys()), expected_uuids)
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_model_cache import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -130,6 +130,13 @@ object AnsiTypeCoercion extends TypeCoercionBase {
     case (t1: YearMonthIntervalType, t2: YearMonthIntervalType) =>
       Some(YearMonthIntervalType(t1.startField.min(t2.startField), t1.endField.max(t2.endField)))
 
+    // We allow coercion from GEOGRAPHY(<srid>) types (i.e. fixed SRID types) to the
+    // GEOGRAPHY(ANY) type (i.e. mixed SRID type). This coercion is always safe to do.
+    case (t1: GeographyType, t2: GeographyType) if t1 != t2 => Some(GeographyType("ANY"))
+    // We allow coercion from GEOMETRY(<srid>) types (i.e. fixed SRID types) to the
+    // GEOMETRY(ANY) type (i.e. mixed SRID type). This coercion is always safe to do.
+    case (t1: GeometryType, t2: GeometryType) if t1 != t2 => Some(GeometryType("ANY"))
+
     case (t1, t2) => findTypeForComplex(t1, t2, findTightestCommonType)
   }
 
@@ -161,6 +168,10 @@ object AnsiTypeCoercion extends TypeCoercionBase {
   private def implicitCast(
       inType: DataType,
       expectedType: AbstractDataType): Option[DataType] = {
+    // CHAR/VARCHAR promotion is checked first: the acceptsType case below would otherwise
+    // accept the constrained type unchanged, since CharType and VarcharType extend StringType.
+    charVarcharToPlainString(inType, expectedType).foreach(dt => return Some(dt))
+
     (inType, expectedType) match {
       // If the expected type equals the input type, no need to cast.
       case _ if expectedType.acceptsType(inType) => Some(inType)
@@ -185,8 +196,8 @@ object AnsiTypeCoercion extends TypeCoercionBase {
       // Ideally the implicit cast rule should be the same as `Cast.canANSIStoreAssign` so that it's
       // consistent with table insertion. To avoid breaking too many existing Spark SQL queries,
       // we make the system to allow implicitly converting String type as other primitive types.
-      case (_: StringType, a @ (_: AtomicType | NumericType | DecimalType | AnyTimestampType)) =>
-        Some(a.defaultConcreteType)
+      case (_: StringType, a @ (_: AtomicType | NumericType | DecimalType | AnyTimestampType |
+          AnyTimeType)) => Some(a.defaultConcreteType)
 
       case (ArrayType(fromType, _), AbstractArrayType(toType)) =>
         implicitCast(fromType, toType).map(ArrayType(_, true))

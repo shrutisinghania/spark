@@ -23,7 +23,7 @@ import java.time.{Instant, LocalDateTime, ZoneId}
 import java.util.{Locale, TimeZone}
 import java.util.concurrent.TimeUnit
 
-import org.apache.spark.{SPARK_DOC_ROOT, SparkConf, SparkUpgradeException}
+import org.apache.spark.{SPARK_DOC_ROOT, SparkConf, SparkRuntimeException, SparkUpgradeException}
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{CEST, LA}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.functions._
@@ -32,7 +32,7 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.unsafe.types.CalendarInterval
 
-class DateFunctionsSuite extends QueryTest with SharedSparkSession {
+class DateFunctionsSuite extends SharedSparkSession {
   import testImplicits._
 
   // The test cases which throw exceptions under ANSI mode are covered by date.sql and
@@ -967,8 +967,9 @@ class DateFunctionsSuite extends QueryTest with SharedSparkSession {
           Row(secs(ts5.getTime)), Row(null)))
 
         // invalid format
+        // Intercept to SparkRuntimeException to check for proper exception handling
         val invalid = df1.selectExpr(s"to_unix_timestamp(x, 'yyyy-MM-dd bb:HH:ss')")
-        val e = intercept[IllegalArgumentException](invalid.collect())
+        val e = intercept[SparkRuntimeException](invalid.collect())
         assert(e.getMessage.contains('b'))
 
         val df3 = Seq("2016-04-08").toDF("a")
@@ -1469,5 +1470,40 @@ class DateFunctionsSuite extends QueryTest with SharedSparkSession {
 
     checkAnswer(df.selectExpr("try_to_timestamp(a)"), Seq(Row(ts)))
     checkAnswer(df.select(try_to_timestamp(col("a"))), Seq(Row(ts)))
+  }
+
+  test("try_to_date") {
+    // without format
+    val df1 = Seq("2015-07-22", "2014-12-31").toDF("s")
+    checkAnswer(
+      df1.select(try_to_date(col("s"))),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(Date.valueOf("2014-12-31"))))
+    checkAnswer(
+      df1.selectExpr("try_to_date(s)"),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(Date.valueOf("2014-12-31"))))
+
+    // with format
+    val df2 = Seq("2015-07-22", "2014-31-12").toDF("s")
+    checkAnswer(
+      df2.select(try_to_date(col("s"), "yyyy-MM-dd")),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(null)))
+    checkAnswer(
+      df2.selectExpr("try_to_date(s, 'yyyy-MM-dd')"),
+      Seq(Row(Date.valueOf("2015-07-22")), Row(null)))
+    checkAnswer(
+      df2.select(try_to_date(col("s"), "yyyy-dd-MM")),
+      Seq(Row(null), Row(Date.valueOf("2014-12-31"))))
+    checkAnswer(
+      df2.selectExpr("try_to_date(s, 'yyyy-dd-MM')"),
+      Seq(Row(null), Row(Date.valueOf("2014-12-31"))))
+
+    // invalid format - returns NULL
+    val df3 = Seq("2016-02-29", "2017-02-29", "2020-13-01", "invalid-date").toDF("x")
+    checkAnswer(
+      df3.select(try_to_date(col("x"))),
+      Seq(Row(Date.valueOf("2016-02-29")), Row(null), Row(null), Row(null)))
+    checkAnswer(
+      df3.selectExpr("try_to_date(x)"),
+      Seq(Row(Date.valueOf("2016-02-29")), Row(null), Row(null), Row(null)))
   }
 }

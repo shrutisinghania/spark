@@ -20,28 +20,26 @@ import shutil
 import string
 import sys
 import tempfile
-
 import unittest
-from typing import cast
 from decimal import Decimal
 
-from pyspark.sql.streaming.state import GroupStateTimeout, GroupState
+from pyspark.sql.streaming.state import GroupState, GroupStateTimeout
 from pyspark.sql.types import (
-    LongType,
-    StringType,
-    StructType,
-    StructField,
-    Row,
     DecimalType,
+    LongType,
+    Row,
+    StringType,
+    StructField,
+    StructType,
 )
-from pyspark.testing.sqlutils import (
-    ReusedSQLTestCase,
+from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import (
+    eventually,
     have_pandas,
     have_pyarrow,
     pandas_requirement_message,
     pyarrow_requirement_message,
 )
-from pyspark.testing.utils import eventually
 
 if have_pandas:
     import pandas as pd
@@ -52,7 +50,7 @@ if have_pyarrow:
 
 @unittest.skipIf(
     not have_pandas or not have_pyarrow,
-    cast(str, pandas_requirement_message or pyarrow_requirement_message),
+    pandas_requirement_message or pyarrow_requirement_message,
 )
 class GroupedApplyInPandasWithStateTestsMixin:
     @classmethod
@@ -346,12 +344,6 @@ class GroupedApplyInPandasWithStateTests(
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.pandas.test_pandas_grouped_map_with_state import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

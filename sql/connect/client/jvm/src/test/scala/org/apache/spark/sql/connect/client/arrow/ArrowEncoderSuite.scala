@@ -16,42 +16,47 @@
  */
 package org.apache.spark.sql.connect.client.arrow
 
+import java.io.{ByteArrayOutputStream, File}
 import java.math.BigInteger
+import java.net.URLClassLoader
 import java.time.{Duration, Period, ZoneOffset}
 import java.time.temporal.ChronoUnit
 import java.util
 import java.util.{Collections, Objects}
+import java.util.concurrent.{ConcurrentLinkedQueue, CyclicBarrier}
 
 import scala.beans.BeanProperty
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 import scala.reflect.classTag
+import scala.reflect.runtime.{universe => ru}
 
 import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
-import org.apache.arrow.vector.VarBinaryVector
-import org.scalatest.BeforeAndAfterAll
+import org.apache.arrow.vector.{BaseVariableWidthViewVector, FieldVector, VarBinaryVector, VectorSchemaRoot, ViewVarBinaryVector, ViewVarCharVector}
+import org.apache.arrow.vector.ipc.ArrowStreamWriter
 
 import org.apache.spark.{SparkRuntimeException, SparkUnsupportedOperationException}
-import org.apache.spark.sql.{AnalysisException, Encoders, Row}
+import org.apache.spark.sql.{Encoders, Row}
 import org.apache.spark.sql.catalyst.{DefinedByConstructorParams, JavaTypeInference, ScalaReflection}
 import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoder, Codec, OuterScopes}
 import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.{agnosticEncoderFor, BinaryEncoder, BoxedBooleanEncoder, BoxedByteEncoder, BoxedDoubleEncoder, BoxedFloatEncoder, BoxedIntEncoder, BoxedLongEncoder, BoxedShortEncoder, CalendarIntervalEncoder, DateEncoder, DayTimeIntervalEncoder, EncoderField, InstantEncoder, IterableEncoder, JavaDecimalEncoder, LocalDateEncoder, LocalDateTimeEncoder, NullEncoder, PrimitiveBooleanEncoder, PrimitiveByteEncoder, PrimitiveDoubleEncoder, PrimitiveFloatEncoder, PrimitiveIntEncoder, PrimitiveLongEncoder, PrimitiveShortEncoder, RowEncoder, ScalaDecimalEncoder, StringEncoder, TimestampEncoder, TransformingEncoder, UDTEncoder, YearMonthIntervalEncoder}
-import org.apache.spark.sql.catalyst.encoders.RowEncoder.{encoderFor => toRowEncoder}
+import org.apache.spark.sql.catalyst.encoders.RowEncoder.{encoderFor => toRowEncoder, encoderForResultSchema => toResultRowEncoder}
 import org.apache.spark.sql.catalyst.util.{DateFormatter, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.MICROS_PER_SECOND
 import org.apache.spark.sql.catalyst.util.IntervalStringStyles.ANSI_STYLE
 import org.apache.spark.sql.catalyst.util.SparkDateTimeUtils._
 import org.apache.spark.sql.catalyst.util.SparkIntervalUtils._
-import org.apache.spark.sql.connect.client.CloseableIterator
 import org.apache.spark.sql.connect.client.arrow.FooEnum.FooEnum
 import org.apache.spark.sql.connect.test.ConnectFunSuite
-import org.apache.spark.sql.types.{ArrayType, DataType, DayTimeIntervalType, Decimal, DecimalType, IntegerType, Metadata, SQLUserDefinedType, StringType, StructType, UserDefinedType, YearMonthIntervalType}
+import org.apache.spark.sql.types.{ArrayType, CharType, DataType, DayTimeIntervalType, Decimal, DecimalType, Geography, Geometry, IntegerType, Metadata, SQLUserDefinedType, StringType, StructType, UserDefinedType, VarcharType, YearMonthIntervalType}
+import org.apache.spark.sql.util.CloseableIterator
 import org.apache.spark.unsafe.types.VariantVal
-import org.apache.spark.util.SparkStringUtils
+import org.apache.spark.util.{MaybeNull, SparkStringUtils}
 
 /**
  * Tests for encoding external data to and from arrow.
  */
-class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
+class ArrowEncoderSuite extends ConnectFunSuite {
   private val allocator = new RootAllocator()
 
   private def newAllocator(name: String): BufferAllocator = {
@@ -218,20 +223,6 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
     }
   }
 
-  private case class MaybeNull(interval: Int) {
-    assert(interval > 1)
-    private var invocations = 0
-    def apply[T](value: T): T = {
-      val result = if (invocations % interval == 0) {
-        null.asInstanceOf[T]
-      } else {
-        value
-      }
-      invocations += 1
-      result
-    }
-  }
-
   private def javaBigDecimal(i: Int): java.math.BigDecimal = {
     javaBigDecimal(i, DecimalType.DEFAULT_SCALE)
   }
@@ -269,12 +260,179 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
     }
   }
 
+  test("deserializing string and binary view vectors") {
+    // The client never produces view-encoded batches itself, but it can receive them, so the
+    // readers must handle them. Mix short (inline, <= 12 bytes) and long (stored in a data
+    // buffer) values to exercise both view-storage paths.
+    val values = Seq("a", "a-string-longer-than-twelve-bytes", null)
+
+    def serializeViewVector(vector: BaseVariableWidthViewVector): Array[Byte] = {
+      vector.allocateNew()
+      values.zipWithIndex.foreach {
+        case (null, i) => vector.setNull(i)
+        case (s, i) =>
+          val bytes = s.getBytes("utf8")
+          vector.setSafe(i, bytes, 0, bytes.length)
+      }
+      vector.setValueCount(values.size)
+      val root = new VectorSchemaRoot(Collections.singletonList[FieldVector](vector))
+      try {
+        val out = new ByteArrayOutputStream()
+        val writer = new ArrowStreamWriter(root, null, out)
+        writer.start()
+        writer.writeBatch()
+        writer.end()
+        out.toByteArray
+      } finally {
+        root.close()
+      }
+    }
+
+    withAllocator { allocator =>
+      val strings = ArrowDeserializers.deserializeFromArrow(
+        Iterator.single(serializeViewVector(new ViewVarCharVector("s", allocator))),
+        StringEncoder,
+        allocator,
+        timeZoneId = "UTC")
+      compareIterators(values.iterator, strings)
+      strings.close()
+
+      val binaries = ArrowDeserializers.deserializeFromArrow(
+        Iterator.single(serializeViewVector(new ViewVarBinaryVector("b", allocator))),
+        BinaryEncoder,
+        allocator,
+        timeZoneId = "UTC")
+      compareIterators(
+        values.iterator.map(Option(_).map(_.getBytes("utf8").toSeq)),
+        binaries.map(Option(_).map(_.toSeq)))
+      binaries.close()
+    }
+  }
+
+  test("SPARK-58794: char/varchar round trip") {
+    // The client cannot see the server's charVarchar configuration, so a result schema carrying
+    // CHAR/VARCHAR must be decodable regardless of the local one. Values are padded and length
+    // checked by the server, so the client passes them through unchanged.
+    val encoder = toResultRowEncoder(
+      new StructType()
+        .add("c", CharType(4))
+        .add("v", VarcharType(6))
+        .add("s", new StructType().add("c", CharType(4)))
+        .add("a", ArrayType(VarcharType(6))))
+    roundTripAndCheckIdentical(encoder) { () =>
+      val maybeNull = MaybeNull(7)
+      Iterator.tabulate(101) { i =>
+        Row(
+          maybeNull("ab  "),
+          maybeNull("cd"),
+          maybeNull(Row("ef  ")),
+          maybeNull(mutable.ArraySeq.make[String](Array("gh"))))
+      }
+    }
+  }
+
   test("single batch") {
     val inspector = new CountingBatchInspector
     roundTripAndCheckIdentical(singleIntEncoder, inspectBatch = inspector) { () =>
       Iterator.tabulate(10)(i => Row(i))
     }
     assert(inspector.numBatches == 1)
+  }
+
+  test("geography round trip") {
+    val point1 = "010100000000000000000031400000000000001C40"
+      .grouped(2)
+      .map(Integer.parseInt(_, 16).toByte)
+      .toArray
+    val point2 = "010100000000000000000035400000000000001E40"
+      .grouped(2)
+      .map(Integer.parseInt(_, 16).toByte)
+      .toArray
+
+    val geographyEncoder = toRowEncoder(new StructType().add("g", "geography(4326)"))
+    roundTripAndCheckIdentical(geographyEncoder) { () =>
+      val maybeNull = MaybeNull(7)
+      Iterator.tabulate(101)(i => Row(maybeNull(Geography.fromWKB(point1, 4326))))
+    }
+
+    val nestedGeographyEncoder = toRowEncoder(
+      new StructType()
+        .add(
+          "s",
+          new StructType()
+            .add("i1", "int")
+            .add("g0", "geography(4326)")
+            .add("i2", "int")
+            .add("g4326", "geography(4326)"))
+        .add("a", "array<geography(4326)>")
+        .add("m", "map<string, geography(ANY)>"))
+
+    roundTripAndCheckIdentical(nestedGeographyEncoder) { () =>
+      val maybeNull5 = MaybeNull(5)
+      val maybeNull7 = MaybeNull(7)
+      val maybeNull11 = MaybeNull(11)
+      val maybeNull13 = MaybeNull(13)
+      val maybeNull17 = MaybeNull(17)
+      Iterator
+        .tabulate(100)(i =>
+          Row(
+            maybeNull5(
+              Row(
+                i,
+                maybeNull7(Geography.fromWKB(point1)),
+                i + 1,
+                maybeNull11(Geography.fromWKB(point2, 4326)))),
+            maybeNull7((0 until 10).map(j => Geography.fromWKB(point2, 0))),
+            maybeNull13(Map((i.toString, maybeNull17(Geography.fromWKB(point1, 4326)))))))
+    }
+  }
+
+  test("geometry round trip") {
+    val point1 = "010100000000000000000031400000000000001C40"
+      .grouped(2)
+      .map(Integer.parseInt(_, 16).toByte)
+      .toArray
+    val point2 = "010100000000000000000035400000000000001E40"
+      .grouped(2)
+      .map(Integer.parseInt(_, 16).toByte)
+      .toArray
+
+    val geometryEncoder = toRowEncoder(new StructType().add("g", "geometry(0)"))
+    roundTripAndCheckIdentical(geometryEncoder) { () =>
+      val maybeNull = MaybeNull(7)
+      Iterator.tabulate(101)(i => Row(maybeNull(Geometry.fromWKB(point1, 0))))
+    }
+
+    val nestedGeometryEncoder = toRowEncoder(
+      new StructType()
+        .add(
+          "s",
+          new StructType()
+            .add("i1", "int")
+            .add("g0", "geometry(0)")
+            .add("i2", "int")
+            .add("g4326", "geometry(4326)"))
+        .add("a", "array<geometry(0)>")
+        .add("m", "map<string, geometry(ANY)>"))
+
+    roundTripAndCheckIdentical(nestedGeometryEncoder) { () =>
+      val maybeNull5 = MaybeNull(5)
+      val maybeNull7 = MaybeNull(7)
+      val maybeNull11 = MaybeNull(11)
+      val maybeNull13 = MaybeNull(13)
+      val maybeNull17 = MaybeNull(17)
+      Iterator
+        .tabulate(100)(i =>
+          Row(
+            maybeNull5(
+              Row(
+                i,
+                maybeNull7(Geometry.fromWKB(point1, 0)),
+                i + 1,
+                maybeNull11(Geometry.fromWKB(point2, 4326)))),
+            maybeNull7((0 until 10).map(j => Geometry.fromWKB(point2, 0))),
+            maybeNull13(Map((i.toString, maybeNull17(Geometry.fromWKB(point1, 4326)))))))
+    }
   }
 
   test("variant round trip") {
@@ -726,7 +884,6 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
 
   private val wideSchemaEncoder = toRowEncoder(
     new StructType()
-      .add("a", "int")
       .add("b", "string")
       .add(
         "c",
@@ -746,30 +903,29 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
     new StructType()
       .add("b", "string")
       .add(
+        "C",
+        new StructType()
+          .add("Ca", "array<int>")
+          .add("Cb", "binary"))
+      .add(
         "d",
         ArrayType(
           new StructType()
             .add("da", "decimal(20, 10)")
-            .add("dc", "boolean")))
-      .add(
-        "C",
-        new StructType()
-          .add("Ca", "array<int>")
-          .add("Cb", "binary")))
+            .add("db", "string"))))
 
   test("bind to schema") {
-    // Binds to a wider schema. The narrow schema has fewer (nested) fields, has a slightly
-    // different field order, and uses different cased names in a couple of places.
+    // Binds to a wider schema. The narrow schema has fewer (nested) fields, and uses different
+    // cased names in a couple of places.
     withAllocator { allocator =>
       val input = Row(
-        887,
         "foo",
         Row(Seq(1, 7, 5), Array[Byte](8.toByte, 756.toByte), 5f),
         Seq(Row(null, "a", false), Row(javaBigDecimal(57853, 10), "b", false)))
       val expected = Row(
         "foo",
-        Seq(Row(null, false), Row(javaBigDecimal(57853, 10), false)),
-        Row(Seq(1, 7, 5), Array[Byte](8.toByte, 756.toByte)))
+        Row(Seq(1, 7, 5), Array[Byte](8.toByte, 756.toByte)),
+        Seq(Row(null, "a"), Row(javaBigDecimal(57853, 10), "b")))
       val arrowBatches = serializeToArrow(Iterator.single(input), wideSchemaEncoder, allocator)
       val result =
         ArrowDeserializers.deserializeFromArrow(
@@ -777,18 +933,21 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
           narrowSchemaEncoder,
           allocator,
           timeZoneId = "UTC")
-      val actual = result.next()
-      assert(result.isEmpty)
-      assert(expected === actual)
-      result.close()
-      arrowBatches.close()
+      try {
+        val actual = result.next()
+        assert(result.isEmpty)
+        assert(expected === actual)
+      } finally {
+        result.close()
+        arrowBatches.close()
+      }
     }
   }
 
   test("unknown field") {
     withAllocator { allocator =>
       val arrowBatches = serializeToArrow(Iterator.empty, narrowSchemaEncoder, allocator)
-      intercept[AnalysisException] {
+      intercept[SparkRuntimeException] {
         ArrowDeserializers.deserializeFromArrow(
           arrowBatches,
           wideSchemaEncoder,
@@ -800,6 +959,8 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
   }
 
   test("duplicate fields") {
+    // Arrow data with [foO, Foo] decoded into [foo]: positional matching binds foo → foO (pos 0),
+    // and the extra Foo column is ignored (over-complete schema is allowed).
     val duplicateSchemaEncoder = toRowEncoder(
       new StructType()
         .add("foO", "string")
@@ -809,13 +970,65 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
         .add("foo", "string"))
     withAllocator { allocator =>
       val arrowBatches = serializeToArrow(Iterator.empty, duplicateSchemaEncoder, allocator)
-      intercept[AnalysisException] {
+      // Should not throw: RowEncoder uses positional binding, so foo binds to foO at position 0.
+      val result = ArrowDeserializers.deserializeFromArrow(
+        arrowBatches,
+        fooSchemaEncoder,
+        allocator,
+        timeZoneId = "UTC")
+      assert(!result.hasNext)
+      arrowBatches.close()
+      result.close()
+    }
+  }
+
+  test("row with duplicate column names") {
+    // Spark DataFrames allow duplicate column names. collect() must round-trip such rows
+    // without throwing AMBIGUOUS_COLUMN_OR_FIELD.
+    val schema = new StructType()
+      .add("channel", "string")
+      .add("channel", "string")
+    val encoder = toRowEncoder(schema)
+    val rows = Seq(Row("a", "b"), Row("c", "d"), Row(null, "e"))
+    val iterator = roundTrip(encoder, rows.iterator)
+    try {
+      compareIterators(rows.iterator, iterator)
+    } finally {
+      iterator.close()
+    }
+  }
+
+  test("row schema validation - column name mismatch") {
+    val serializeEncoder = toRowEncoder(new StructType().add("a", "string").add("b", "string"))
+    val deserializeEncoder = toRowEncoder(new StructType().add("a", "string").add("x", "string"))
+    withAllocator { allocator =>
+      val arrowBatches = serializeToArrow(Iterator.empty, serializeEncoder, allocator)
+      val e = intercept[SparkRuntimeException] {
         ArrowDeserializers.deserializeFromArrow(
           arrowBatches,
-          fooSchemaEncoder,
+          deserializeEncoder,
           allocator,
           timeZoneId = "UTC")
       }
+      assert(e.getCondition == "ARROW_SCHEMA_FIELD_NAME_MISMATCH")
+      arrowBatches.close()
+    }
+  }
+
+  test("row schema validation - encoder has more fields than Arrow data") {
+    val serializeEncoder = toRowEncoder(new StructType().add("a", "string"))
+    val deserializeEncoder =
+      toRowEncoder(new StructType().add("a", "string").add("b", "string"))
+    withAllocator { allocator =>
+      val arrowBatches = serializeToArrow(Iterator.empty, serializeEncoder, allocator)
+      val e = intercept[SparkRuntimeException] {
+        ArrowDeserializers.deserializeFromArrow(
+          arrowBatches,
+          deserializeEncoder,
+          allocator,
+          timeZoneId = "UTC")
+      }
+      assert(e.getCondition == "ARROW_SCHEMA_FIELD_COUNT_MISMATCH")
       arrowBatches.close()
     }
   }
@@ -1023,6 +1236,76 @@ class ArrowEncoderSuite extends ConnectFunSuite with BeforeAndAfterAll {
         ArrowSerializer.serializerFor(StringEncoder, new VarBinaryVector("bytes", allocator))
       }
     }
+  }
+
+  // SPARK-57371: ArrowDeserializers resolves Scala collection companions and Enumeration modules
+  // via runtime reflection, which is not thread-safe (scala/bug#6240): a concurrent
+  // `mirror.classSymbol(cls).companion/.module.asModule` can observe the symbol as `NoSymbol` and
+  // throw `ScalaReflectionException: <none> is not a module`. ArrowDeserializers serializes the
+  // reflection through a single monitor. The race only manifests while a mirror's symbol table is
+  // cold, so each repetition below builds a fresh mirror over a classloader parented at the
+  // platform loader (so `scala.*` is reloaded cold) and drives the real synchronized method from
+  // several threads released at once; without the lock it races red.
+
+  private val collectionCompanionClassNames = Seq(
+    "scala.collection.immutable.List",
+    "scala.collection.immutable.Vector",
+    "scala.collection.immutable.Set",
+    "scala.collection.immutable.Map",
+    "scala.collection.mutable.ArrayBuffer",
+    "scala.collection.mutable.HashMap")
+
+  /** A fresh classloader parented at the platform loader, so `scala.*` is reloaded cold. */
+  private def newColdLoader(): URLClassLoader = {
+    val urls = System
+      .getProperty("java.class.path")
+      .split(File.pathSeparator)
+      .filter(_.nonEmpty)
+      .map(p => new File(p).toURI.toURL)
+    new URLClassLoader(urls, ClassLoader.getPlatformClassLoader)
+  }
+
+  // Drive `resolve` against a fresh cold mirror from 8 threads, 50 times; fail on any error/hang.
+  private def hammerReflection(
+      names: Seq[String],
+      resolve: (ru.Mirror, Class[_]) => Any): Unit = {
+    val errors = new ConcurrentLinkedQueue[Throwable]()
+    for (_ <- 0 until 50) {
+      val loader = newColdLoader()
+      val mirror = ru.runtimeMirror(loader)
+      val classes = names.map(loader.loadClass)
+      val barrier = new CyclicBarrier(8)
+      val threads = (0 until 8).map { _ =>
+        new Thread(() => {
+          barrier.await() // release all threads simultaneously onto the cold mirror
+          classes.foreach { cls =>
+            try resolve(mirror, cls)
+            catch { case e: Throwable => errors.add(e) }
+          }
+        })
+      }
+      threads.foreach(_.start())
+      threads.foreach { t =>
+        t.join(60000)
+        assert(!t.isAlive, "thread did not finish within 60s (possible deadlock)")
+      }
+    }
+    assert(
+      errors.isEmpty,
+      s"reflection raced under concurrent access (${errors.size} error(s)): " +
+        errors.asScala.map(e => s"${e.getClass.getName}: ${e.getMessage}").toSet.mkString("; "))
+  }
+
+  test("SPARK-57371: resolveCompanion is thread-safe under concurrent cold-mirror access") {
+    hammerReflection(
+      collectionCompanionClassNames,
+      (m, c) => ArrowDeserializers.resolveCompanionFromMirror(m, c))
+  }
+
+  test("SPARK-57371: resolveEnum is thread-safe under concurrent cold-mirror access") {
+    hammerReflection(
+      Seq(FooEnum.getClass.getName),
+      (m, c) => ArrowDeserializers.resolveEnumFromMirror(m, c))
   }
 }
 

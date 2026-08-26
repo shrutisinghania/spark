@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-from typing import Any, TypeVar, Callable, List, Tuple, Union, Iterable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Tuple, TypeVar, Union
 
 import pandas as pd
 
@@ -74,7 +74,7 @@ def aggregate_dataframe(
 
     dataframe = dataframe.select(*input_col_names)
 
-    def compute_state(iterator: Iterable["pd.DataFrame"]) -> Iterable["pd.DataFrame"]:
+    def compute_state(iterator: Iterator["pd.DataFrame"]) -> Iterator["pd.DataFrame"]:
         state = None
 
         for batch_pandas_df in iterator:

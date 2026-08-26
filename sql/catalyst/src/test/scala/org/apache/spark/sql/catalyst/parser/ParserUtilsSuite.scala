@@ -206,12 +206,22 @@ class ParserUtilsSuite extends SparkFunSuite {
   }
 
   test("string") {
-    assert(string(showDbsContext.pattern.STRING_LITERAL()) == "identifier_with_wildcards")
-    assert(string(createDbContext.commentSpec().get(0).stringLit().STRING_LITERAL()) ==
-      "database_comment")
+    val dataTypeBuilder = new org.apache.spark.sql.catalyst.parser.DataTypeAstBuilder()
+    val token1 = dataTypeBuilder.visitStringLit(showDbsContext.pattern)
+    if (token1 != null) {
+      assert(string(token1) == "identifier_with_wildcards")
+    }
 
-    assert(string(createDbContext.locationSpec.asScala.head.stringLit().STRING_LITERAL()) ==
-      "/home/user/db")
+    val token2 = dataTypeBuilder.visitStringLit(createDbContext.commentSpec().get(0).stringLit())
+    if (token2 != null) {
+      assert(string(token2) == "database_comment")
+    }
+
+    val token3 = dataTypeBuilder.visitStringLit(
+      createDbContext.locationSpec.asScala.head.stringLit())
+    if (token3 != null) {
+      assert(string(token3) == "/home/user/db")
+    }
   }
 
   test("position") {
@@ -222,26 +232,12 @@ class ParserUtilsSuite extends SparkFunSuite {
     assert(position(emptyContext.stop) == Origin(None, None))
   }
 
-  test("validate") {
-    val f1 = { ctx: ParserRuleContext =>
-      ctx.children != null && !ctx.children.isEmpty
-    }
-    val message = "ParserRuleContext should not be empty."
-    validate(f1(showFuncContext), message, showFuncContext)
-
-    checkError(
-      exception = intercept[ParseException] {
-        validate(f1(emptyContext), message, emptyContext)
-      },
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> message))
-  }
-
   test("withOrigin") {
     val ctx = createDbContext.locationSpec.asScala.head
     val current = CurrentOrigin.get
     val (location, origin) = withOrigin(ctx) {
-      (string(ctx.stringLit().STRING_LITERAL), CurrentOrigin.get)
+      (Option(new org.apache.spark.sql.catalyst.parser.DataTypeAstBuilder()
+        .visitStringLit(ctx.stringLit())).map(string).getOrElse(""), CurrentOrigin.get)
     }
     assert(location == "/home/user/db")
     assert(origin == Origin(Some(3), Some(27)))

@@ -25,7 +25,7 @@ import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{LOG_TYPE, PATH}
-import org.apache.spark.ui.{UIUtils, WebUIPage}
+import org.apache.spark.ui.{CspNonce, UIUtils, WebUIPage}
 import org.apache.spark.util.Utils
 import org.apache.spark.util.logging.RollingFileAppender
 
@@ -71,11 +71,16 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
     val byteLength = Option(request.getParameter("byteLength")).map(_.toInt)
       .getOrElse(defaultBytes)
 
+    // The identifiers below flow both into a filesystem path (logDir, kept raw and guarded by
+    // Utils.isInDirectory in getLog) and into the query string of the generated /log requests
+    // (params). URL-encode the query-string copy so request-supplied values cannot inject extra
+    // parameters or truncate the request.
     val (logDir, params, pageName) = (appId, executorId, driverId, self) match {
       case (Some(a), Some(e), None, None) =>
-        (s"${workDir.getPath}/$a/$e/", s"appId=$a&executorId=$e", s"$a/$e")
+        (s"${workDir.getPath}/$a/$e/",
+          s"appId=${UIUtils.encodeLogParam(a)}&executorId=${UIUtils.encodeLogParam(e)}", s"$a/$e")
       case (None, None, Some(d), None) =>
-        (s"${workDir.getPath}/$d/", s"driverId=$d", d)
+        (s"${workDir.getPath}/$d/", s"driverId=${UIUtils.encodeLogParam(d)}", d)
       case (None, None, None, Some(_)) =>
         (s"${sys.env.getOrElse("SPARK_LOG_DIR", workDir.getPath)}/", "self", "worker")
       case _ =>
@@ -91,36 +96,36 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
       </span>
 
     val moreButton =
-      <button type="button" onclick={"loadMore()"} class="log-more-btn btn btn-secondary">
+      <button type="button" class="log-more-btn btn btn-secondary">
         Load More
       </button>
 
     val newButton =
-      <button type="button" onclick={"loadNew()"} class="log-new-btn btn btn-secondary">
+      <button type="button" class="log-new-btn btn btn-secondary">
         Load New
       </button>
 
     val alert =
-      <div class="no-new-alert alert alert-info" style="display: none;">
+      <div class="no-new-alert alert alert-info d-none">
         End of Log
       </div>
 
-    val logParams = "?%s&logType=%s".format(params, logType)
-    val jsOnload = "window.onload = " +
-      s"initLogPage('$logParams', $curLogLength, $startByte, $endByte, $logLength, $byteLength);"
+    val logParams = "?%s&logType=%s".format(params, UIUtils.encodeLogParam(logType))
+    val jsOnload = UIUtils.logPageOnloadScript(
+      logParams, curLogLength, startByte, endByte, logLength, byteLength)
 
     val content =
       <script type="module" src={UIUtils.prependBaseUri(request, "/static/utils.js")}></script> ++
       <div>
         {linkToMaster}
         {range}
-        <div class="log-content" style="height:80vh; overflow:auto; padding:5px;">
+        <div class="log-content overflow-auto p-1" style="height:80vh;">
           <div>{moreButton}</div>
           <pre>{logText}</pre>
           {alert}
           <div>{newButton}</div>
         </div>
-        <script>{Unparsed(jsOnload)}</script>
+        <script nonce={CspNonce.get}>{Unparsed(jsOnload)}</script>
       </div>
 
     UIUtils.basicSparkPage(request, content, logType + " log page for " + pageName)

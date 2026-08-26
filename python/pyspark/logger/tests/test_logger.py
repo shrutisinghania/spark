@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -15,14 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import logging
-import unittest
 import json
+import logging
 import tempfile
 from io import StringIO
+
 from pyspark.errors import ArithmeticException
-from pyspark.logger.logger import PySparkLogger, SPARK_LOG_SCHEMA
-from pyspark.sql import Row, functions as sf
+from pyspark.logger.logger import SPARK_LOG_SCHEMA, PySparkLogger
+from pyspark.sql import Row
+from pyspark.sql import functions as sf
 from pyspark.testing import assertDataFrameEqual
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
@@ -72,8 +72,8 @@ class LoggerTestsMixin:
         self.assertTrue("msg" in log_json["exception"])
         self.assertTrue("stacktrace" in log_json["exception"])
 
-    def test_log_warn(self):
-        self.logger.warn("This is an warn log", user="test_user_warn", action="test_action_warn")
+    def test_log_warning(self):
+        self.logger.warning("This is an warn log", user="test_user_warn", action="test_action_warn")
         log_json = json.loads(self.handler.stream.getvalue().strip())
 
         self.assertEqual(log_json["msg"], "This is an warn log")
@@ -215,13 +215,6 @@ class LoggerTests(LoggerTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.logger.tests.test_logger import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

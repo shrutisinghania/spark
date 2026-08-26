@@ -14,19 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from pyspark.sql.connect.utils import check_dependencies
-
-check_dependencies(__name__)
-
-from typing import TYPE_CHECKING, Union, Sequence, List, Optional, Tuple, cast, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence, Tuple, Union, cast
 
 from pyspark.sql.column import Column
-from pyspark.sql.window import (
-    Window as ParentWindow,
-    WindowSpec as ParentWindowSpec,
-)
 from pyspark.sql.connect.expressions import Expression, SortOrder
 from pyspark.sql.connect.functions import builtin as F
+from pyspark.sql.window import (
+    Window as ParentWindow,
+)
+from pyspark.sql.window import (
+    WindowSpec as ParentWindowSpec,
+)
 
 if TYPE_CHECKING:
     from pyspark.sql.connect._typing import ColumnOrName
@@ -66,8 +64,10 @@ class WindowSpec(ParentWindowSpec):
         frame: Optional[WindowFrame],
     ) -> "WindowSpec":
         self = object.__new__(cls)
-        self.__init__(partitionSpec, orderSpec, frame)  # type: ignore[misc]
         return self
+
+    def __getnewargs__(self) -> Tuple[Any, ...]:
+        return (self._partitionSpec, self._orderSpec, self._frame)
 
     def __init__(
         self,
@@ -156,11 +156,12 @@ class Window(ParentWindow):
 
 
 def _test() -> None:
+    import doctest
     import os
     import sys
-    import doctest
-    from pyspark.sql import SparkSession as PySparkSession
+
     import pyspark.sql.window
+    from pyspark.sql import SparkSession as PySparkSession
 
     globs = pyspark.sql.window.__dict__.copy()
     globs["spark"] = (
@@ -169,7 +170,7 @@ def _test() -> None:
         .getOrCreate()
     )
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.window,
         globs=globs,
         optionflags=doctest.ELLIPSIS

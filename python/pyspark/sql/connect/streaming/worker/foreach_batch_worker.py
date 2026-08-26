@@ -19,20 +19,20 @@
 A worker for streaming foreachBatch in Spark Connect.
 Usually this is ran on the driver side of the Spark Connect Server.
 """
-import os
 
-from pyspark.util import local_connect_and_auth
-from pyspark.serializers import (
-    write_int,
-    read_long,
-    UTF8Deserializer,
-    CPickleSerializer,
-)
+import os
+from typing import IO
+
 from pyspark import worker
+from pyspark.serializers import (
+    CPickleSerializer,
+    UTF8Deserializer,
+    read_long,
+    write_int,
+)
 from pyspark.sql.connect.session import SparkSession
 from pyspark.util import handle_worker_exception
-from typing import IO
-from pyspark.worker_util import check_python_version
+from pyspark.worker_util import check_python_version, get_sock_file_to_executor
 
 pickle_ser = CPickleSerializer()
 utf8_deserializer = UTF8Deserializer()
@@ -64,7 +64,7 @@ def main(infile: IO, outfile: IO) -> None:
         connect_url = os.environ["SPARK_CONNECT_LOCAL_URL"]
         session_id = utf8_deserializer.loads(infile)
 
-        print(f"{log_name} is starting with " f"url {connect_url} and sessionId {session_id}.")
+        print(f"{log_name} is starting with url {connect_url} and sessionId {session_id}.")
 
         # To attach to the existing SparkSession, we're setting the session_id in the URL.
         connect_url = connect_url + ";session_id=" + session_id
@@ -90,14 +90,5 @@ def main(infile: IO, outfile: IO) -> None:
 
 
 if __name__ == "__main__":
-    # Read information about how to connect back to the JVM from the environment.
-    conn_info = os.environ.get(
-        "PYTHON_WORKER_FACTORY_SOCK_PATH", int(os.environ.get("PYTHON_WORKER_FACTORY_PORT", -1))
-    )
-    auth_secret = os.environ.get("PYTHON_WORKER_FACTORY_SECRET")
-    (sock_file, sock) = local_connect_and_auth(conn_info, auth_secret)
-    # There could be a long time between each micro batch.
-    sock.settimeout(None)
-    write_int(os.getpid(), sock_file)
-    sock_file.flush()
-    main(sock_file, sock_file)
+    with get_sock_file_to_executor(timeout=None) as sock_file:
+        main(sock_file, sock_file)

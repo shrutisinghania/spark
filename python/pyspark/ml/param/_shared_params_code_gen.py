@@ -72,7 +72,7 @@ def _gen_param_header(
     )
 
     def __init__(self) -> None:
-        super({Name}, self).__init__()'''
+        super().__init__()'''
 
     if defaultValueStr is not None:
         template += f"""
@@ -332,6 +332,12 @@ if __name__ == "__main__":
             + "depends on specific algorithm. Must be >= 0.",
             "0.0",
             "TypeConverters.toFloat",
+        ),
+        (
+            "intermediateStorageLevel",
+            "StorageLevel for intermediate datasets. Cannot be 'NONE'.",
+            '"MEMORY_AND_DISK"',
+            "TypeConverters.toString",
         ),
         (
             "numTrainWorkers",

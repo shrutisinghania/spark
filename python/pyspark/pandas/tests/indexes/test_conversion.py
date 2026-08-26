@@ -14,14 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 from datetime import datetime
 
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.testing.pandasutils import PandasOnSparkTestCase, SPARK_CONF_ARROW_ENABLED
-from pyspark.testing.sqlutils import SQLTestUtils
+from pyspark.pandas.utils import (
+    SPARK_CONF_ARROW_ENABLED,
+    SPARK_CONF_PANDAS_STRUCT_MODE,
+)
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
+from pyspark.testing.utils import is_ansi_mode_test
 
 
 class ConversionMixin:
@@ -187,15 +190,26 @@ class ConversionMixin:
 
         # Multiindex
         arrays = [[1, 2], ["red", "blue"]]
-        psidx = ps.MultiIndex.from_arrays(arrays, names=("number", "color"))
-        res_psser = psidx.to_series()
-        # TODO(SPARK-53050): MultiIndex.to_series() should return tuples for each entry
-        self.assert_eq(list(res_psser.values), [["1", "red"], ["2", "blue"]])
+        pidx = pd.MultiIndex.from_arrays(arrays, names=("number", "color"))
+        psidx = ps.from_pandas(pidx)
+
+        if is_ansi_mode_test:
+            with self.sql_conf(
+                {
+                    SPARK_CONF_PANDAS_STRUCT_MODE: "row",
+                }
+            ):
+                self.assert_eq(
+                    list(psidx.to_series().values),
+                    list(pidx.to_series().values),
+                )
+        else:
+            self.assert_eq(list(psidx.to_series().values), [["1", "red"], ["2", "blue"]])
 
         pidx = self.pdf.set_index("b", append=True).index
         psidx = self.psdf.set_index("b", append=True).index
 
-        with self.sql_conf({SPARK_CONF_ARROW_ENABLED: False}):
+        with self.sql_conf({SPARK_CONF_ARROW_ENABLED: False, SPARK_CONF_PANDAS_STRUCT_MODE: "row"}):
             self.assert_eq(psidx.to_series(), pidx.to_series(), check_exact=False)
             self.assert_eq(psidx.to_series(name="a"), pidx.to_series(name="a"), check_exact=False)
 
@@ -291,18 +305,11 @@ class ConversionMixin:
 class ConversionTests(
     ConversionMixin,
     PandasOnSparkTestCase,
-    SQLTestUtils,
 ):
     pass
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.indexes.test_conversion import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

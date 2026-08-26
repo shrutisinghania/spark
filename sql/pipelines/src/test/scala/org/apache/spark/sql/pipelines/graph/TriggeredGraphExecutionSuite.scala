@@ -26,7 +26,7 @@ import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Identifier, TableC
 import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
 import org.apache.spark.sql.pipelines.common.{FlowStatus, RunState}
 import org.apache.spark.sql.pipelines.graph.TriggeredGraphExecution.StreamState
-import org.apache.spark.sql.pipelines.logging.EventLevel
+import org.apache.spark.sql.pipelines.logging.{EventLevel, FlowProgress}
 import org.apache.spark.sql.pipelines.utils.{ExecutionTest, TestGraphRegistrationContext}
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{IntegerType, StringType, StructType}
@@ -60,7 +60,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       registerMaterializedView("b", query = readFlowFunc("a"))
     }
     val unresolvedGraph = pipelineDef.toDataflowGraph
-    val resolvedGraph = unresolvedGraph.resolve()
+    val resolvedGraph = unresolvedGraph.resolve(spark.sessionState.conf.caseSensitiveAnalysis)
     assert(resolvedGraph.flows.size == 2)
     assert(unresolvedGraph.flows.size == 2)
     assert(unresolvedGraph.tables.size == 2)
@@ -68,7 +68,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       resolvedGraph.resolvedFlows.filter(_.identifier == fullyQualifiedIdentifier("b")).head
     assert(bFlow.inputs == Set(fullyQualifiedIdentifier("a")))
 
-    val updateContext = TestPipelineUpdateContext(spark, unresolvedGraph)
+    val updateContext = TestPipelineUpdateContext(spark, unresolvedGraph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -109,7 +109,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
 
     val unresolvedGraph = pipelineDef.toDataflowGraph
-    val resolvedGraph = unresolvedGraph.resolve()
+    val resolvedGraph = unresolvedGraph.resolve(spark.sessionState.conf.caseSensitiveAnalysis)
     assert(resolvedGraph.flows.size == 4)
     assert(resolvedGraph.tables.size == 3)
     assert(resolvedGraph.views.size == 1)
@@ -128,7 +128,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       resolvedGraph.resolvedFlows.filter(_.identifier == fullyQualifiedIdentifier("d")).head
     assert(dFlow.inputs == Set(fullyQualifiedIdentifier("c", isTemporaryView = true)))
 
-    val updateContext = TestPipelineUpdateContext(spark, unresolvedGraph)
+    val updateContext = TestPipelineUpdateContext(spark, unresolvedGraph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -201,7 +201,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
     val graph = pipelineDef.toDataflowGraph
 
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -268,7 +268,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
     val graph = pipelineDef.toDataflowGraph
 
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -329,7 +329,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       registerTable("z", query = Option(readStreamFlowFunc("x")))
     }
     val graph = pipelineDef.toDataflowGraph
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -437,7 +437,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
 
     val graph1 = pipelineDef1.toDataflowGraph
-    val updateContext1 = TestPipelineUpdateContext(spark, graph1)
+    val updateContext1 = TestPipelineUpdateContext(spark, graph1, storageRoot)
     updateContext1.pipelineExecution.runPipeline()
     updateContext1.pipelineExecution.awaitCompletion()
     assertFlowProgressEvent(
@@ -458,10 +458,12 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       )
     }
     val graph2 = pipelineDef2.toDataflowGraph
-    val updateContext2 = TestPipelineUpdateContext(spark, graph2)
+    val updateContext2 = TestPipelineUpdateContext(spark, graph2, storageRoot)
     updateContext2.pipelineExecution.runPipeline()
     updateContext2.pipelineExecution.awaitCompletion()
 
+    // A streaming source change is unrecoverable without a full refresh, so the flow must not be
+    // retried: we should see exactly one failure rather than maxFlowRetryAttempts + 1 of them.
     assertFlowProgressEvent(
       eventBuffer = updateContext2.eventBuffer,
       identifier = fullyQualifiedIdentifier("input_table"),
@@ -469,6 +471,17 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       expectedEventLevel = EventLevel.ERROR,
       msgChecker = _.contains(
         s"Flow '${eventLogName("input_table")}' had streaming sources added or removed."
+      ),
+      expectedNumOfEvents = Option(1)
+    )
+
+    // The run should fail because of the source change, not because the flow exhausted its retries.
+    assertRunProgressEvent(
+      eventBuffer = updateContext2.eventBuffer,
+      state = RunState.FAILED,
+      expectedEventLevel = EventLevel.ERROR,
+      msgChecker = _.contains(
+        s"flow '${eventLogName("input_table")}' had streaming sources added or removed."
       )
     )
   }
@@ -506,6 +519,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     val ctx = TestPipelineUpdateContext(
       spark,
       pipelineDef.toDataflowGraph,
+      storageRoot,
       fullRefreshTables = AllTables,
       resetCheckpointFlows = AllFlows
     )
@@ -562,7 +576,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
 
     val graph = pipelineDef.toDataflowGraph
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.startPipeline()
 
     val graphExecution = updateContext.pipelineExecution.graphExecution.get
@@ -626,7 +640,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
 
     val graph = pipelineDef.toDataflowGraph
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -688,7 +702,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
 
     val graph = pipelineDef.toDataflowGraph
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -767,7 +781,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     }
 
     val graph = pipelineDef.toDataflowGraph
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -826,7 +840,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       )
     }
     val graph = pipelineDef.toDataflowGraph
-    val updateContext = TestPipelineUpdateContext(spark, graph)
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
     updateContext.pipelineExecution.runPipeline()
     updateContext.pipelineExecution.awaitCompletion()
 
@@ -883,6 +897,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     val updateContext1 = TestPipelineUpdateContext(
       spark = spark,
       unresolvedGraph = graph1,
+      storageRoot = storageRoot,
       refreshTables = SomeTables(
         Set(fullyQualifiedIdentifier("source"), fullyQualifiedIdentifier("all"))
       ),
@@ -932,6 +947,7 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
     val updateContext2 = TestPipelineUpdateContext(
       spark = spark,
       unresolvedGraph = graph1,
+      storageRoot = storageRoot,
       refreshTables = SomeTables(
         Set(fullyQualifiedIdentifier("source"), fullyQualifiedIdentifier("max_evens"))
       ),
@@ -986,7 +1002,8 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
       registerTable("table3", query = Option(sqlFlowFunc(spark, "SELECT * FROM table1")))
     }.toDataflowGraph
 
-    val updateContext = TestPipelineUpdateContext(spark = spark, unresolvedGraph = graph)
+    val updateContext = TestPipelineUpdateContext(spark = spark,
+      unresolvedGraph = graph, storageRoot = storageRoot)
     updateContext.pipelineExecution.runPipeline()
 
     assertFlowProgressEvent(
@@ -1026,5 +1043,83 @@ class TriggeredGraphExecutionSuite extends ExecutionTest with SharedSparkSession
         )
       }
     )
+  }
+
+  test("consecutive failure event level is correct") {
+    val session = spark
+    import session.implicits._
+
+    val pipelineDef = new TestGraphRegistrationContext(spark) {
+      registerMaterializedView(
+        "retry_test",
+        partitionCols = Some(Seq("nonexistent_col")),
+        query = dfFlowFunc(spark.range(5).withColumn("id_mod", ($"id" % 2).cast("int")))
+      )
+    }
+
+    val graph = pipelineDef.toDataflowGraph
+    val updateContext = TestPipelineUpdateContext(spark, graph, storageRoot)
+    updateContext.pipelineExecution.runPipeline()
+    updateContext.pipelineExecution.awaitCompletion()
+
+    val failedEvents = updateContext.eventBuffer.getEvents.filter { e =>
+      e.details.isInstanceOf[FlowProgress] &&
+      e.details.asInstanceOf[FlowProgress].status == FlowStatus.FAILED
+    }
+
+    val warnCount = failedEvents.count(_.level == EventLevel.WARN)
+    // flowToNumConsecutiveFailure controls that the last failure should be logged as ERROR
+    val errorCount = failedEvents.count(_.level == EventLevel.ERROR)
+
+    assert(warnCount == 2 && errorCount == 1)
+  }
+
+  /** A non-retryable (retries exhausted) failure, i.e. one that stops the run. */
+  private def stopFailure(ts: Long, flowName: String, cause: Throwable): TriggeredFailureInfo = {
+    // currentNumTries > maxAllowedRetries yields a StopFlowExecution.
+    val action = GraphExecution.determineFlowExecutionActionFromError(
+      ex = cause,
+      flowDisplayName = flowName,
+      currentNumTries = 2,
+      maxAllowedRetries = 1)
+    TriggeredFailureInfo(ts, numFailures = 2, lastException = cause, lastExceptionAction = action)
+  }
+
+  test("chooseRunTerminationReason surfaces the earliest non-retryable failure deterministically") {
+    val earliestCause = new RuntimeException("earliest")
+    // A retryable failure with an earlier timestamp must be ignored: it does not stop the run.
+    val retryable = {
+      val cause = new RuntimeException("retryable")
+      val action = GraphExecution.determineFlowExecutionActionFromError(
+        ex = cause, flowDisplayName = "flow_retry", currentNumTries = 1, maxAllowedRetries = 3)
+      TableIdentifier("flow_retry") -> TriggeredFailureInfo(
+        50, numFailures = 1, lastException = cause, lastExceptionAction = action)
+    }
+    val entries = Seq(
+      TableIdentifier("flow_c") -> stopFailure(300, "flow_c", new RuntimeException("c")),
+      TableIdentifier("flow_b") -> stopFailure(100, "flow_b", earliestCause),
+      TableIdentifier("flow_a") -> stopFailure(200, "flow_a", new RuntimeException("a")),
+      retryable)
+
+    // The earliest non-retryable failure (flow_b @ 100) wins regardless of iteration order.
+    Seq(entries, entries.reverse).foreach { ordered =>
+      assert(
+        TriggeredGraphExecution.chooseRunTerminationReason(ordered.iterator)
+          .contains(QueryExecutionFailure("flow_b", 1, Some(earliestCause))))
+    }
+  }
+
+  test("chooseRunTerminationReason breaks ties between equal timestamps by flow name") {
+    val aCause = new RuntimeException("a")
+    val entries = Seq(
+      TableIdentifier("flow_z") -> stopFailure(100, "flow_z", new RuntimeException("z")),
+      TableIdentifier("flow_a") -> stopFailure(100, "flow_a", aCause))
+    assert(
+      TriggeredGraphExecution.chooseRunTerminationReason(entries.iterator)
+        .contains(QueryExecutionFailure("flow_a", 1, Some(aCause))))
+  }
+
+  test("chooseRunTerminationReason has no reason when no flow stopped the run") {
+    assert(TriggeredGraphExecution.chooseRunTerminationReason(Iterator.empty).isEmpty)
   }
 }

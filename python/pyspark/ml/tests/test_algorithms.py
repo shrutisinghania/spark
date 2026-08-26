@@ -15,9 +15,8 @@
 # limitations under the License.
 #
 import os
-from shutil import rmtree
 import tempfile
-import unittest
+from shutil import rmtree
 
 import numpy as np
 
@@ -27,9 +26,9 @@ from pyspark.ml.classification import (
     MultilayerPerceptronClassifier,
     OneVsRest,
 )
-from pyspark.ml.clustering import DistributedLDAModel, KMeans, LocalLDAModel, LDA, LDAModel
+from pyspark.ml.clustering import LDA, DistributedLDAModel, KMeans, LDAModel, LocalLDAModel
 from pyspark.ml.fpm import FPGrowth
-from pyspark.ml.linalg import Vectors, DenseVector
+from pyspark.ml.linalg import DenseVector, Vectors
 from pyspark.ml.recommendation import ALS
 from pyspark.ml.regression import GeneralizedLinearRegression, LinearRegression
 from pyspark.sql import Row
@@ -191,9 +190,9 @@ class KMeansTests(SparkSessionTestCase):
         kmeans = KMeans(k=3, seed=1, distanceMeasure="cosine")
         model = kmeans.fit(df)
         result = model.transform(df).collect()
-        self.assertTrue(result[0].prediction == result[1].prediction)
-        self.assertTrue(result[2].prediction == result[3].prediction)
-        self.assertTrue(result[4].prediction == result[5].prediction)
+        self.assertEqual(result[0].prediction, result[1].prediction)
+        self.assertEqual(result[2].prediction, result[3].prediction)
+        self.assertEqual(result[4].prediction, result[5].prediction)
 
 
 class LDATest(SparkSessionTestCase):
@@ -254,7 +253,7 @@ class LDATest(SparkSessionTestCase):
 
 class FPGrowthTests(SparkSessionTestCase):
     def setUp(self):
-        super(FPGrowthTests, self).setUp()
+        super().setUp()
         self.data = self.spark.createDataFrame(
             [([1, 2],), ([1, 2],), ([1, 2, 3],), ([1, 3],)], ["items"]
         )
@@ -380,12 +379,6 @@ class LinearRegressionTest(SparkSessionTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_algorithms import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

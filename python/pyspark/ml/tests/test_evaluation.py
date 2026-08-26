@@ -15,17 +15,16 @@
 # limitations under the License.
 #
 import tempfile
-import unittest
 
 import numpy as np
 
 from pyspark.ml.evaluation import (
-    ClusteringEvaluator,
-    RegressionEvaluator,
     BinaryClassificationEvaluator,
+    ClusteringEvaluator,
     MulticlassClassificationEvaluator,
     MultilabelClassificationEvaluator,
     RankingEvaluator,
+    RegressionEvaluator,
 )
 from pyspark.ml.linalg import Vectors
 from pyspark.sql import Row
@@ -290,7 +289,7 @@ class EvaluatorTestsMixin:
             # Load the saved evaluator
             evaluator2 = ClusteringEvaluator.load(tmp_dir)
             self.assertEqual(evaluator2.getPredictionCol(), "prediction")
-            self.assertTrue(str(evaluator) == str(evaluator2))
+            self.assertEqual(str(evaluator), str(evaluator2))
 
     def test_clustering_evaluator_with_cosine_distance(self):
         featureAndPredictions = map(
@@ -340,7 +339,7 @@ class EvaluatorTestsMixin:
             # Load the saved evaluator
             evaluator2 = RegressionEvaluator.load(tmp_dir)
             self.assertEqual(evaluator2.getPredictionCol(), "raw")
-            self.assertTrue(str(evaluator) == str(evaluator2))
+            self.assertEqual(str(evaluator), str(evaluator2))
 
         evaluator_with_weights = RegressionEvaluator(predictionCol="raw", weightCol="weight")
         weighted_rmse = evaluator_with_weights.evaluate(dataset)
@@ -380,12 +379,6 @@ class EvaluatorTests(EvaluatorTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_evaluation import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

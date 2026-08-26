@@ -18,20 +18,23 @@
 """
 A wrapper class for Spark Column to behave like pandas Series.
 """
+
 import datetime
-import re
 import inspect
+import re
 import warnings
 from collections.abc import Mapping
 from functools import partial, reduce, wraps
 from typing import (
+    IO,
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
     Generic,
-    IO,
     Iterable,
     List,
+    Literal,
     Optional,
     Sequence,
     Tuple,
@@ -41,25 +44,88 @@ from typing import (
     cast,
     no_type_check,
     overload,
-    TYPE_CHECKING,
 )
 
 import numpy as np
 import pandas as pd
-from pandas.core.accessor import CachedAccessor
-from pandas.io.formats.printing import pprint_thing
-from pandas.api.types import (  # type: ignore[attr-defined]
-    is_list_like,
-    is_hashable,
+from pandas.api.extensions import no_default
+from pandas.api.types import (
     CategoricalDtype,
+    is_hashable,
+    is_list_like,
+    is_numeric_dtype,
 )
-from pandas.tseries.frequencies import DateOffset
+from pandas.core.accessor import CachedAccessor  # type: ignore[attr-defined]
+from pandas.io.formats.printing import pprint_thing  # type: ignore[import-not-found]
+from pandas.tseries.frequencies import DateOffset  # type: ignore[attr-defined]
 
+from pyspark import pandas as ps  # For running doctests and reference resolution in PyCharm.
+from pyspark._globals import _NoValue, _NoValueType
+from pyspark.loose_version import LooseVersion
+from pyspark.pandas._typing import Axis, Dtype, Label, Name, Scalar, T
+from pyspark.pandas.accessors import PandasOnSparkSeriesMethods
+from pyspark.pandas.base import IndexOpsMixin
+from pyspark.pandas.categorical import CategoricalAccessor
+from pyspark.pandas.config import get_option
+from pyspark.pandas.correlation import (
+    CORRELATION_CORR_OUTPUT_COLUMN,
+    CORRELATION_COUNT_OUTPUT_COLUMN,
+    CORRELATION_VALUE_1_COLUMN,
+    CORRELATION_VALUE_2_COLUMN,
+    compute,
+)
+from pyspark.pandas.datetimes import DatetimeMethods
+from pyspark.pandas.exceptions import SparkPandasIndexingError
+from pyspark.pandas.frame import DataFrame
+from pyspark.pandas.generic import Frame
+from pyspark.pandas.internal import (
+    DEFAULT_SERIES_NAME,
+    NATURAL_ORDER_COLUMN_NAME,
+    SPARK_DEFAULT_INDEX_NAME,
+    SPARK_DEFAULT_SERIES_NAME,
+    InternalField,
+    InternalFrame,
+)
+from pyspark.pandas.missing.series import MissingPandasLikeSeries
+from pyspark.pandas.plot import PandasOnSparkPlotAccessor
+from pyspark.pandas.spark.accessors import SparkSeriesMethods
+from pyspark.pandas.strings import StringMethods
+from pyspark.pandas.typedef import (
+    ScalarType,
+    SeriesType,
+    create_type_for_series_type,
+    infer_return_type,
+    spark_type_to_pandas_dtype,
+)
+from pyspark.pandas.typedef.typehints import as_spark_type
+from pyspark.pandas.utils import (
+    SPARK_CONF_ARROW_ENABLED,
+    ansi_mode_context,
+    combine_frames,
+    is_ansi_mode_enabled,
+    is_name_like_tuple,
+    is_name_like_value,
+    log_advice,
+    name_like_string,
+    same_anchor,
+    scol_for,
+    sql_conf,
+    validate_arguments_and_invoke_function,
+    validate_axis,
+    validate_bool_kwarg,
+    verify_temp_column_name,
+)
+from pyspark.sql import (
+    Column as PySparkColumn,
+)
+from pyspark.sql import (
+    DataFrame as SparkDataFrame,
+)
+from pyspark.sql import (
+    Window as PySparkWindow,
+)
 from pyspark.sql import (
     functions as F,
-    Column as PySparkColumn,
-    DataFrame as SparkDataFrame,
-    Window as PySparkWindow,
 )
 from pyspark.sql.internal import InternalFunction as SF
 from pyspark.sql.types import (
@@ -70,75 +136,20 @@ from pyspark.sql.types import (
     FloatType,
     IntegerType,
     LongType,
+    NullType,
     NumericType,
     Row,
     StructType,
     TimestampType,
-    NullType,
 )
 from pyspark.sql.window import Window
-from pyspark import pandas as ps  # For running doctests and reference resolution in PyCharm.
-from pyspark.pandas._typing import Axis, Dtype, Label, Name, Scalar, T
-from pyspark.pandas.accessors import PandasOnSparkSeriesMethods
-from pyspark.pandas.categorical import CategoricalAccessor
-from pyspark.pandas.config import get_option
-from pyspark.pandas.correlation import (
-    compute,
-    CORRELATION_VALUE_1_COLUMN,
-    CORRELATION_VALUE_2_COLUMN,
-    CORRELATION_CORR_OUTPUT_COLUMN,
-    CORRELATION_COUNT_OUTPUT_COLUMN,
-)
-from pyspark.pandas.base import IndexOpsMixin
-from pyspark.pandas.exceptions import SparkPandasIndexingError
-from pyspark.pandas.frame import DataFrame
-from pyspark.pandas.generic import Frame
-from pyspark.pandas.internal import (
-    InternalField,
-    InternalFrame,
-    DEFAULT_SERIES_NAME,
-    NATURAL_ORDER_COLUMN_NAME,
-    SPARK_DEFAULT_INDEX_NAME,
-    SPARK_DEFAULT_SERIES_NAME,
-)
-from pyspark.pandas.missing.series import MissingPandasLikeSeries
-from pyspark.pandas.plot import PandasOnSparkPlotAccessor
-from pyspark.pandas.utils import (
-    ansi_mode_context,
-    combine_frames,
-    is_ansi_mode_enabled,
-    is_name_like_tuple,
-    is_name_like_value,
-    name_like_string,
-    same_anchor,
-    scol_for,
-    sql_conf,
-    validate_arguments_and_invoke_function,
-    validate_axis,
-    validate_bool_kwarg,
-    verify_temp_column_name,
-    SPARK_CONF_ARROW_ENABLED,
-    log_advice,
-)
-from pyspark.pandas.datetimes import DatetimeMethods
-from pyspark.pandas.spark.accessors import SparkSeriesMethods
-from pyspark.pandas.strings import StringMethods
-from pyspark.pandas.typedef import (
-    infer_return_type,
-    spark_type_to_pandas_dtype,
-    ScalarType,
-    SeriesType,
-    create_type_for_series_type,
-)
-from pyspark.pandas.typedef.typehints import as_spark_type
 
 if TYPE_CHECKING:
-    from pyspark.sql._typing import ColumnOrName
-
     from pyspark.pandas.groupby import SeriesGroupBy
-    from pyspark.pandas.resample import SeriesResampler
     from pyspark.pandas.indexes import Index
+    from pyspark.pandas.resample import SeriesResampler
     from pyspark.pandas.spark.accessors import SparkIndexOpsMethods
+    from pyspark.sql._typing import ColumnOrName
 
 # This regular expression pattern is compiled and defined here to avoid to compile the same
 # pattern every time it is used in _repr_ in Series.
@@ -414,7 +425,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
     """
 
     def __init__(  # type: ignore[no-untyped-def]
-        self, data=None, index=None, dtype=None, name=None, copy=False, fastpath=False
+        self, data=None, index=None, dtype=None, name=None, copy=False, fastpath=no_default
     ):
         assert data is not None
 
@@ -424,14 +435,14 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             assert dtype is None
             assert name is None
             assert not copy
-            assert not fastpath
+            assert fastpath is no_default
 
             self._anchor = data
             self._col_label = index
 
         elif isinstance(data, Series):
             assert not copy
-            assert not fastpath
+            assert fastpath is no_default
 
             if name:
                 data = data.rename(name)
@@ -452,7 +463,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                 assert dtype is None
                 assert name is None
                 assert not copy
-                assert not fastpath
+                assert fastpath is no_default
                 s = data
             else:
                 from pyspark.pandas.indexes.base import Index
@@ -463,9 +474,13 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                         "Try pandas index or array-like."
                     )
 
-                s = pd.Series(
-                    data=data, index=index, dtype=dtype, name=name, copy=copy, fastpath=fastpath
-                )
+                if LooseVersion(pd.__version__) < LooseVersion("3.0.0"):
+                    s = pd.Series(
+                        data=data, index=index, dtype=dtype, name=name, copy=copy, fastpath=fastpath
+                    )
+                else:
+                    # fastpath is removed since pandas 3.0.0
+                    s = pd.Series(data=data, index=index, dtype=dtype, name=name, copy=copy)
             internal = InternalFrame.from_pandas(pd.DataFrame(s))
             if s.name is None:
                 internal = internal.copy(column_labels=[None])
@@ -486,6 +501,14 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
     @property
     def _column_label(self) -> Optional[Label]:
         return self._col_label
+
+    def _update_internal_frame(
+        self, internal: InternalFrame, check_same_anchor: bool = True
+    ) -> None:
+        if LooseVersion(pd.__version__) < "3.0.0":
+            self._psdf._update_internal_frame(internal, check_same_anchor=check_same_anchor)
+        else:
+            self._update_anchor(DataFrame(internal.select_column(self._column_label)))
 
     def _update_anchor(self, psdf: DataFrame) -> None:
         assert psdf._internal.column_labels == [self._column_label], (
@@ -513,9 +536,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         )
         return first_series(DataFrame(internal))
 
-    spark: "SparkIndexOpsMethods" = CachedAccessor(  # type: ignore[assignment]
-        "spark", SparkSeriesMethods
-    )
+    spark: "SparkIndexOpsMethods" = CachedAccessor("spark", SparkSeriesMethods)
 
     @property
     def dtypes(self) -> Dtype:
@@ -1035,7 +1056,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             rmask = self < right
         else:
             raise ValueError(
-                "Inclusive has to be either string of 'both'," "'left', 'right', or 'neither'."
+                "Inclusive has to be either string of 'both','left', 'right', or 'neither'."
             )
 
         return lmask & rmask
@@ -1077,9 +1098,9 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         """
         if not isinstance(other, Series):
             raise TypeError("unsupported type: %s" % type(other))
-        if not np.issubdtype(self.dtype, np.number):  # type: ignore[arg-type]
+        if not is_numeric_dtype(self.dtype):
             raise TypeError("unsupported dtype: %s" % self.dtype)
-        if not np.issubdtype(other.dtype, np.number):  # type: ignore[arg-type]
+        if not is_numeric_dtype(other.dtype):
             raise TypeError("unsupported dtype: %s" % other.dtype)
         if not isinstance(ddof, int):
             raise TypeError("ddof must be integer")
@@ -1100,7 +1121,6 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             sdf = sdf.select(SF.covar(F.col(sdf.columns[0]), F.col(sdf.columns[1]), ddof))
             return sdf.head(1)[0][0]
 
-    # TODO: NaN and None when ``arg`` is an empty dict
     # TODO: Support ps.Series ``arg``
     def map(
         self, arg: Union[Dict, Callable[[Any], Any], pd.Series], na_action: Optional[str] = None
@@ -1195,6 +1215,15 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         dtype: object
         """
         if isinstance(arg, (dict, pd.Series)):
+            if (
+                isinstance(arg, dict)
+                and len(arg) == 0
+                and not hasattr(arg, "__missing__")
+                and LooseVersion(pd.__version__) >= "3.0.0"
+            ):
+                # pandas 3 returns an all-NaN float64 Series for ``Series.map({})``.
+                return self._with_new_scol(F.lit(None).cast(DoubleType()))
+
             is_start = True
             # In case dictionary is empty.
             current = F.when(F.lit(False), F.lit(None).cast(self.spark.data_type))
@@ -1206,10 +1235,10 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                 else:
                     current = current.when(self.spark.column == F.lit(to_replace), value)
 
-            if hasattr(arg, "__missing__"):
-                tmp_val = arg[np._NoValue]  # type: ignore[attr-defined]
+            if isinstance(arg, dict) and hasattr(arg, "__missing__"):
+                tmp_val = arg[np._NoValue]
                 # Remove in case it's set in defaultdict.
-                del arg[np._NoValue]  # type: ignore[attr-defined]
+                del arg[np._NoValue]
                 current = current.otherwise(F.lit(tmp_val))
             else:
                 current = current.otherwise(F.lit(None).cast(self.spark.data_type))
@@ -2093,7 +2122,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
     def fillna(
         self,
         value: Optional[Any] = None,
-        method: Optional[str] = None,
+        method: Union[Optional[str], _NoValueType] = _NoValue,
         axis: Optional[Axis] = None,
         inplace: bool = False,
         limit: Optional[int] = None,
@@ -2162,7 +2191,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         We can also propagate non-null values forward or backward.
 
-        >>> s.fillna(method='ffill')
+        >>> s.fillna(method='ffill')  # doctest: +SKIP
         0    NaN
         1    2.0
         2    3.0
@@ -2172,7 +2201,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         Name: x, dtype: float64
 
         >>> s = ps.Series([np.nan, 'a', 'b', 'c', np.nan], name='x')
-        >>> s.fillna(method='ffill')
+        >>> s.fillna(method='ffill')  # doctest: +SKIP
         0    None
         1       a
         2       b
@@ -2180,6 +2209,32 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         4       c
         Name: x, dtype: object
         """
+        if LooseVersion(pd.__version__) < "3.0.0":
+            if method is _NoValue:
+                method = None
+        else:
+            if method is not _NoValue:
+                raise TypeError(
+                    "The `method` parameter is not supported in pandas 3.0.0 and later. "
+                )
+            method = None
+
+        return self._fillna_with_method(
+            value=value,
+            method=method,  # type: ignore[arg-type]
+            axis=axis,
+            inplace=inplace,
+            limit=limit,
+        )
+
+    def _fillna_with_method(
+        self,
+        value: Optional[Any] = None,
+        method: Optional[str] = None,
+        axis: Optional[Axis] = None,
+        inplace: bool = False,
+        limit: Optional[int] = None,
+    ) -> Optional["Series"]:
         psser = self._fillna(value=value, method=method, axis=axis, limit=limit)
 
         if method is not None:
@@ -2192,7 +2247,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         inplace = validate_bool_kwarg(inplace, "inplace")
         if inplace:
-            self._psdf._update_internal_frame(psser._psdf._internal, check_same_anchor=False)
+            self._update_internal_frame(psser._psdf._internal, check_same_anchor=False)
             return None
         else:
             return psser.copy()
@@ -2253,7 +2308,8 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         return DataFrame(
             self._psdf._internal.with_new_spark_column(
-                self._column_label, scol.alias(name_like_string(self.name))  # TODO: dtype?
+                self._column_label,
+                scol.alias(name_like_string(self.name)),  # TODO: dtype?
             )
         )._psser_for(self._column_label)
 
@@ -2501,7 +2557,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                     data_spark_columns=[scol.alias(self._internal.data_spark_column_names[0])],
                     data_fields=[self._internal.data_fields[0]],
                 )
-                self._psdf._update_internal_frame(internal, check_same_anchor=False)
+                self._update_internal_frame(internal, check_same_anchor=False)
                 return None
             else:
                 return self._with_new_scol(
@@ -2518,6 +2574,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         columns: Optional[Union[Name, List[Name]]] = None,
         level: Optional[int] = None,
         inplace: bool = False,
+        errors: str = "raise",
     ) -> "Series":
         """
         Return Series with specified index labels removed.
@@ -2532,7 +2589,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         index : single label or list-like
             Redundant for application on Series, but index can be used instead of labels.
         columns : single label or list-like
-            No change is made to the Series; use ‘index’ or ‘labels’ instead.
+            No change is made to the Series; use 'index' or 'labels' instead.
 
             .. versionadded:: 3.4.0
         level : int or level name, optional
@@ -2541,6 +2598,10 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             If True, do operation inplace and return None
 
             .. versionadded:: 3.4.0
+        errors : {{'ignore', 'raise'}}, default 'raise'
+            If 'ignore', suppress error and only existing labels are dropped.
+
+            .. versionadded:: 4.1.0
 
         Returns
         -------
@@ -2649,6 +2710,8 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                 length      0.3
         dtype: float64
         """
+        if errors not in ("raise", "ignore"):
+            raise ValueError("errors must be either 'raise' or 'ignore'")
         dropped = self._drop(
             labels=labels, index=index, level=level, inplace=inplace, columns=columns
         )
@@ -2778,7 +2841,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         Get the rows for the last 3 days:
 
-        >>> psser.last('3D')
+        >>> psser.last('3D')  # doctest: +SKIP
         2018-04-13    3
         2018-04-15    4
         dtype: int64
@@ -2787,6 +2850,15 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         3 observed days in the dataset, and therefore data for 2018-04-11 was
         not returned.
         """
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return self._last(offset)
+        else:
+            raise AttributeError(
+                "The `last` method is not supported in pandas 3.0.0 and later. "
+                "Please create a mask and filter using `.loc` instead"
+            )
+
+    def _last(self, offset: Union[str, DateOffset]) -> "Series":
         warnings.warn(
             "last is deprecated and will be removed in a future version. "
             "Please create a mask and filter using `.loc` instead",
@@ -2832,7 +2904,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         Get the rows for the first 3 days:
 
-        >>> psser.first('3D')
+        >>> psser.first('3D')  # doctest: +SKIP
         2018-04-09    1
         2018-04-11    2
         dtype: int64
@@ -2841,6 +2913,15 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         3 observed days in the dataset, and therefore data for 2018-04-13 was
         not returned.
         """
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return self._first(offset)
+        else:
+            raise AttributeError(
+                "The `first` method is not supported in pandas 3.0.0 and later. "
+                "Please create a mask and filter using `.loc` instead"
+            )
+
+    def _first(self, offset: Union[str, DateOffset]) -> "Series":
         warnings.warn(
             "first is deprecated and will be removed in a future version. "
             "Please create a mask and filter using `.loc` instead",
@@ -2923,7 +3004,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         na_position : {'first', 'last'}, default 'last'
              `first` puts NaNs at the beginning, `last` puts NaNs at the end
         ignore_index : bool, default False
-             If True, the resulting axis will be labeled 0, 1, …, n - 1.
+             If True, the resulting axis will be labeled 0, 1, ..., n - 1.
 
              .. versionadded:: 3.4.0
 
@@ -3050,11 +3131,11 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         kind : str, default None
             pandas-on-Spark does not allow specifying the sorting algorithm now,
             default None
-        na_position : {‘first’, ‘last’}, default ‘last’
+        na_position : {'first', 'last'}, default 'last'
             first puts NaNs at the beginning, last puts NaNs at the end. Not implemented for
             MultiIndex.
         ignore_index : bool, default False
-            If True, the resulting axis will be labeled 0, 1, …, n - 1.
+            If True, the resulting axis will be labeled 0, 1, ..., n - 1.
 
             .. versionadded:: 3.4.0
 
@@ -3212,12 +3293,21 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         z    3
         dtype: int64
         >>>
-        >>> psser.swapaxes(0, 0)
+        >>> psser.swapaxes(0, 0)  # doctest: +SKIP
         x    1
         y    2
         z    3
         dtype: int64
         """
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return self._swapaxes(i, j, copy)
+        else:
+            raise AttributeError(
+                "The `swapaxes` method is not supported in pandas 3.0.0 and later. "
+                "Please use the `transpose` method instead"
+            )
+
+    def _swapaxes(self, i: Axis, j: Axis, copy: bool = True) -> "Series":
         warnings.warn(
             "'Series.swapaxes' is deprecated and will be removed in a future version. "
             "Please use 'Series.transpose' instead.",
@@ -4457,14 +4547,20 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         if len(results) == 0:
             raise ValueError("attempt to get idxmin of an empty sequence")
         if results[0][0] is None:
-            # This will only happen when skipna is False because we will
-            # place nulls first.
-            warnings.warn(
-                "The behavior of Series.idxmax with all-NA values, or any-NA and skipna=False, "
-                "is deprecated. In a future version this will raise ValueError",
-                FutureWarning,
-            )
-            return np.nan
+            if LooseVersion(pd.__version__) < "3.0.0":
+                # This will only happen when skipna is False because we will
+                # place nulls first.
+                warnings.warn(
+                    "The behavior of Series.idxmax with all-NA values, or any-NA and skipna=False, "
+                    "is deprecated. In a future version this will raise ValueError",
+                    FutureWarning,
+                )
+                return np.nan
+            else:
+                if skipna:
+                    raise ValueError("Encountered all NA values")
+                else:
+                    raise ValueError("Encountered an NA value with skipna=False")
         values = list(results[0][1:])
         if len(values) == 1:
             return values[0]
@@ -4570,14 +4666,20 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         if len(results) == 0:
             raise ValueError("attempt to get idxmin of an empty sequence")
         if results[0][0] is None:
-            # This will only happen when skipna is False because we will
-            # place nulls first.
-            warnings.warn(
-                "The behavior of Series.idxmin with all-NA values, or any-NA and skipna=False, "
-                "is deprecated. In a future version this will raise ValueError",
-                FutureWarning,
-            )
-            return np.nan
+            if LooseVersion(pd.__version__) < "3.0.0":
+                # This will only happen when skipna is False because we will
+                # place nulls first.
+                warnings.warn(
+                    "The behavior of Series.idxmin with all-NA values, or any-NA and skipna=False, "
+                    "is deprecated. In a future version this will raise ValueError",
+                    FutureWarning,
+                )
+                return np.nan
+            else:
+                if skipna:
+                    raise ValueError("Encountered all NA values")
+                else:
+                    raise ValueError("Encountered an NA value with skipna=False")
         values = list(results[0][1:])
         if len(values) == 1:
             return values[0]
@@ -4936,11 +5038,11 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
                 - Dicts can be used to specify different replacement values for different
                   existing values.
-                  For example, {'a': 'b', 'y': 'z'} replaces the value ‘a’ with ‘b’ and ‘y’
-                  with ‘z’. To use a dict in this way the value parameter should be None.
+                  For example, {'a': 'b', 'y': 'z'} replaces the value 'a' with 'b' and 'y'
+                  with 'z'. To use a dict in this way the value parameter should be None.
                 - For a DataFrame a dict can specify that different values should be replaced
                   in different columns. For example, {'a': 1, 'b': 'z'} looks for the value 1
-                  in column ‘a’ and the value ‘z’ in column ‘b’ and replaces these values with
+                  in column 'a' and the value 'z' in column 'b' and replaces these values with
                   whatever is specified in value.
                   The value parameter should not be None in this case.
                   You can treat this as a special case of passing two lists except that you are
@@ -5111,12 +5213,20 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         elif not isinstance(regex, bool):
             raise NotImplementedError("'regex' of %s type is not supported" % type(regex).__name__)
         elif regex is True:
-            assert isinstance(
-                to_replace, str
-            ), "If 'regex' is True then 'to_replace' must be a string"
+            assert isinstance(to_replace, str), (
+                "If 'regex' is True then 'to_replace' must be a string"
+            )
 
         if to_replace is None:
-            return self.fillna(method="ffill")
+            if LooseVersion(pd.__version__) < "3.0.0":
+                return self._fillna_with_method(method="ffill")
+            else:
+                if value is None and regex is False:
+                    raise ValueError(
+                        "Series.replace must specify either 'value', a dict-like "
+                        "'to_replace', or dict-like 'regex'."
+                    )
+
         if not isinstance(to_replace, (str, list, tuple, dict, int, float)):
             raise TypeError("'to_replace' should be one of str, list, tuple, dict, int, float")
 
@@ -5275,9 +5385,10 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                 .alias(self._psdf._internal.spark_column_name_for(self._column_label))
             )
             internal = self._psdf._internal.with_new_spark_column(
-                self._column_label, scol  # TODO: dtype?
+                self._column_label,
+                scol,  # TODO: dtype?
             )
-            self._psdf._update_internal_frame(internal)
+            self._update_internal_frame(internal)
         else:
             combined = combine_frames(self._psdf, other._psdf, how="leftouter")
 
@@ -5291,10 +5402,11 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             )
 
             internal = combined["this"]._internal.with_new_spark_column(
-                self._column_label, scol  # TODO: dtype?
+                self._column_label,
+                scol,  # TODO: dtype?
             )
 
-            self._psdf._update_internal_frame(internal.resolved_copy, check_same_anchor=False)
+            self._update_internal_frame(internal.resolved_copy, check_same_anchor=False)
 
     def where(self, cond: "Series", other: Any = np.nan) -> "Series":
         """
@@ -5671,7 +5783,9 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             *index_scols, cond.alias(self._internal.data_spark_column_names[0])
         ).distinct()
         internal = self._internal.with_new_sdf(
-            sdf, index_fields=combined._internal.index_fields, data_fields=[None]  # TODO: dtype?
+            sdf,
+            index_fields=combined._internal.index_fields,
+            data_fields=[None],  # TODO: dtype?
         )
         return first_series(DataFrame(internal))
 
@@ -5891,7 +6005,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         -----
         Indices are assumed to be sorted. Raises if this is not the case and config
         'compute.eager_check' is True. If 'compute.eager_check' is False pandas-on-Spark just
-        proceeds and performs by ignoring the indeces's order
+        proceeds and performs by ignoring the indices' order
 
         Examples
         --------
@@ -5950,12 +6064,14 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             F.max_by(
                 spark_column,
                 F.when(
-                    (index_scol <= F.lit(index).cast(index_type)) & spark_column.isNotNull()
-                    if pd.notna(index)
-                    # If index is nan and the value of the col is not null
-                    # then return monotonically_increasing_id. This will let max by
-                    # to return last index value, which is the behaviour of pandas
-                    else spark_column.isNotNull(),
+                    (
+                        (index_scol <= F.lit(index).cast(index_type)) & spark_column.isNotNull()
+                        if pd.notna(index)
+                        # If index is nan and the value of the col is not null
+                        # then return monotonically_increasing_id. This will let max by
+                        # to return last index value, which is the behaviour of pandas
+                        else spark_column.isNotNull()
+                    ),
                     F.col(monotonically_increasing_id_column),
                 ),
             )
@@ -6319,14 +6435,17 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         10    10
         dtype: int64
         """
-        warnings.warn(
-            "The behavior of Series.argsort in the presence of NA values is deprecated. "
-            "In a future version, NA values will be ordered last instead of set to -1.",
-            FutureWarning,
-        )
-        notnull = self.loc[self.notnull()]
+        if LooseVersion(pd.__version__) < "3.0.0":
+            warnings.warn(
+                "The behavior of Series.argsort in the presence of NA values is deprecated. "
+                "In a future version, NA values will be ordered last instead of set to -1.",
+                FutureWarning,
+            )
+            source = self.loc[self.notnull()]
+        else:
+            source = self
 
-        sdf_for_index = notnull._internal.spark_frame.select(notnull._internal.index_spark_columns)
+        sdf_for_index = source._internal.spark_frame.select(source._internal.index_spark_columns)
 
         tmp_join_key = verify_temp_column_name(sdf_for_index, "__tmp_join_key__")
         sdf_for_index = InternalFrame.attach_distributed_sequence_column(
@@ -6343,8 +6462,8 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         # |               4|                4|
         # +----------------+-----------------+
 
-        sdf_for_data = notnull._internal.spark_frame.select(
-            notnull.spark.column.alias("values"), NATURAL_ORDER_COLUMN_NAME
+        sdf_for_data = source._internal.spark_frame.select(
+            source.spark.column.alias("values"), NATURAL_ORDER_COLUMN_NAME
         )
         sdf_for_data = InternalFrame.attach_distributed_sequence_column(
             sdf_for_data, SPARK_DEFAULT_SERIES_NAME
@@ -6360,9 +6479,12 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         # |  4|     2|     128849018880|
         # +---+------+-----------------+
 
-        sdf_for_data = sdf_for_data.sort(
-            scol_for(sdf_for_data, "values"), NATURAL_ORDER_COLUMN_NAME
-        ).drop("values", NATURAL_ORDER_COLUMN_NAME)
+        value_scol = scol_for(sdf_for_data, "values")
+        if LooseVersion(pd.__version__) < "3.0.0":
+            sdf_for_data = sdf_for_data.sort(value_scol, NATURAL_ORDER_COLUMN_NAME)
+        else:
+            sdf_for_data = sdf_for_data.sort(value_scol.asc_nulls_last(), NATURAL_ORDER_COLUMN_NAME)
+        sdf_for_data = sdf_for_data.drop("values", NATURAL_ORDER_COLUMN_NAME)
 
         tmp_join_key = verify_temp_column_name(sdf_for_data, "__tmp_join_key__")
         sdf_for_data = InternalFrame.attach_distributed_sequence_column(sdf_for_data, tmp_join_key)
@@ -6389,10 +6511,13 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         )
         psser = first_series(DataFrame(internal))
 
-        return cast(
-            Series,
-            ps.concat([psser, self.loc[self.isnull()].spark.transform(lambda _: F.lit(-1))]),
-        )
+        if LooseVersion(pd.__version__) < "3.0.0":
+            return cast(
+                Series,
+                ps.concat([psser, self.loc[self.isnull()].spark.transform(lambda _: F.lit(-1))]),
+            )
+        else:
+            return psser
 
     def argmax(self, axis: Axis = None, skipna: bool = True) -> int:
         """
@@ -6454,13 +6579,19 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             max_value = results[0]
             # If the maximum is achieved in multiple locations, the first row position is returned.
             if max_value[0] is None:
-                warnings.warn(
-                    "The behavior of Series.argmax/argmin "
-                    "with skipna=False and NAs, or with all-NAs is deprecated. "
-                    "In a future version this will raise ValueError.",
-                    FutureWarning,
-                )
-                return -1
+                if LooseVersion(pd.__version__) < "3.0.0":
+                    warnings.warn(
+                        "The behavior of Series.argmax/argmin "
+                        "with skipna=False and NAs, or with all-NAs is deprecated. "
+                        "In a future version this will raise ValueError.",
+                        FutureWarning,
+                    )
+                    return -1
+                else:
+                    if skipna:
+                        raise ValueError("Encountered all NA values")
+                    else:
+                        raise ValueError("Encountered an NA value with skipna=False")
             else:
                 return max_value[1]
 
@@ -6523,13 +6654,19 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
             min_value = results[0]
             # If the maximum is achieved in multiple locations, the first row position is returned.
             if min_value[0] is None:
-                warnings.warn(
-                    "The behavior of Series.argmax/argmin "
-                    "with skipna=False and NAs, or with all-NAs is deprecated. "
-                    "In a future version this will raise ValueError.",
-                    FutureWarning,
-                )
-                return -1
+                if LooseVersion(pd.__version__) < "3.0.0":
+                    warnings.warn(
+                        "The behavior of Series.argmax/argmin "
+                        "with skipna=False and NAs, or with all-NAs is deprecated. "
+                        "In a future version this will raise ValueError.",
+                        FutureWarning,
+                    )
+                    return -1
+                else:
+                    if skipna:
+                        raise ValueError("Encountered all NA values")
+                    else:
+                        raise ValueError("Encountered an NA value with skipna=False")
             else:
                 return min_value[1]
 
@@ -6695,9 +6832,9 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         ----------
         value : scalar
             Values to insert into self.
-        side : {‘left’, ‘right’}, optional
-            If ‘left’, the index of the first suitable location found is given.
-            If ‘right’, return the last such index. If there is no suitable index,
+        side : {'left', 'right'}, optional
+            If 'left', the index of the first suitable location found is given.
+            If 'right', return the last such index. If there is no suitable index,
             return either 0 or N (where N is the length of self).
 
         Returns
@@ -6941,7 +7078,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         Examples
         --------
-        >>> idx = pd.date_range('2018-04-09', periods=4, freq='12H')
+        >>> idx = pd.date_range('2018-04-09', periods=4, freq='12h')
         >>> psser = ps.Series([1, 2, 3, 4], index=idx)
         >>> psser
         2018-04-09 00:00:00    1
@@ -7140,7 +7277,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
     def groupby(
         self,
         by: Union[Name, "Series", List[Union[Name, "Series"]]],
-        axis: Axis = 0,
+        axis: Union[Axis, _NoValueType] = _NoValue,
         as_index: bool = True,
         dropna: bool = True,
     ) -> "SeriesGroupBy":
@@ -7160,8 +7297,8 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
     def resample(
         self,
         rule: str_type,
-        closed: Optional[str_type] = None,
-        label: Optional[str_type] = None,
+        closed: Optional[Literal["left", "right"]] = None,
+        label: Optional[Literal["left", "right"]] = None,
         on: Optional["Series"] = None,
     ) -> "SeriesResampler":
         """
@@ -7201,7 +7338,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         --------
         Start by creating a series with 9 one minute timestamps.
 
-        >>> index = pd.date_range('1/1/2000', periods=9, freq='T')
+        >>> index = pd.date_range('1/1/2000', periods=9, freq='min')
         >>> series = ps.Series(range(9), index=index, name='V')
         >>> series
         2000-01-01 00:00:00    0
@@ -7218,7 +7355,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         Downsample the series into 3 minute bins and sum the values
         of the timestamps falling into a bin.
 
-        >>> series.resample('3T').sum().sort_index()
+        >>> series.resample('3min').sum().sort_index()
         2000-01-01 00:00:00     3.0
         2000-01-01 00:03:00    12.0
         2000-01-01 00:06:00    21.0
@@ -7234,7 +7371,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         To include this value, close the right side of the bin interval as
         illustrated in the example below this one.
 
-        >>> series.resample('3T', label='right').sum().sort_index()
+        >>> series.resample('3min', label='right').sum().sort_index()
         2000-01-01 00:03:00     3.0
         2000-01-01 00:06:00    12.0
         2000-01-01 00:09:00    21.0
@@ -7243,7 +7380,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         Downsample the series into 3 minute bins as above, but close the right
         side of the bin interval.
 
-        >>> series.resample('3T', label='right', closed='right').sum().sort_index()
+        >>> series.resample('3min', label='right', closed='right').sum().sort_index()
         2000-01-01 00:00:00     0.0
         2000-01-01 00:03:00     6.0
         2000-01-01 00:06:00    15.0
@@ -7252,7 +7389,7 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
 
         Upsample the series into 30 second bins.
 
-        >>> series.resample('30S').sum().sort_index()[0:5]   # Select first 5 rows
+        >>> series.resample('30s').sum().sort_index()[0:5]   # Select first 5 rows
         2000-01-01 00:00:00    0.0
         2000-01-01 00:00:30    0.0
         2000-01-01 00:01:00    1.0
@@ -7291,19 +7428,24 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
         )
 
     def __getitem__(self, key: Any) -> Any:
-        if type(key) == int and not isinstance(self.index.spark.data_type, (IntegerType, LongType)):
-            warnings.warn(
-                "Series.__getitem__ treating keys as positions is deprecated. "
-                "In a future version, integer keys will always be treated as labels "
-                "(consistent with DataFrame behavior). "
-                "To access a value by position, use `ser.iloc[pos]`",
-                FutureWarning,
+        if LooseVersion(pd.__version__) < "3.0.0":
+            treating_keys_as_positions = isinstance(key, int) and not isinstance(
+                self.index.spark.data_type, (IntegerType, LongType)
             )
+            if treating_keys_as_positions:
+                warnings.warn(
+                    "Series.__getitem__ treating keys as positions is deprecated. "
+                    "In a future version, integer keys will always be treated as labels "
+                    "(consistent with DataFrame behavior). "
+                    "To access a value by position, use `ser.iloc[pos]`",
+                    FutureWarning,
+                )
+        else:
+            treating_keys_as_positions = False
         try:
-            if (isinstance(key, slice) and any(type(n) == int for n in [key.start, key.stop])) or (
-                type(key) == int
-                and not isinstance(self.index.spark.data_type, (IntegerType, LongType))
-            ):
+            if (
+                isinstance(key, slice) and any(isinstance(n, int) for n in [key.start, key.stop])
+            ) or treating_keys_as_positions:
                 # Seems like pandas Series always uses int as positional search when slicing
                 # with ints, searches based on index values when the value is int.
                 return self.iloc[key]
@@ -7357,13 +7499,12 @@ class Series(Frame, IndexOpsMixin, Generic[T]):
                     )
                 else:
                     footer = (
-                        "\nName: {name}, dtype: {dtype}"
-                        "\nShowing only the first {length}".format(
+                        "\nName: {name}, dtype: {dtype}\nShowing only the first {length}".format(
                             length=length, name=self.name, dtype=pprint_thing(dtype_name)
                         )
                     )
                 return rest + footer
-        return pser.to_string(name=self.name, dtype=self.dtype)
+        return pser.to_string(name=self.name, dtype=self.dtype)  # type: ignore[call-overload]
 
     def __dir__(self) -> Iterable[str_type]:
         if not isinstance(self.spark.data_type, StructType):
@@ -7394,13 +7535,11 @@ def unpack_scalar(sdf: SparkDataFrame) -> Any:
 
 
 @overload
-def first_series(df: DataFrame) -> Series:
-    ...
+def first_series(df: DataFrame) -> Series: ...
 
 
 @overload
-def first_series(df: pd.DataFrame) -> pd.Series:
-    ...
+def first_series(df: pd.DataFrame) -> pd.Series: ...
 
 
 def first_series(df: Union[DataFrame, pd.DataFrame]) -> Union[Series, pd.Series]:
@@ -7415,11 +7554,12 @@ def first_series(df: Union[DataFrame, pd.DataFrame]) -> Union[Series, pd.Series]
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.series
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -7429,7 +7569,7 @@ def _test() -> None:
     spark = (
         SparkSession.builder.master("local[4]").appName("pyspark.pandas.series tests").getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.series,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

@@ -39,10 +39,13 @@ import org.apache.parquet.schema.LogicalTypeAnnotation.TimeUnit;
 import org.apache.parquet.schema.PrimitiveType;
 
 import org.apache.spark.SparkUnsupportedOperationException;
+import org.apache.spark.sql.execution.datasources.parquet.types.ops.ParquetTypeOps$;
 import org.apache.spark.sql.execution.vectorized.WritableColumnVector;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.Decimal;
 import org.apache.spark.sql.types.DecimalType;
+import org.apache.spark.sql.types.GeometryType;
+import org.apache.spark.sql.types.GeographyType;
 
 import static org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BOOLEAN;
 import static org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.INT64;
@@ -148,6 +151,14 @@ public class VectorizedColumnReader {
   private boolean isLazyDecodingSupported(
       PrimitiveType.PrimitiveTypeName typeName,
       DataType sparkType) {
+    // Types Framework: a framework-managed type decides whether its dictionary-encoded column can
+    // be lazily decoded (false when its vectorized updater does per-value processing that lazy
+    // decoding would bypass). Non-framework types fall through to the built-in cases below.
+    Boolean frameworkDecision =
+        ParquetTypeOps$.MODULE$.supportsLazyDictionaryDecodingOrNull(sparkType, descriptor);
+    if (frameworkDecision != null) {
+      return frameworkDecision;
+    }
     boolean isSupported = false;
     // Don't use lazy dictionary decoding if the column needs extra processing: upcasting or date
     // rebasing.
@@ -165,8 +176,7 @@ public class VectorizedColumnReader {
       case INT64: {
         boolean isDecimal = sparkType instanceof DecimalType;
         boolean needsUpcast = (isDecimal && !DecimalType.is64BitDecimalType(sparkType)) ||
-          updaterFactory.isTimestampTypeMatched(TimeUnit.MILLIS) ||
-          updaterFactory.isTimeTypeMatched(TimeUnit.MICROS);
+          updaterFactory.isTimestampTypeMatched(TimeUnit.MILLIS);
         boolean needsRebase = updaterFactory.isTimestampTypeMatched(TimeUnit.MICROS) &&
           !"CORRECTED".equals(datetimeRebaseMode);
         isSupported = !needsUpcast && !needsRebase && !needsDecimalScaleRebase(sparkType);
@@ -180,6 +190,8 @@ public class VectorizedColumnReader {
         break;
       case BINARY:
         isSupported = !needsDecimalScaleRebase(sparkType);
+        boolean isGeoType = sparkType instanceof GeometryType || sparkType instanceof GeographyType;
+        isSupported = isSupported && !isGeoType;
         break;
     }
     return isSupported;
@@ -367,6 +379,18 @@ public class VectorizedColumnReader {
       case DELTA_BYTE_ARRAY -> new VectorizedDeltaByteArrayReader();
       case DELTA_LENGTH_BYTE_ARRAY -> new VectorizedDeltaLengthByteArrayReader();
       case DELTA_BINARY_PACKED -> new VectorizedDeltaBinaryPackedReader();
+      case BYTE_STREAM_SPLIT -> {
+        PrimitiveType.PrimitiveTypeName typeName =
+          this.descriptor.getPrimitiveType().getPrimitiveTypeName();
+        int typeWidth = switch (typeName) {
+          case FLOAT, INT32 -> 4;
+          case DOUBLE, INT64 -> 8;
+          case FIXED_LEN_BYTE_ARRAY -> this.descriptor.getPrimitiveType().getTypeLength();
+          default -> throw new SparkUnsupportedOperationException(
+            "_LEGACY_ERROR_TEMP_3190", Map.of("typeName", typeName.toString()));
+        };
+        yield new VectorizedByteStreamSplitValuesReader(typeWidth);
+      }
       case RLE -> {
         PrimitiveType.PrimitiveTypeName typeName =
           this.descriptor.getPrimitiveType().getPrimitiveTypeName();

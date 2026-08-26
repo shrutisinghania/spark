@@ -20,32 +20,33 @@ import unittest
 
 from pyspark import serializers
 from pyspark.serializers import (
+    AutoBatchedSerializer,
+    AutoSerializer,
+    BatchedSerializer,
+    CartesianDeserializer,
     CloudPickleSerializer,
     CompressedSerializer,
-    AutoBatchedSerializer,
-    BatchedSerializer,
-    AutoSerializer,
+    CPickleSerializer,
+    FlattenedValuesSerializer,
+    MarshalSerializer,
     NoOpSerializer,
     PairDeserializer,
-    FlattenedValuesSerializer,
-    CartesianDeserializer,
-    CPickleSerializer,
     UTF8Deserializer,
-    MarshalSerializer,
 )
 from pyspark.testing.utils import (
-    PySparkTestCase,
-    read_int,
-    write_int,
     ByteArrayOutput,
+    PySparkTestCase,
     have_numpy,
     have_scipy,
+    read_int,
+    write_int,
 )
 
 
 class SerializationTestCase(unittest.TestCase):
     def test_namedtuple(self):
         from collections import namedtuple
+
         from pyspark.cloudpickle import dumps, loads
 
         P = namedtuple("P", "x y")
@@ -161,7 +162,6 @@ class SerializationTestCase(unittest.TestCase):
 
 @unittest.skipIf(not have_scipy, "SciPy not installed")
 class SciPyTests(PySparkTestCase):
-
     """General PySpark tests that depend on scipy"""
 
     def test_serialize(self):
@@ -175,7 +175,6 @@ class SciPyTests(PySparkTestCase):
 
 @unittest.skipIf(not have_numpy, "NumPy not installed")
 class NumPyTests(PySparkTestCase):
-
     """General PySpark tests that depend on numpy"""
 
     def test_statcounter_array(self):
@@ -246,12 +245,6 @@ class SerializersTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_serializers import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

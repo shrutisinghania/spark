@@ -16,7 +16,7 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.jdbc
 
-import java.sql.SQLException
+import java.sql.{Connection, SQLException}
 import java.util
 
 import scala.collection.mutable
@@ -40,7 +40,6 @@ class JDBCTableCatalog extends TableCatalog
   with FunctionCatalog
   with DataTypeErrorsBase
   with Logging {
-  import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 
   private var catalogName: String = null
   private var options: JDBCOptions = _
@@ -93,29 +92,44 @@ class JDBCTableCatalog extends TableCatalog
   }
 
   override def tableExists(ident: Identifier): Boolean = {
+    JdbcUtils.withConnection(options)(tableExists(ident, _))
+  }
+
+  private def tableExists(ident: Identifier, conn: Connection): Boolean = {
     checkNamespace(ident.namespace())
     val writeOptions = new JdbcOptionsInWrite(
       options.parameters + (JDBCOptions.JDBC_TABLE_NAME -> getTableName(ident)))
-    JdbcUtils.withConnection(options) {
-      JdbcUtils.classifyException(
-        condition = "FAILED_JDBC.TABLE_EXISTS",
-        messageParameters = Map(
-          "url" -> options.getRedactUrl(),
-          "tableName" -> toSQLId(ident)),
-        dialect,
-        description = s"Failed table existence check: $ident",
-        isRuntime = false)(JdbcUtils.tableExists(_, writeOptions))
-    }
+    JdbcUtils.classifyException(
+      condition = "FAILED_JDBC.TABLE_EXISTS",
+      messageParameters = Map(
+        "url" -> options.getRedactUrl(),
+        "tableName" -> toSQLId(ident)),
+      dialect,
+      description = s"Failed table existence check: $ident",
+      isRuntime = false)(JdbcUtils.tableExists(conn, writeOptions))
   }
 
   override def dropTable(ident: Identifier): Boolean = {
     checkNamespace(ident.namespace())
     JdbcUtils.withConnection(options) { conn =>
-      try {
-        JdbcUtils.dropTable(conn, getTableName(ident), options)
-        true
-      } catch {
-        case _: SQLException => false
+      JdbcUtils.classifyException(
+        condition = "FAILED_JDBC.DROP_TABLE",
+        messageParameters = Map(
+          "url" -> options.getRedactUrl(),
+          "tableName" -> toSQLId(ident)),
+        dialect,
+        description = s"Failed to drop table: $ident",
+        isRuntime = true) {
+        try {
+          JdbcUtils.dropTable(conn, getTableName(ident), options)
+          true
+        } catch {
+          // TableCatalog.dropTable API is designed to return false
+          // only in case table does not exist.
+          case e: SQLException if dialect.isObjectNotFoundException(e) =>
+            false
+          // All other SQLExceptions get classified and propagated
+        }
       }
     }
   }
@@ -138,28 +152,26 @@ class JDBCTableCatalog extends TableCatalog
   }
 
   override def loadTable(ident: Identifier): Table = {
-    if (!tableExists(ident)) {
-      throw QueryCompilationErrors.noSuchTableError(ident)
-    }
-
-    val optionsWithTableName = new JDBCOptions(
-      options.parameters + (JDBCOptions.JDBC_TABLE_NAME -> getTableName(ident)))
-    JdbcUtils.classifyException(
-      condition = "FAILED_JDBC.LOAD_TABLE",
-      messageParameters = Map(
-        "url" -> options.getRedactUrl(),
-        "tableName" -> toSQLId(ident)),
-      dialect,
-      description = s"Failed to load table: $ident",
-      isRuntime = false
-    ) {
-      val remoteSchemaFetchMetric = JdbcUtils
-        .createSchemaFetchMetric(SparkSession.active.sparkContext)
-      val schema = SQLMetrics.withTimingNs(remoteSchemaFetchMetric) {
-        JDBCRDD.resolveTable(optionsWithTableName)
+    JdbcUtils.withConnection(options) { conn =>
+      val optionsWithTableName = new JDBCOptions(
+        options.parameters + (JDBCOptions.JDBC_TABLE_NAME -> getTableName(ident)))
+      JdbcUtils.classifyException(
+        condition = "FAILED_JDBC.LOAD_TABLE",
+        messageParameters = Map(
+          "url" -> options.getRedactUrl(),
+          "tableName" -> toSQLId(ident)),
+        dialect,
+        description = s"Failed to load table: $ident",
+        isRuntime = false
+      ) {
+        val remoteSchemaFetchMetric = JdbcUtils
+          .createSchemaFetchMetric(SparkSession.active.sparkContext)
+        val schema = SQLMetrics.withTimingNs(remoteSchemaFetchMetric) {
+          JDBCRDD.resolveTable(optionsWithTableName, conn, Some(ident), Some(name()))
+        }
+        JDBCTable(ident, schema, optionsWithTableName,
+          Map(JDBCRelation.schemaFetchKey -> remoteSchemaFetchMetric))
       }
-      JDBCTable(ident, schema, optionsWithTableName,
-        Map(JDBCRelation.schemaFetchKey -> remoteSchemaFetchMetric))
     }
   }
 
@@ -421,7 +433,7 @@ class JDBCTableCatalog extends TableCatalog
 
   override def loadFunction(ident: Identifier): UnboundFunction = {
     if (ident.namespace().nonEmpty) {
-      throw QueryCompilationErrors.noSuchFunctionError(ident.asFunctionIdentifier)
+      throw new NoSuchFunctionException(ident)
     }
     functions.get(ident.name()) match {
       case Some(func) =>

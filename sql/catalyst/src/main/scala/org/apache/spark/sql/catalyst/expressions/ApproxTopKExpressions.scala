@@ -17,14 +17,11 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
-import org.apache.datasketches.frequencies.ItemsSketch
-import org.apache.datasketches.memory.Memory
-
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{TypeCheckFailure, TypeCheckSuccess}
-import org.apache.spark.sql.catalyst.expressions.aggregate.ApproxTopK
+import org.apache.spark.sql.catalyst.expressions.aggregate.{ApproxTopK, ApproxTopKAggregateBuffer}
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.types._
 
@@ -45,6 +42,13 @@ import org.apache.spark.sql.types._
     _FUNC_(state, k) - Returns top k items with their frequency.
       `k` An optional INTEGER literal greater than 0. If k is not specified, it defaults to 5.
   """,
+  arguments = """
+    Arguments:
+      * state - The sketch state produced by `approx_top_k_accumulate` or
+          `approx_top_k_combine`.
+      * k - Optional. A constant INTEGER literal greater than 0 giving the number
+          of top items to return. If omitted, it defaults to 5.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(approx_top_k_accumulate(expr)) FROM VALUES (0), (0), (1), (1), (2), (3), (4), (4) AS tab(expr);
@@ -53,7 +57,13 @@ import org.apache.spark.sql.types._
       > SELECT _FUNC_(approx_top_k_accumulate(expr), 2) FROM VALUES 'a', 'b', 'c', 'c', 'c', 'c', 'd', 'd' tab(expr);
        [{"item":"c","count":4},{"item":"d","count":2}]
   """,
-  group = "misc_funcs",
+  note = """
+    When the sketch was built over a string column with a non-UTF8_BINARY collation, values that
+    are equal under the collation are counted as one item, and the returned item is one of the
+    actual input values of that group; which one is returned is not deterministic (as with the
+    `mode` function).
+  """,
+  group = "sketch_funcs",
   since = "4.1.0")
 // scalastyle:on line.size.limit
 case class ApproxTopKEstimate(state: Expression, k: Expression)
@@ -66,8 +76,8 @@ case class ApproxTopKEstimate(state: Expression, k: Expression)
   def this(child: Expression) = this(child, Literal(ApproxTopK.DEFAULT_K))
 
   private lazy val itemDataType: DataType = {
-    // itemDataType is the type of the second field of the output of ACCUMULATE or COMBINE
-    state.dataType.asInstanceOf[StructType](1).dataType
+    // itemDataType is the type of the third field of the output of ACCUMULATE or COMBINE
+    state.dataType.asInstanceOf[StructType](2).dataType
   }
 
   override def left: Expression = state
@@ -76,35 +86,12 @@ case class ApproxTopKEstimate(state: Expression, k: Expression)
 
   override def inputTypes: Seq[AbstractDataType] = Seq(StructType, IntegerType)
 
-  private def checkStateFieldAndType(state: Expression): TypeCheckResult = {
-    val stateStructType = state.dataType.asInstanceOf[StructType]
-    if (stateStructType.length != 3) {
-      return TypeCheckFailure("State must be a struct with 3 fields. " +
-        "Expected struct: struct<sketch:binary,itemDataType:any,maxItemsTracked:int>. " +
-        "Got: " + state.dataType.simpleString)
-    }
-
-    if (stateStructType.head.dataType != BinaryType) {
-      TypeCheckFailure("State struct must have the first field to be binary. " +
-        "Got: " + stateStructType.head.dataType.simpleString)
-    } else if (!ApproxTopK.isDataTypeSupported(itemDataType)) {
-      TypeCheckFailure("State struct must have the second field to be a supported data type. " +
-        "Got: " + itemDataType.simpleString)
-    } else if (stateStructType(2).dataType != IntegerType) {
-      TypeCheckFailure("State struct must have the third field to be int. " +
-        "Got: " + stateStructType(2).dataType.simpleString)
-    } else {
-      TypeCheckSuccess
-    }
-  }
-
-
   override def checkInputDataTypes(): TypeCheckResult = {
     val defaultCheck = super.checkInputDataTypes()
     if (defaultCheck.isFailure) {
       defaultCheck
     } else {
-      val stateCheck = checkStateFieldAndType(state)
+      val stateCheck = ApproxTopK.checkStateFieldAndType(state)
       if (stateCheck.isFailure) {
         stateCheck
       } else if (!k.foldable) {
@@ -124,13 +111,17 @@ case class ApproxTopKEstimate(state: Expression, k: Expression)
     val stateEval = left.eval(input)
     val kEval = right.eval(input)
     val dataSketchBytes = stateEval.asInstanceOf[InternalRow].getBinary(0)
-    val maxItemsTrackedVal = stateEval.asInstanceOf[InternalRow].getInt(2)
+    val maxItemsTrackedVal = stateEval.asInstanceOf[InternalRow].getInt(1)
     val kVal = kEval.asInstanceOf[Int]
     ApproxTopK.checkK(kVal)
     ApproxTopK.checkMaxItemsTracked(maxItemsTrackedVal, kVal)
-    val itemsSketch = ItemsSketch.getInstance(
-      Memory.wrap(dataSketchBytes), ApproxTopK.genSketchSerDe(itemDataType))
-    ApproxTopK.genEvalResult(itemsSketch, kVal, itemDataType)
+    val sketchItemType = ApproxTopK.withCollationOf(
+      ApproxTopK.DDLToDataType(stateEval.asInstanceOf[InternalRow].getUTF8String(3).toString),
+      itemDataType)
+    val approxTopKAggregateBuffer = ApproxTopKAggregateBuffer.deserialize(
+      dataSketchBytes,
+      ApproxTopK.genSketchSerDe(sketchItemType))
+    approxTopKAggregateBuffer.eval(kVal, sketchItemType, itemDataType)
   }
 
   override protected def withNewChildrenInternal(newState: Expression, newK: Expression)

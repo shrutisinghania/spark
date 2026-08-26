@@ -17,7 +17,7 @@
 
 from pyspark import pandas as ps
 from pyspark.pandas import config
-from pyspark.pandas.config import Option, DictWrapper
+from pyspark.pandas.config import DictWrapper, Option
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -148,13 +148,6 @@ class ConfigTests(ConfigTestsMixin, PandasOnSparkTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.test_config import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

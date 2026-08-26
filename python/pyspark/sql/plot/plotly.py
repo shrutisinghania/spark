@@ -20,16 +20,17 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union
 
 from pyspark.errors import PySparkTypeError, PySparkValueError
 from pyspark.sql.plot import (
-    PySparkPlotAccessor,
     PySparkBoxPlotBase,
-    PySparkKdePlotBase,
     PySparkHistogramPlotBase,
+    PySparkKdePlotBase,
+    PySparkPlotAccessor,
 )
 from pyspark.sql.types import NumericType
 
 if TYPE_CHECKING:
-    from pyspark.sql import DataFrame
     from plotly.graph_objs import Figure
+
+    from pyspark.sql import DataFrame
 
 
 def plot_pyspark(data: "DataFrame", kind: str, **kwargs: Any) -> "Figure":
@@ -164,8 +165,8 @@ def plot_box(data: "DataFrame", **kwargs: Any) -> "Figure":
 
 
 def plot_kde(data: "DataFrame", **kwargs: Any) -> "Figure":
-    from pyspark.testing.utils import have_numpy
     from pyspark.sql.pandas.utils import require_minimum_pandas_version
+    from pyspark.testing.utils import have_numpy
 
     require_minimum_pandas_version()
 
@@ -262,15 +263,14 @@ def process_column_param(column: Optional[Union[str, List[str]]], data: "DataFra
     - Raises a PySparkTypeError if any column in the list is not present in the DataFrame
       or is not of NumericType.
     """
+    fields_by_name = {f.name: f for f in data.schema.fields}
     if column is None:
-        return [
-            field.name for field in data.schema.fields if isinstance(field.dataType, NumericType)
-        ]
+        return [name for name, f in fields_by_name.items() if isinstance(f.dataType, NumericType)]
     if isinstance(column, str):
         column = [column]
 
     for col in column:
-        field = next((f for f in data.schema.fields if f.name == col), None)
+        field = fields_by_name.get(col)
         if not field or not isinstance(field.dataType, NumericType):
             raise PySparkTypeError(
                 errorClass="PLOT_INVALID_TYPE_COLUMN",

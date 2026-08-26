@@ -86,8 +86,10 @@ function check_for_tag {
 function get_release_info {
   if [ -z "$GIT_BRANCH" ]; then
     # If no branch is specified, found out the latest branch from the repo.
+    # Exclude master (preview / next major integration) and branch-4.x (rolling Spark 4
+    # integration; minors cut from branch-4.x as branch-4.N such as branch-4.2 or branch-4.1).
     GIT_BRANCH=$(git ls-remote --heads "$ASF_REPO" |
-      grep -v refs/heads/master |
+      grep -Ev 'refs/heads/(master|branch-4\.x)' |
       awk '{print $2}' |
       sort -r |
       head -n 1 |
@@ -106,6 +108,9 @@ function get_release_info {
   fi
 
   NEXT_VERSION="$VERSION"
+  if [ -n "$RELEASE_VERSION" ]; then
+    SPARK_RELEASE_VERSION="$RELEASE_VERSION"
+  fi
   RELEASE_VERSION="${VERSION/-SNAPSHOT/}"
   SHORT_VERSION=$(echo "$VERSION" | cut -d . -f 1-2)
   local REV=$(echo "$RELEASE_VERSION" | cut -d . -f 3)
@@ -136,6 +141,11 @@ function get_release_info {
 
   if [ "$GIT_BRANCH" = "master" ]; then
     RELEASE_VERSION="$RELEASE_VERSION-preview1"
+    if [ -n "$SPARK_RELEASE_VERSION" ]; then
+      # If we are building it from master branch, respect the RELEASE_VERSION
+      # set before. This is usually a preview release.
+      RELEASE_VERSION="$SPARK_RELEASE_VERSION"
+    fi
   fi
   export NEXT_VERSION
   export RELEASE_VERSION=$(read_config "Release" "$RELEASE_VERSION")

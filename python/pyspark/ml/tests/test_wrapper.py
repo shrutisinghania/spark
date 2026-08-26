@@ -15,17 +15,16 @@
 # limitations under the License.
 #
 
-import unittest
 
 import py4j
 
 from pyspark.ml.linalg import DenseVector, Vectors
 from pyspark.ml.regression import LinearRegression
 from pyspark.ml.wrapper import (
-    _java2py,
-    _py2java,
     JavaParams,
     JavaWrapper,
+    _java2py,
+    _py2java,
 )
 from pyspark.testing.mllibutils import MLlibTestCase
 from pyspark.testing.mlutils import SparkSessionTestCase
@@ -127,12 +126,6 @@ class WrapperTests(MLlibTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_wrapper import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -29,7 +29,7 @@ Contributing by Testing Releases
 --------------------------------
 
 Before the official release, PySpark release candidates are shared in the `dev@spark.apache.org <https://mail-archives.apache.org/mod_mbox/spark-dev/>`_ mailing list to vote on.
-This release candidates can be easily installed via pip. For example, in case of Spark 3.0.0 RC1, you can install as below:
+These release candidates can be easily installed via pip. For example, in case of Spark 3.0.0 RC1, you can install as below:
 
 .. code-block:: bash
 
@@ -48,7 +48,7 @@ Contributing Documentation Changes
 
 The release documentation is located under Spark's `docs <https://github.com/apache/spark/tree/master/docs>`_ directory.
 `README.md <https://github.com/apache/spark/blob/master/docs/README.md>`_ describes the required dependencies and steps
-to generate the documentations. Usually, PySpark documentation is tested with the command below
+to generate the documentation. Usually, PySpark documentation is tested with the command below
 under the `docs <https://github.com/apache/spark/tree/master/docs>`_ directory:
 
 .. code-block:: bash
@@ -81,7 +81,7 @@ Additionally, there are a couple of additional notes to keep in mind when contri
     Apache Spark is an unified engine that provides a consistent API layer. In general, the APIs are consistently supported across other languages.
 
 * PySpark-specific APIs can be accepted
-    As long as they are Pythonic and do not conflict with other existent APIs, it is fine to raise a API request, for example, decorator usage of UDFs.
+    As long as they are Pythonic and do not conflict with other existent APIs, it is fine to raise an API request, for example, decorator usage of UDFs.
 
 * Adjust the corresponding type hints if you extend or modify public API
     See `Contributing and Maintaining Type Hints`_ for details.
@@ -122,6 +122,12 @@ PySpark development requires to build Spark that needs a proper JDK installed, e
 
 Note that if you intend to contribute to Spark Connect in Python, ``buf`` is required, see `Buf Installation <https://docs.buf.build/installation>`_ for more details.
 
+``pip>=25.1`` is required to install the dependencies. If your ``pip`` version is older than 25.1, you can upgrade it by:
+
+.. code-block:: bash
+
+    pip install --upgrade pip
+
 Conda
 ~~~~~
 
@@ -129,10 +135,10 @@ If you are using Conda, the development environment can be set as follows.
 
 .. code-block:: bash
 
-    # Python 3.10+ is required
-    conda create --name pyspark-dev-env python=3.10
+    # Python 3.11+ is required
+    conda create --name pyspark-dev-env python=3.11
     conda activate pyspark-dev-env
-    pip install --upgrade -r dev/requirements.txt
+    pip install --upgrade --group dev
 
 Once it is set up, make sure you switch to `pyspark-dev-env` before starting the development:
 
@@ -142,14 +148,26 @@ Once it is set up, make sure you switch to `pyspark-dev-env` before starting the
 
 Now, you can start developing and `running the tests <testing.rst>`_.
 
-pip
-~~~
+venv
+~~~~
 
-With Python 3.10+, pip can be used as below to install and set up the development environment.
+You can use Python's built-in ``venv`` module to create an isolated environment:
 
 .. code-block:: bash
 
-    pip install --upgrade -r dev/requirements.txt
+    # Python 3.11+ is required
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install --upgrade --group dev
+
+pip
+~~~
+
+With Python 3.11+, pip can be used as below to install and set up the development environment.
+
+.. code-block:: bash
+
+    pip install --upgrade --group dev
 
 Now, you can start developing and `running the tests <testing.rst>`_.
 
@@ -215,7 +233,7 @@ Note that:
 
 * In addition, pandas-on-Spark (``pyspark.pandas``) also uses `snake_case` because this package is free from API consistency with other languages.
 
-PySpark leverages linters such as `pycodestyle <https://pycodestyle.pycqa.org/en/latest/>`_ and `flake8 <https://flake8.pycqa.org/en/latest/>`_, which ``dev/lint-python`` runs. Therefore, make sure to run that script to double check.
+PySpark leverages linters such as `pycodestyle <https://pycodestyle.pycqa.org/en/latest/>`_ and `ruff <https://docs.astral.sh/ruff/>`_, which ``dev/lint-python`` runs. Therefore, make sure to run that script to double check.
 
 
 Docstring Conventions
@@ -230,13 +248,13 @@ Doctest Conventions
 In general, doctests should be grouped logically by separating a newline.
 
 For instance, the first block is for the statements for preparation, the second block is for using the function with a specific argument,
-and third block is for another argument. As a example, please refer `DataFrame.rsub <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.rsub.html#pandas.DataFrame.rsub>`_ in pandas.
+and third block is for another argument. As an example, please refer `DataFrame.rsub <https://pandas.pydata.org/pandas-docs/stable/reference/api/pandas.DataFrame.rsub.html#pandas.DataFrame.rsub>`_ in pandas.
 
 These blocks should be consistently separated in PySpark doctests, and more doctests should be added if the coverage of the doctests or the number of examples to show is not enough.
 
 
-Contributing Error and Exception
---------------------------------
+Contributing Errors and Exceptions
+----------------------------------
 
 .. currentmodule:: pyspark.errors
 

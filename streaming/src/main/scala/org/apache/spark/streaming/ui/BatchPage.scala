@@ -244,7 +244,7 @@ private[ui] class BatchPage(parent: StreamingTab) extends WebUIPage("batch") {
     <div>
       {outputOp.name}
       <span
-        onclick="this.parentNode.querySelector('.stage-details').classList.toggle('collapsed')"
+        data-toggle-details=".stage-details"
         class="expand-details">
           +details
       </span>
@@ -267,19 +267,6 @@ private[ui] class BatchPage(parent: StreamingTab) extends WebUIPage("batch") {
       Some(store.lastStageAttempt(stageId))
     } catch {
       case _: NoSuchElementException => None
-    }
-  }
-
-  private def generateOutputOperationStatusForUI(failure: String): String = {
-    if (failure.startsWith("org.apache.spark.SparkException")) {
-      "Failed due to Spark job error\n" + failure
-    } else {
-      var nextLineIndex = failure.indexOf("\n")
-      if (nextLineIndex < 0) {
-        nextLineIndex = failure.length
-      }
-      val firstLine = failure.substring(0, nextLineIndex)
-      s"Failed due to error: $firstLine\n$failure"
     }
   }
 

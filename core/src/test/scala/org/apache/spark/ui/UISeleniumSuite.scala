@@ -302,6 +302,59 @@ class UISeleniumSuite extends SparkFunSuite with WebBrowser with Matchers {
     }
   }
 
+  test("SPARK-58828: spark.ui.holdEnabled should properly control hold button display") {
+    def hasHoldLink: Boolean = find(className("confirm-link")).isDefined
+    // The control needs a coarse-grained backend (so local-cluster, not local) and the hold
+    // preconditions; the external shuffle service itself is not needed to render the page.
+    val holdConfs = Map(
+      SHUFFLE_SERVICE_ENABLED.key -> "true",
+      DECOMMISSION_ENABLED.key -> "true")
+
+    withSpark(newSparkContext(master = "local-cluster[1,1,1024]",
+        additionalConfs = holdConfs)) { sc =>
+      eventually(timeout(10.seconds), interval(50.milliseconds)) {
+        goToUi(sc, "/jobs")
+        assert(hasHoldLink)
+      }
+    }
+
+    withSpark(newSparkContext(master = "local-cluster[1,1,1024]",
+        additionalConfs = holdConfs + (UI_HOLD_ENABLED.key -> "false"))) { sc =>
+      goToUi(sc, "/jobs")
+      assert(!hasHoldLink)
+    }
+  }
+
+  test("SPARK-59010: hold status api") {
+    def holdStatus(sc: SparkContext): (Boolean, Boolean, Int) = {
+      val json = getJson(sc.ui.get, "holdstatus")
+      ((json \ "supported").extract[Boolean], (json \ "held").extract[Boolean],
+        (json \ "draining").extract[Int])
+    }
+
+    // A local backend cannot hold its executors.
+    withSpark(newSparkContext()) { sc =>
+      assert(holdStatus(sc) === (false, false, 0))
+    }
+
+    withSpark(newSparkContext(master = "local-cluster[1,1,1024]",
+        additionalConfs = Map(
+          SHUFFLE_SERVICE_ENABLED.key -> "true",
+          DECOMMISSION_ENABLED.key -> "true"))) { sc =>
+      assert(holdStatus(sc) === (true, false, 0))
+      // Wait for the executor to register, so that the hold has something to drain.
+      eventually(timeout(30.seconds), interval(200.milliseconds)) {
+        assert(sc.getExecutorIds().nonEmpty)
+      }
+      assert(sc.holdExecutors())
+      assert(holdStatus(sc)._2)
+      // The held executors exit once they are done, and the drain is then complete.
+      eventually(timeout(30.seconds), interval(200.milliseconds)) {
+        assert(holdStatus(sc) === (true, true, 0))
+      }
+    }
+  }
+
   test("jobs page should not display job group name unless some job was submitted in a job group") {
     withSpark(newSparkContext()) { sc =>
       // If no job has been run in a job group, then "(Job Group)" should not appear in the header
@@ -362,7 +415,7 @@ class UISeleniumSuite extends SparkFunSuite with WebBrowser with Matchers {
       eventually(timeout(5.seconds), interval(50.milliseconds)) {
         goToUi(sc, "/jobs")
         find(cssSelector(".stage-progress-cell")).get.text should be ("2/2 (1 failed)")
-        find(cssSelector(".progress-cell .progress")).get.text should be ("2/2 (1 failed)")
+        find(cssSelector(".progress-cell .progress-stacked")).get.text should be ("2/2 (1 failed)")
       }
       val jobJson = getJson(sc.ui.get, "jobs")
       (jobJson \\ "numTasks").extract[Int]should be (2)
@@ -417,7 +470,7 @@ class UISeleniumSuite extends SparkFunSuite with WebBrowser with Matchers {
         // Instead, it's safer to check that each row contains a link to a stage details page.
         findAll(cssSelector("tbody tr")).foreach { row =>
           val link = row.underlying.findElement(By.xpath("./td/div/a"))
-          link.getAttribute("href") should include ("stage")
+          link.getDomProperty("href") should include ("stage")
         }
       }
     }
@@ -473,7 +526,7 @@ class UISeleniumSuite extends SparkFunSuite with WebBrowser with Matchers {
         // Instead, it's safer to check that each row contains a link to a stage details page.
         findAll(cssSelector("tbody tr")).foreach { row =>
           val link = row.underlying.findElement(By.xpath(".//a"))
-          link.getAttribute("href") should include ("stage")
+          link.getDomProperty("href") should include ("stage")
         }
       }
     }

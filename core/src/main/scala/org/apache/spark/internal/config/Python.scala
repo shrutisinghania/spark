@@ -138,4 +138,41 @@ private[spark] object Python {
       .intConf
       .checkValue(_ > 0, "If set, the idle worker max size must be > 0.")
       .createOptional
+
+  val PYTHON_DAEMON_KILL_WORKER_ON_FLUSH_FAILURE =
+    ConfigBuilder("spark.python.daemon.killWorkerOnFlushFailure")
+      .doc("When enabled, exceptions raised during output flush operations in the Python " +
+        "worker managed under Python daemon are not caught, causing the worker to terminate " +
+        "with the exception. This allows Spark to detect the failure and launch a new worker " +
+        "and retry the task. " +
+        "When disabled, flush exceptions are caught and logged but the worker continues, " +
+        "which could cause the worker to get stuck due to protocol mismatch.")
+      .version("4.1.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val PYTHON_UDF_PIPELINED_EXECUTION =
+    ConfigBuilder("spark.python.udf.pipelined.enabled")
+      .doc("When true, enables pipelined (asynchronous) data transfer between JVM and Python " +
+        "UDF workers. In pipelined mode, input serialization runs in a separate writer thread " +
+        "while the main task thread reads output from the Python worker, allowing the two " +
+        "directions to overlap. This can improve throughput for some workloads " +
+        "(e.g., multi-column UDFs or compute-heavy UDFs like ML inference); for light, " +
+        "single-column UDFs the overhead of the extra thread may offset the gain.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val PYTHON_UDF_PIPELINED_QUEUE_DEPTH =
+    ConfigBuilder("spark.python.udf.pipelined.queueDepth")
+      .doc("The maximum number of input batches the Python worker's background reader thread " +
+        "can pre-fetch ahead of UDF computation. A higher value allows more overlap between " +
+        "input reading and UDF processing, at the cost of increased memory usage. " +
+        "Only effective when spark.python.udf.pipelined.enabled is true.")
+      .version("4.3.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(_ > 0, "Queue depth must be positive.")
+      .createWithDefault(2)
 }

@@ -241,6 +241,52 @@ org.apache.spark.SparkRuntimeException
 
 
 -- !query
+select element_at(array(1, 2, 3), -2147483648)
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.SparkArrayIndexOutOfBoundsException
+{
+  "errorClass" : "INVALID_ARRAY_INDEX_IN_ELEMENT_AT",
+  "sqlState" : "22003",
+  "messageParameters" : {
+    "arraySize" : "3",
+    "indexValue" : "-2147483648"
+  },
+  "queryContext" : [ {
+    "objectType" : "",
+    "objectName" : "",
+    "startIndex" : 8,
+    "stopIndex" : 46,
+    "fragment" : "element_at(array(1, 2, 3), -2147483648)"
+  } ]
+}
+
+
+-- !query
+select element_at(array(1, 2, 3), idx) from values (-2147483648) as t(idx)
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.SparkArrayIndexOutOfBoundsException
+{
+  "errorClass" : "INVALID_ARRAY_INDEX_IN_ELEMENT_AT",
+  "sqlState" : "22003",
+  "messageParameters" : {
+    "arraySize" : "3",
+    "indexValue" : "-2147483648"
+  },
+  "queryContext" : [ {
+    "objectType" : "",
+    "objectName" : "",
+    "startIndex" : 8,
+    "stopIndex" : 38,
+    "fragment" : "element_at(array(1, 2, 3), idx)"
+  } ]
+}
+
+
+-- !query
 select elt(4, '123', '456')
 -- !query schema
 struct<>
@@ -538,8 +584,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"1\"",
     "inputType" : "\"INT\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"1[0]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(1, 0)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -564,8 +610,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"1\"",
     "inputType" : "\"INT\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"1[-1]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(1, -1)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -590,8 +636,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"1\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"1[0]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(1, 0)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -616,8 +662,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"1\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"1[-1]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(1, -1)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -642,8 +688,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"NULL\"",
     "inputType" : "\"VOID\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"NULL[0]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(NULL, 0)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -668,8 +714,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"NULL\"",
     "inputType" : "\"VOID\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"NULL[-1]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(NULL, -1)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -694,8 +740,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"NULL\"",
     "inputType" : "\"VOID\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"NULL[NULL]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(NULL, NULL)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -720,8 +766,8 @@ org.apache.spark.sql.catalyst.ExtendedAnalysisException
     "inputSql" : "\"CAST(NULL AS STRING)\"",
     "inputType" : "\"STRING\"",
     "paramIndex" : "first",
-    "requiredType" : "(\"ARRAY\")",
-    "sqlExpr" : "\"CAST(NULL AS STRING)[0]\""
+    "requiredType" : "\"ARRAY\"",
+    "sqlExpr" : "\"get(CAST(NULL AS STRING), 0)\""
   },
   "queryContext" : [ {
     "objectType" : "",
@@ -1106,3 +1152,103 @@ select array_distinct(array(0.0, -0.0, -0.0, DOUBLE("NaN"), DOUBLE("NaN")))
 struct<array_distinct(array(0.0, 0.0, 0.0, NaN, NaN)):array<double>>
 -- !query output
 [0.0,NaN]
+
+
+-- !query
+select trim_array(array(1, 2, 3, 4, 5), 0)
+-- !query schema
+struct<trim_array(array(1, 2, 3, 4, 5), 0):array<int>>
+-- !query output
+[1,2,3,4,5]
+
+
+-- !query
+select trim_array(array(1, 2, 3, 4, 5), 2)
+-- !query schema
+struct<trim_array(array(1, 2, 3, 4, 5), 2):array<int>>
+-- !query output
+[1,2,3]
+
+
+-- !query
+select trim_array(array(1, 2, 3, 4, 5), 5)
+-- !query schema
+struct<trim_array(array(1, 2, 3, 4, 5), 5):array<int>>
+-- !query output
+[]
+
+
+-- !query
+select trim_array(array('a', 'b', 'c'), 1)
+-- !query schema
+struct<trim_array(array(a, b, c), 1):array<string>>
+-- !query output
+["a","b"]
+
+
+-- !query
+select trim_array(array(1, 2, null, 4), 1)
+-- !query schema
+struct<trim_array(array(1, 2, NULL, 4), 1):array<int>>
+-- !query output
+[1,2,null]
+
+
+-- !query
+select trim_array(array(), 0)
+-- !query schema
+struct<trim_array(array(), 0):array<void>>
+-- !query output
+[]
+
+
+-- !query
+select trim_array(array(1, 2, 3), -1)
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.SparkRuntimeException
+{
+  "errorClass" : "INVALID_PARAMETER_VALUE.TRIM_ARRAY_LENGTH",
+  "sqlState" : "22023",
+  "messageParameters" : {
+    "functionName" : "`trim_array`",
+    "length" : "-1",
+    "numElements" : "3",
+    "parameter" : "`n`"
+  }
+}
+
+
+-- !query
+select trim_array(array(1, 2, 3), 4)
+-- !query schema
+struct<>
+-- !query output
+org.apache.spark.SparkRuntimeException
+{
+  "errorClass" : "INVALID_PARAMETER_VALUE.TRIM_ARRAY_LENGTH",
+  "sqlState" : "22023",
+  "messageParameters" : {
+    "functionName" : "`trim_array`",
+    "length" : "4",
+    "numElements" : "3",
+    "parameter" : "`n`"
+  }
+}
+
+
+-- !query
+select trim_array(CAST(null AS ARRAY<INT>), 1)
+-- !query schema
+struct<trim_array(NULL, 1):array<int>>
+-- !query output
+NULL
+
+
+-- !query
+select trim_array(array(1, 2, 3), CAST(null AS INT))
+-- !query schema
+struct<trim_array(array(1, 2, 3), CAST(NULL AS INT)):array<int>>
+-- !query output
+NULL

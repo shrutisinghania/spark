@@ -18,18 +18,18 @@
 import tempfile
 import unittest
 
-from pyspark.sql import Row
-from pyspark.ml.pipeline import Pipeline, PipelineModel
+from pyspark.ml.classification import LogisticRegression, LogisticRegressionModel
+from pyspark.ml.clustering import GaussianMixture, KMeans, KMeansModel
 from pyspark.ml.feature import (
-    VectorAssembler,
     MaxAbsScaler,
     MaxAbsScalerModel,
     MinMaxScaler,
     MinMaxScalerModel,
+    VectorAssembler,
 )
 from pyspark.ml.linalg import Vectors
-from pyspark.ml.classification import LogisticRegression, LogisticRegressionModel
-from pyspark.ml.clustering import KMeans, KMeansModel, GaussianMixture
+from pyspark.ml.pipeline import Pipeline, PipelineModel
+from pyspark.sql import Row
 from pyspark.testing.mlutils import MockDataset, MockEstimator, MockTransformer
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
@@ -301,12 +301,6 @@ class PipelineTests(PipelineTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_pipeline import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -17,41 +17,43 @@
 
 import unittest
 
+from pyspark import pipelines as dp
 from pyspark.errors import PySparkTypeError
-from pyspark import pipelines as sdp
 
 
 class DecoratorsTest(unittest.TestCase):
     def test_dataset_name_not_string(self):
-        for decorator in [sdp.table, sdp.temporary_view, sdp.materialized_view]:
+        for decorator in [dp.table, dp.temporary_view, dp.materialized_view]:
             with self.assertRaises(PySparkTypeError) as context:
 
                 @decorator(name=5)
                 def dataset_with_non_string_name():
                     raise NotImplementedError()
 
-            assert context.exception.getCondition() == "NOT_STR"
+            assert context.exception.getCondition() == "NOT_EXPECTED_TYPE"
             assert context.exception.getMessageParameters() == {
+                "expected_type": "str",
                 "arg_name": "name",
                 "arg_type": "int",
             }, context.exception.getMessageParameters()
 
     def test_invalid_partition_cols(self):
-        for decorator in [sdp.table, sdp.materialized_view]:
+        for decorator in [dp.table, dp.materialized_view]:
             with self.assertRaises(PySparkTypeError) as context:
 
                 @decorator(partition_cols=["a", 1, 2])  # type: ignore
                 def dataset_with_invalid_partition_cols():
                     raise NotImplementedError()
 
-            assert context.exception.getCondition() == "NOT_LIST_OF_STR"
+            assert context.exception.getCondition() == "NOT_EXPECTED_TYPE"
             assert context.exception.getMessageParameters() == {
+                "expected_type": "list[str]",
                 "arg_name": "partition_cols",
                 "arg_type": "list",
             }, context.exception.getMessageParameters()
 
     def test_decorator_with_positional_arg(self):
-        for decorator in [sdp.table, sdp.temporary_view, sdp.materialized_view]:
+        for decorator in [dp.table, dp.temporary_view, dp.materialized_view]:
             with self.assertRaises(PySparkTypeError) as context:
                 decorator("table1")
 
@@ -63,10 +65,6 @@ class DecoratorsTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    try:
-        import xmlrunner  # type: ignore
+    from pyspark.testing import main
 
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

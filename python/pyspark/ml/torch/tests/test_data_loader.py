@@ -17,12 +17,12 @@
 
 import unittest
 
+from pyspark.ml.linalg import Vectors
 from pyspark.ml.torch.distributor import (
     TorchDistributor,
     _get_spark_partition_data_loader,
 )
 from pyspark.sql import SparkSession
-from pyspark.ml.linalg import Vectors
 
 
 # @unittest.skipIf(not have_torch, torch_requirement_message)
@@ -122,12 +122,6 @@ class TorchDistributorDataLoaderUnitTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.torch.tests.test_data_loader import *  # noqa: F401,F403
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

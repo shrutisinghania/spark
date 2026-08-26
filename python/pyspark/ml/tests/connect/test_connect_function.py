@@ -16,13 +16,13 @@
 #
 import unittest
 
-from pyspark.util import is_remote_only
 from pyspark.ml import functions as SF
 from pyspark.testing.connectutils import (
-    should_test_connect,
     ReusedMixedTestCase,
+    should_test_connect,
 )
 from pyspark.testing.pandasutils import PandasOnSparkTestUtils
+from pyspark.util import is_remote_only
 
 if should_test_connect:
     from pyspark.ml.connect import functions as CF
@@ -67,12 +67,6 @@ class SparkConnectMLFunctionTests(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.connect.test_connect_function import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

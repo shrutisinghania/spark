@@ -39,24 +39,14 @@ except ImportError as e:
     else:
         raise
 
-if "PYARROW_IGNORE_TIMEZONE" not in os.environ:
-    warnings.warn(
-        "'PYARROW_IGNORE_TIMEZONE' environment variable was not set. It is required to "
-        "set this environment variable to '1' in both driver and executor sides if you use "
-        "pyarrow>=2.0.0. "
-        "pandas-on-Spark will set it for you but it does not work if there is a Spark context "
-        "already launched."
-    )
-    os.environ["PYARROW_IGNORE_TIMEZONE"] = "1"
-
 from pyspark.pandas.frame import DataFrame
+from pyspark.pandas.groupby import NamedAgg
 from pyspark.pandas.indexes.base import Index
 from pyspark.pandas.indexes.category import CategoricalIndex
 from pyspark.pandas.indexes.datetimes import DatetimeIndex
 from pyspark.pandas.indexes.multi import MultiIndex
 from pyspark.pandas.indexes.timedelta import TimedeltaIndex
 from pyspark.pandas.series import Series
-from pyspark.pandas.groupby import NamedAgg
 
 __all__ = [  # noqa: F405
     "read_csv",
@@ -85,12 +75,13 @@ __all__ = [  # noqa: F405
     "options",
     "option_context",
     "NamedAgg",
+    "show_versions",
 ]
 
 
 def _auto_patch_spark() -> None:
-    import os
     import logging
+    import os
 
     # Attach a usage logger. 'KOALAS_USAGE_LOGGER' is legacy, and it's for compatibility.
     logger_module = os.getenv("PYSPARK_PANDAS_USAGE_LOGGER", os.getenv("KOALAS_USAGE_LOGGER", ""))
@@ -138,7 +129,7 @@ _auto_patch_spark()
 _auto_patch_pandas()
 
 # Import after the usage logger is attached.
-from pyspark.pandas.config import get_option, options, option_context, reset_option, set_option
+from pyspark.pandas.config import get_option, option_context, options, reset_option, set_option
 from pyspark.pandas.namespace import *  # noqa: F403
 from pyspark.pandas.sql_formatter import sql
 

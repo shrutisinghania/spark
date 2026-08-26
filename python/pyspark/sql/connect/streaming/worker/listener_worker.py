@@ -19,28 +19,27 @@
 A worker for streaming query listener in Spark Connect.
 Usually this is ran on the driver side of the Spark Connect Server.
 """
-import os
-import json
 
-from pyspark.util import local_connect_and_auth
-from pyspark.serializers import (
-    read_int,
-    write_int,
-    UTF8Deserializer,
-    CPickleSerializer,
-)
-from pyspark import worker
-from pyspark.sql.connect.session import SparkSession
-from pyspark.util import handle_worker_exception
+import json
+import os
 from typing import IO
 
-from pyspark.sql.streaming.listener import (
-    QueryStartedEvent,
-    QueryProgressEvent,
-    QueryTerminatedEvent,
-    QueryIdleEvent,
+from pyspark import worker
+from pyspark.serializers import (
+    CPickleSerializer,
+    UTF8Deserializer,
+    read_int,
+    write_int,
 )
-from pyspark.worker_util import check_python_version
+from pyspark.sql.connect.session import SparkSession
+from pyspark.sql.streaming.listener import (
+    QueryIdleEvent,
+    QueryProgressEvent,
+    QueryStartedEvent,
+    QueryTerminatedEvent,
+)
+from pyspark.util import handle_worker_exception
+from pyspark.worker_util import check_python_version, get_sock_file_to_executor
 
 pickle_ser = CPickleSerializer()
 utf8_deserializer = UTF8Deserializer()
@@ -104,14 +103,5 @@ def main(infile: IO, outfile: IO) -> None:
 
 
 if __name__ == "__main__":
-    # Read information about how to connect back to the JVM from the environment.
-    conn_info = os.environ.get(
-        "PYTHON_WORKER_FACTORY_SOCK_PATH", int(os.environ.get("PYTHON_WORKER_FACTORY_PORT", -1))
-    )
-    auth_secret = os.environ.get("PYTHON_WORKER_FACTORY_SECRET")
-    (sock_file, sock) = local_connect_and_auth(conn_info, auth_secret)
-    # There could be a long time between each listener event.
-    sock.settimeout(None)
-    write_int(os.getpid(), sock_file)
-    sock_file.flush()
-    main(sock_file, sock_file)
+    with get_sock_file_to_executor(timeout=None) as sock_file:
+        main(sock_file, sock_file)

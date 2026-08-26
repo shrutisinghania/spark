@@ -15,11 +15,10 @@
 # limitations under the License.
 #
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pyspark.ml import functions as PyMLFunctions
 from pyspark.sql.column import Column
-
 
 if TYPE_CHECKING:
     from pyspark.sql._typing import UserDefinedFunctionLike
@@ -65,8 +64,9 @@ def _test() -> None:
         sys.exit(0)
 
     import doctest
-    from pyspark.sql import SparkSession as PySparkSession
+
     import pyspark.ml.connect.functions
+    from pyspark.sql import SparkSession as PySparkSession
 
     globs = pyspark.ml.connect.functions.__dict__.copy()
 
@@ -76,7 +76,7 @@ def _test() -> None:
         .getOrCreate()
     )
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.ml.connect.functions,
         globs=globs,
         optionflags=doctest.ELLIPSIS

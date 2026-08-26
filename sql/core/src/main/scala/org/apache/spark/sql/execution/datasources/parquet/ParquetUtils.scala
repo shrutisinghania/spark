@@ -38,13 +38,15 @@ import org.apache.spark.internal.LogKeys.{CLASS_NAME, CONFIG}
 import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.JoinedRow
+import org.apache.spark.sql.catalyst.expressions.variant.VariantExpressionEvalUtils
 import org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec
 import org.apache.spark.sql.connector.expressions.aggregate.{Aggregation, Count, CountStar, Max, Min}
-import org.apache.spark.sql.execution.datasources.{AggregatePushDownUtils, OutputWriter, OutputWriterFactory}
+import org.apache.spark.sql.execution.datasources.{AggregatePushDownUtils, DataSourceUtils, OutputWriter, OutputWriterFactory}
+import org.apache.spark.sql.execution.datasources.parquet.types.ops.ParquetTypeOps
 import org.apache.spark.sql.execution.datasources.v2.V2ColumnUtils
 import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.internal.SQLConf.PARQUET_AGGREGATE_PUSHDOWN_ENABLED
-import org.apache.spark.sql.types.{ArrayType, AtomicType, DataType, MapType, StructField, StructType, UserDefinedType, VariantType}
+import org.apache.spark.sql.types.{ArrayType, AtomicType, DataType, MapType, NullType, StructField, StructType, UserDefinedType, VariantType}
 import org.apache.spark.util.ArrayImplicits._
 
 object ParquetUtils extends Logging {
@@ -142,7 +144,10 @@ object ParquetUtils extends Logging {
     val leaves = allFiles.toArray.sortBy(_.getPath.toString)
 
     FileTypes(
-      data = leaves.filterNot(f => isSummaryFile(f.getPath)).toImmutableArraySeq,
+      // Zero-length files (e.g. `_SUCCESS` markers surfaced by a relaxed `ignoredPathSegmentRegex`)
+      // cannot contain a Parquet footer, so exclude them from schema inference candidates.
+      data = leaves.filter(_.getLen > 0).filterNot(f => isSummaryFile(f.getPath))
+        .toImmutableArraySeq,
       metadata =
         leaves.filter(_.getPath.getName == ParquetFileWriter.PARQUET_METADATA_FILE)
           .toImmutableArraySeq,
@@ -205,9 +210,16 @@ object ParquetUtils extends Logging {
     sqlConf.parquetVectorizedReaderEnabled &&
       schema.forall(f => isBatchReadSupported(sqlConf, f.dataType))
 
-  def isBatchReadSupported(sqlConf: SQLConf, dt: DataType): Boolean = dt match {
+  def isBatchReadSupported(sqlConf: SQLConf, dt: DataType): Boolean =
+    // Types Framework: framework FIRST, original match as fallback.
+    ParquetTypeOps(dt).map(_.isBatchReadSupported(sqlConf))
+      .getOrElse(isBatchReadSupportedDefault(sqlConf, dt))
+
+  private def isBatchReadSupportedDefault(sqlConf: SQLConf, dt: DataType): Boolean = dt match {
     case _: AtomicType =>
       true
+    case _: NullType =>
+      sqlConf.parquetVectorizedReaderNullTypeEnabled
     case at: ArrayType =>
       sqlConf.parquetVectorizedReaderNestedColumnEnabled &&
         isBatchReadSupported(sqlConf, at.elementType)
@@ -332,7 +344,7 @@ object ParquetUtils extends Logging {
         agg match {
           case max: Max if V2ColumnUtils.extractV2Column(max.column).isDefined =>
             val colName = V2ColumnUtils.extractV2Column(max.column).get
-            index = dataSchema.fieldNames.toList.indexOf(colName)
+            index = dataSchema.getFieldIndex(colName).getOrElse(-1)
             schemaName = "max(" + colName + ")"
             val currentMax = getCurrentBlockMaxOrMin(filePath, blockMetaData, index, true)
             if (value == None || currentMax.asInstanceOf[Comparable[Any]].compareTo(value) > 0) {
@@ -340,7 +352,7 @@ object ParquetUtils extends Logging {
             }
           case min: Min if V2ColumnUtils.extractV2Column(min.column).isDefined =>
             val colName = V2ColumnUtils.extractV2Column(min.column).get
-            index = dataSchema.fieldNames.toList.indexOf(colName)
+            index = dataSchema.getFieldIndex(colName).getOrElse(-1)
             schemaName = "min(" + colName + ")"
             val currentMin = getCurrentBlockMaxOrMin(filePath, blockMetaData, index, false)
             if (value == None || currentMin.asInstanceOf[Comparable[Any]].compareTo(value) < 0) {
@@ -351,12 +363,12 @@ object ParquetUtils extends Logging {
             schemaName = "count(" + colName + ")"
             rowCount += block.getRowCount
             var isPartitionCol = false
-            if (partitionSchema.fields.map(_.name).toSet.contains(colName)) {
+            if (partitionSchema.getFieldIndex(colName).isDefined) {
               isPartitionCol = true
             }
             isCount = true
             if (!isPartitionCol) {
-              index = dataSchema.fieldNames.toList.indexOf(colName)
+              index = dataSchema.getFieldIndex(colName).getOrElse(-1)
               // Count(*) includes the null values, but Count(colName) doesn't.
               rowCount -= getNumNulls(filePath, blockMetaData, index)
             }
@@ -395,7 +407,7 @@ object ParquetUtils extends Logging {
     val statistics = columnChunkMetaData.get(i).getStatistics
     if (!statistics.hasNonNullValue) {
       throw new SparkUnsupportedOperationException(
-        errorClass = "_LEGACY_ERROR_TEMP_3172",
+        errorClass = "PARQUET_AGGREGATE_PUSH_DOWN_UNSUPPORTED.NO_MIN_MAX",
         messageParameters = Map(
           "filePath" -> filePath,
           "config" -> PARQUET_AGGREGATE_PUSHDOWN_ENABLED.key))
@@ -411,12 +423,12 @@ object ParquetUtils extends Logging {
     val statistics = columnChunkMetaData.get(i).getStatistics
     if (!statistics.isNumNullsSet) {
       throw new SparkUnsupportedOperationException(
-        errorClass = "_LEGACY_ERROR_TEMP_3171",
+        errorClass = "PARQUET_AGGREGATE_PUSH_DOWN_UNSUPPORTED.NO_NUM_NULLS",
         messageParameters = Map(
           "filePath" -> filePath,
           "config" -> PARQUET_AGGREGATE_PUSHDOWN_ENABLED.key))
     }
-    statistics.getNumNulls;
+    statistics.getNumNulls
   }
 
   // Replaces each VariantType in the schema with the corresponding type in the shredding schema.
@@ -433,6 +445,21 @@ object ParquetUtils extends Logging {
         }
     }
     StructType(newFields)
+  }
+
+  private def needShreddingInference(
+      parquetOptions: ParquetOptions,
+      schema: StructType): Boolean = {
+    // If shredding inference is enabled, use the shredding writer, but only if the schema
+    // actually contains at least one Variant column.
+    if (parquetOptions.inferShreddingForVariant) {
+      // This will return true even if the type contains Variant as an array or map element.
+      // Even though we don't try to infer a schema right now, there isn't much downside, and
+      // we may want to allow schema inference for these cases in the future.
+      VariantExpressionEvalUtils.typeContainsVariant(schema)
+    } else {
+      false
+    }
   }
 
   def prepareWrite(
@@ -489,21 +516,17 @@ object ParquetUtils extends Logging {
 
     // Sets flags for `ParquetWriteSupport`, which converts Catalyst schema to Parquet
     // schema and writes actual rows to Parquet files.
-    conf.set(
-      SQLConf.PARQUET_WRITE_LEGACY_FORMAT.key,
-      sqlConf.writeLegacyParquetFormat.toString)
-
-    conf.set(
-      SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key,
-      sqlConf.parquetOutputTimestampType.toString)
-
-    conf.set(
-      SQLConf.PARQUET_FIELD_ID_WRITE_ENABLED.key,
-      sqlConf.parquetFieldIdWriteEnabled.toString)
-
-    conf.set(
-      SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key,
-      sqlConf.legacyParquetNanosAsLong.toString)
+    DataSourceUtils.setConfIfAbsent(conf,
+      SQLConf.PARQUET_WRITE_LEGACY_FORMAT.key, sqlConf.writeLegacyParquetFormat.toString)
+    DataSourceUtils.setConfIfAbsent(conf,
+      SQLConf.PARQUET_OUTPUT_TIMESTAMP_TYPE.key, sqlConf.parquetOutputTimestampType.toString)
+    DataSourceUtils.setConfIfAbsent(conf,
+      SQLConf.PARQUET_FIELD_ID_WRITE_ENABLED.key, sqlConf.parquetFieldIdWriteEnabled.toString)
+    DataSourceUtils.setConfIfAbsent(conf,
+      SQLConf.LEGACY_PARQUET_NANOS_AS_LONG.key, sqlConf.legacyParquetNanosAsLong.toString)
+    DataSourceUtils.setConfIfAbsent(conf,
+      SQLConf.PARQUET_ANNOTATE_VARIANT_LOGICAL_TYPE.key,
+      sqlConf.parquetAnnotateVariantLogicalType.toString)
 
     // Sets compression scheme
     conf.set(ParquetOutputFormat.COMPRESSION, parquetOptions.compressionCodecClassName)
@@ -522,12 +545,22 @@ object ParquetUtils extends Logging {
         log"${MDC(CONFIG, ParquetOutputFormat.JOB_SUMMARY_LEVEL)} to NONE.")
     }
 
+    val useVariantShreddingWriter = needShreddingInference(parquetOptions, dataSchema)
+    val shreddingSchemaForced =
+        sqlConf.getConf(SQLConf.VARIANT_FORCE_SHREDDING_SCHEMA_FOR_TEST).nonEmpty
+
     new OutputWriterFactory {
       override def newInstance(
           path: String,
           dataSchema: StructType,
           context: TaskAttemptContext): OutputWriter = {
-        new ParquetOutputWriter(path, context)
+        if (useVariantShreddingWriter) {
+          val inferenceHelper = new InferVariantShreddingSchema(dataSchema)
+          new ParquetOutputWriterWithVariantShredding(path, context, inferenceHelper,
+              shreddingSchemaForced)
+        } else {
+          new ParquetOutputWriter(path, context)
+        }
       }
 
       override def getFileExtension(context: TaskAttemptContext): String = {

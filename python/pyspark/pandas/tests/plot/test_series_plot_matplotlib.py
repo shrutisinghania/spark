@@ -16,14 +16,14 @@
 #
 
 import base64
-from io import BytesIO
 import unittest
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.pandas.config import set_option, reset_option
+from pyspark.pandas.config import reset_option, set_option
 from pyspark.testing.pandasutils import PandasOnSparkTestCase, TestUtils
 from pyspark.testing.utils import have_matplotlib, matplotlib_requirement_message
 
@@ -263,7 +263,7 @@ class SeriesPlotMatplotlibTestsMixin:
                 "signups": [5, 5, 6, 12, 14, 13],
                 "visits": [20, 42, 28, 62, 81, 50],
             },
-            index=pd.date_range(start="2018/01/01", end="2018/07/01", freq="M"),
+            index=pd.date_range(start="2018/01/01", end="2018/07/01", freq="ME"),
         )
         psdf = ps.from_pandas(pdf)
 
@@ -321,7 +321,7 @@ class SeriesPlotMatplotlibTestsMixin:
             check_box_plot(p, k, showfliers=True)
             check_box_plot(p, k, sym="")
             check_box_plot(p, k, sym=".", color="r")
-            check_box_plot(p, k, use_index=False, labels=["Test"])
+            check_box_plot(p, k, use_index=False)
             check_box_plot(p, k, usermedians=[2.0])
             check_box_plot(p, k, conf_intervals=[(1.0, 3.0)])
 
@@ -394,12 +394,6 @@ class SeriesPlotMatplotlibTests(SeriesPlotMatplotlibTestsMixin, PandasOnSparkTes
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.plot.test_series_plot_matplotlib import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

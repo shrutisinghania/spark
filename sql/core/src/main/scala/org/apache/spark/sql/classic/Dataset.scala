@@ -28,7 +28,7 @@ import scala.util.control.NonFatal
 
 import org.apache.commons.text.StringEscapeUtils
 
-import org.apache.spark.{sql, TaskContext}
+import org.apache.spark.{sql, SparkException, TaskContext}
 import org.apache.spark.annotation.{DeveloperApi, Stable, Unstable}
 import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.api.java.function._
@@ -49,7 +49,6 @@ import org.apache.spark.sql.catalyst.parser.{ParseException, ParserUtils}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.trees.{CurrentOrigin, TreeNodeTag, TreePattern}
-import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, IntervalUtils}
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
 import org.apache.spark.sql.classic.ClassicConversions._
@@ -60,7 +59,7 @@ import org.apache.spark.sql.execution.aggregate.TypedAggregateExpression
 import org.apache.spark.sql.execution.arrow.{ArrowBatchStreamWriter, ArrowConverters}
 import org.apache.spark.sql.execution.command._
 import org.apache.spark.sql.execution.datasources.LogicalRelationWithTable
-import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2ScanRelation, FileTable}
+import org.apache.spark.sql.execution.datasources.v2.{ExtractV2ScanInfo, ExtractV2Table, FileTable}
 import org.apache.spark.sql.execution.python.EvaluatePython
 import org.apache.spark.sql.execution.stat.StatFunctions
 import org.apache.spark.sql.internal.SQLConf
@@ -121,7 +120,7 @@ private[sql] object Dataset {
       shuffleCleanupMode: ShuffleCleanupMode): DataFrame =
     sparkSession.withActive {
       val qe = new QueryExecution(
-        sparkSession, logicalPlan, shuffleCleanupMode = shuffleCleanupMode)
+        sparkSession, logicalPlan, shuffleCleanupModeOpt = Some(shuffleCleanupMode))
       if (!qe.isLazyAnalysis) qe.assertAnalyzed()
       new Dataset[Row](qe, () => RowEncoder.encoderFor(qe.analyzed.schema))
     }
@@ -134,7 +133,7 @@ private[sql] object Dataset {
       shuffleCleanupMode: ShuffleCleanupMode = DoNotCleanup)
     : DataFrame = sparkSession.withActive {
     val qe = new QueryExecution(
-      sparkSession, logicalPlan, tracker, shuffleCleanupMode = shuffleCleanupMode)
+      sparkSession, logicalPlan, tracker, shuffleCleanupModeOpt = Some(shuffleCleanupMode))
     if (!qe.isLazyAnalysis) qe.assertAnalyzed()
     new Dataset[Row](qe, () => RowEncoder.encoderFor(qe.analyzed.schema))
   }
@@ -583,7 +582,11 @@ class Dataset[T] private[sql](
       }
 
       withTypedPlan[T] {
-        LogicalRDD.fromDataset(rdd = internalRdd, originDataset = this, isStreaming = isStreaming)
+        LogicalRDD.fromDataset(
+          rdd = internalRdd,
+          originDataset = this,
+          isStreaming = isStreaming,
+          fromCheckpoint = true)
       }
     }
   }
@@ -595,9 +598,8 @@ class Dataset[T] private[sql](
     val parsedDelay = IntervalUtils.fromIntervalString(delayThreshold)
     require(!IntervalUtils.isNegative(parsedDelay),
       s"delay threshold ($delayThreshold) should not be negative.")
-    EliminateEventTimeWatermark(
-      EventTimeWatermark(util.UUID.randomUUID(), UnresolvedAttribute(eventTime),
-        parsedDelay, logicalPlan))
+    EventTimeWatermark(util.UUID.randomUUID(), UnresolvedAttribute(eventTime),
+      parsedDelay, logicalPlan)
   }
 
   /** @inheritdoc */
@@ -649,7 +651,7 @@ class Dataset[T] private[sql](
   private def resolveSelfJoinCondition(
       right: Dataset[_],
       joinExprs: Option[Column],
-      joinType: String): Join = {
+      joinType: String): LogicalPlan = {
     // Note that in this function, we introduce a hack in the case of self-join to automatically
     // resolve ambiguous join conditions into ones that might make sense [SPARK-6231].
     // Consider this case: df.join(df, df("key") === df("key"))
@@ -660,28 +662,40 @@ class Dataset[T] private[sql](
 
     // Trigger analysis so in the case of self-join, the analyzer will clone the plan.
     // After the cloning, left and right side will have distinct expression ids.
-    val plan = withPlan(
-      Join(logicalPlan, right.logicalPlan,
-        JoinType(joinType), joinExprs.map(_.expr), JoinHint.NONE))
-      .queryExecution.analyzed.asInstanceOf[Join]
+    val planToAnalyze = Join(
+      logicalPlan, right.logicalPlan, JoinType(joinType), joinExprs.map(_.expr), JoinHint.NONE)
+    val analyzedJoinPlan = withPlan(planToAnalyze).queryExecution.analyzed
 
     // If auto self join alias is disabled, return the plan.
     if (!sparkSession.sessionState.conf.dataFrameSelfJoinAutoResolveAmbiguity) {
-      return plan
+      return analyzedJoinPlan
     }
 
     // If left/right have no output set intersection, return the plan.
     val lanalyzed = this.queryExecution.analyzed
     val ranalyzed = right.queryExecution.analyzed
     if (lanalyzed.outputSet.intersect(ranalyzed.outputSet).isEmpty) {
-      return plan
+      return analyzedJoinPlan
     }
 
     // Otherwise, find the trivially true predicates and automatically resolves them to both sides.
     // By the time we get here, since we have already run analysis, all attributes should've been
     // resolved and become AttributeReference.
-
-    JoinWith.resolveSelfJoinCondition(sparkSession.sessionState.analyzer.resolver, plan)
+    analyzedJoinPlan match {
+      case project @ Project(_, join: Join) =>
+        // SPARK-53143: Handling edge-cases when `AddMetadataColumns` analyzer rule adds `Project`
+        //              node on top of `Join` node.
+        // Check "SPARK-53143: self join edge-case when Join is not returned by the analyzer" in
+        //   `DataframeSelfJoinSuite` for more details.
+        val newProject = project.copy(child = JoinWith.resolveSelfJoinCondition(
+          sparkSession.sessionState.analyzer.resolver, join))
+        newProject.copyTagsFrom(project)
+        newProject
+      case join: Join =>
+        JoinWith.resolveSelfJoinCondition(sparkSession.sessionState.analyzer.resolver, join)
+      case _ => throw SparkException.internalError(
+        s"Unexpected plan type: ${analyzedJoinPlan.getClass.getName} for self join resolution.")
+    }
   }
 
   /** @inheritdoc */
@@ -694,6 +708,11 @@ class Dataset[T] private[sql](
   /** @inheritdoc */
   def crossJoin(right: sql.Dataset[_]): DataFrame = withPlan {
     Join(logicalPlan, right.logicalPlan, joinType = Cross, None, JoinHint.NONE)
+  }
+
+  /** @inheritdoc */
+  def zip(other: sql.Dataset[_]): DataFrame = withPlan {
+    Zip(logicalPlan, other.logicalPlan)
   }
 
   /** @inheritdoc */
@@ -753,6 +772,66 @@ class Dataset[T] private[sql](
     lateralJoin(right, Some(joinExprs), LateralJoinType(joinType))
   }
 
+  private[sql] def nearestByJoin(
+      right: sql.Dataset[_],
+      rankingExpression: Column,
+      numResults: Int,
+      joinType: JoinType,
+      approx: Boolean,
+      direction: NearestByDirection): DataFrame = {
+    if (numResults < 1 || numResults > NearestByJoin.MaxNumResults) {
+      throw new AnalysisException(
+        errorClass = "NEAREST_BY_JOIN.NUM_RESULTS_OUT_OF_RANGE",
+        messageParameters = Map(
+          "numResults" -> numResults.toString,
+          "min" -> "1",
+          "max" -> NearestByJoin.MaxNumResults.toString))
+    }
+    withPlan {
+      NearestByJoin(
+        logicalPlan,
+        right.logicalPlan,
+        joinType,
+        approx,
+        numResults,
+        rankingExpression.expr,
+        direction)
+    }
+  }
+
+  /** @inheritdoc */
+  def nearestByJoin(
+      right: sql.Dataset[_],
+      rankingExpression: Column,
+      numResults: Int,
+      mode: String,
+      direction: String): DataFrame = {
+    nearestByJoin(
+      right,
+      rankingExpression,
+      numResults,
+      Inner,
+      NearestByJoinMode(mode),
+      NearestByDirection(direction))
+  }
+
+  /** @inheritdoc */
+  def nearestByJoin(
+      right: sql.Dataset[_],
+      rankingExpression: Column,
+      numResults: Int,
+      mode: String,
+      direction: String,
+      joinType: String): DataFrame = {
+    nearestByJoin(
+      right,
+      rankingExpression,
+      numResults,
+      NearestByJoinType(joinType),
+      NearestByJoinMode(mode),
+      NearestByDirection(direction))
+  }
+
   // TODO(SPARK-22947): Fix the DataFrame API.
   private[sql] def joinAsOf(
       other: Dataset[_],
@@ -781,27 +860,37 @@ class Dataset[T] private[sql](
       tolerance: Column,
       allowExactMatches: Boolean,
       direction: String): DataFrame = {
-    val joined = resolveSelfJoinCondition(other, Option(joinExprs), joinType)
-    val leftAsOfExpr = leftAsOf.expr.transformUp {
-      case a: AttributeReference if logicalPlan.outputSet.contains(a) =>
-        val index = logicalPlan.output.indexWhere(_.exprId == a.exprId)
-        joined.left.output(index)
-    }
-    val rightAsOfExpr = rightAsOf.expr.transformUp {
-      case a: AttributeReference if other.logicalPlan.outputSet.contains(a) =>
-        val index = other.logicalPlan.output.indexWhere(_.exprId == a.exprId)
-        joined.right.output(index)
-    }
-    withPlan {
+
+    def createAsOfJoinPlan(joinPlan: Join): AsOfJoin = {
+      val leftAsOfExpr = leftAsOf.expr.transformUp {
+        case a: AttributeReference if logicalPlan.outputSet.contains(a) =>
+          val index = logicalPlan.output.indexWhere(_.exprId == a.exprId)
+          joinPlan.left.output(index)
+      }
+      val rightAsOfExpr = rightAsOf.expr.transformUp {
+        case a: AttributeReference if other.logicalPlan.outputSet.contains(a) =>
+          val index = other.logicalPlan.output.indexWhere(_.exprId == a.exprId)
+          joinPlan.right.output(index)
+      }
       AsOfJoin(
-        joined.left, joined.right,
+        joinPlan.left, joinPlan.right,
         leftAsOfExpr, rightAsOfExpr,
-        joined.condition,
-        joined.joinType,
+        joinPlan.condition,
+        joinPlan.joinType,
         Option(tolerance).map(_.expr),
         allowExactMatches,
         AsOfJoinDirection(direction)
       )
+    }
+
+    resolveSelfJoinCondition(other, Option(joinExprs), joinType) match {
+      case project @ Project(_, join: Join) =>
+        val newProjectPlan = project.copy(child = createAsOfJoinPlan(join))
+        newProjectPlan.copyTagsFrom(project)
+        withPlan { newProjectPlan }
+      case join: Join => withPlan { createAsOfJoinPlan(join) }
+      case plan => throw SparkException.internalError(
+        s"Unexpected plan type: ${plan.getClass.getName} returned from self join resolution.")
     }
   }
 
@@ -1103,8 +1192,9 @@ class Dataset[T] private[sql](
       case Distinct(u: Union) =>
         Distinct(flattenUnion(u, isUnionDistinct = true))
       // Only handle distinct-like 'Deduplicate', where the keys == output
-      case Deduplicate(keys: Seq[Attribute], u: Union) if AttributeSet(keys) == u.outputSet =>
-        Deduplicate(keys, flattenUnion(u, isUnionDistinct = true))
+      case d @ Deduplicate(keys: Seq[Attribute], u: Union, _)
+          if AttributeSet(keys) == u.outputSet =>
+        d.copy(child = flattenUnion(u, isUnionDistinct = true))
       case u: Union =>
         flattenUnion(u, isUnionDistinct = false)
     }
@@ -1120,7 +1210,7 @@ class Dataset[T] private[sql](
         changed = true
         children
       // Only handle distinct-like 'Deduplicate', where the keys == output
-      case Deduplicate(keys: Seq[Attribute], child @ Union(children, byName, allowMissingCol))
+      case Deduplicate(keys: Seq[Attribute], child @ Union(children, byName, allowMissingCol), _)
           if AttributeSet(keys) == child.outputSet && isUnionDistinct && byName == u.byName &&
             allowMissingCol == u.allowMissingCol =>
         changed = true
@@ -1285,7 +1375,7 @@ class Dataset[T] private[sql](
     }
   }
 
-  protected[spark] def withColumnsRenamed(
+  override protected[spark] def withColumnsRenamed(
       colNames: Seq[String],
       newColNames: Seq[String]): DataFrame = {
     require(colNames.size == newColNames.size,
@@ -1328,41 +1418,41 @@ class Dataset[T] private[sql](
   }
 
   /** @inheritdoc */
-  def dropDuplicates(): Dataset[T] = dropDuplicates(this.columns)
-
-  /** @inheritdoc */
-  def dropDuplicates(colNames: Seq[String]): Dataset[T] = withSameTypedPlan {
-    val groupCols = groupColsFromDropDuplicates(colNames)
-    Deduplicate(groupCols, logicalPlan)
+  def dropDuplicates(): Dataset[T] = withSameTypedPlan {
+    UnresolvedDeduplicate(
+      keySpec = DeduplicateAllColumnsAsKey,
+      withinWatermark = false,
+      viaSparkClassic = true,
+      child = logicalPlan)
   }
 
   /** @inheritdoc */
-  def dropDuplicatesWithinWatermark(): Dataset[T] = {
-    dropDuplicatesWithinWatermark(this.columns)
+  def dropDuplicates(colNames: Seq[String]): Dataset[T] = withSameTypedPlan {
+    UnresolvedDeduplicate(
+      keySpec = DeduplicateKeyColumns(colNames),
+      withinWatermark = false,
+      viaSparkClassic = true,
+      child = logicalPlan)
+  }
+
+  /** @inheritdoc */
+  def dropDuplicatesWithinWatermark(): Dataset[T] = withSameTypedPlan {
+    // UnsupportedOperationChecker will fail the query if this is called with batch Dataset.
+    UnresolvedDeduplicate(
+      keySpec = DeduplicateAllColumnsAsKey,
+      withinWatermark = true,
+      viaSparkClassic = true,
+      child = logicalPlan)
   }
 
   /** @inheritdoc */
   def dropDuplicatesWithinWatermark(colNames: Seq[String]): Dataset[T] = withSameTypedPlan {
-    val groupCols = groupColsFromDropDuplicates(colNames)
     // UnsupportedOperationChecker will fail the query if this is called with batch Dataset.
-    DeduplicateWithinWatermark(groupCols, logicalPlan)
-  }
-
-  private def groupColsFromDropDuplicates(colNames: Seq[String]): Seq[Attribute] = {
-    val resolver = sparkSession.sessionState.analyzer.resolver
-    val allColumns = queryExecution.analyzed.output
-    // SPARK-31990: We must keep `toSet.toSeq` here because of the backward compatibility issue
-    // (the Streaming's state store depends on the `groupCols` order).
-    colNames.toSet.toSeq.flatMap { (colName: String) =>
-      // It is possibly there are more than one columns with the same name,
-      // so we call filter instead of find.
-      val cols = allColumns.filter(col => resolver(col.name, colName))
-      if (cols.isEmpty) {
-        throw QueryCompilationErrors.cannotResolveColumnNameAmongAttributesError(
-          colName, schema.fieldNames.mkString(", "))
-      }
-      cols
-    }
+    UnresolvedDeduplicate(
+      keySpec = DeduplicateKeyColumns(colNames),
+      withinWatermark = true,
+      viaSparkClassic = true,
+      child = logicalPlan)
   }
 
   /** @inheritdoc */
@@ -1439,15 +1529,10 @@ class Dataset[T] private[sql](
       funcCol: Column,
       isBarrier: Boolean = false,
       profile: ResourceProfile = null): DataFrame = {
-    val func = funcCol.expr
     Dataset.ofRows(
       sparkSession,
-      MapInPandas(
-        func,
-        toAttributes(func.dataType.asInstanceOf[StructType]),
-        logicalPlan,
-        isBarrier,
-        Option(profile)))
+      sparkSession.sessionState.externalUDFPlanner.planPythonMapInPandas(
+        funcCol.expr, logicalPlan, isBarrier, Option(profile)))
   }
 
   /**
@@ -1459,15 +1544,10 @@ class Dataset[T] private[sql](
       funcCol: Column,
       isBarrier: Boolean = false,
       profile: ResourceProfile = null): DataFrame = {
-    val func = funcCol.expr
     Dataset.ofRows(
       sparkSession,
-      MapInArrow(
-        func,
-        toAttributes(func.dataType.asInstanceOf[StructType]),
-        logicalPlan,
-        isBarrier,
-        Option(profile)))
+      sparkSession.sessionState.externalUDFPlanner.planPythonMapInArrow(
+        funcCol.expr, logicalPlan, isBarrier, Option(profile)))
   }
 
   /** @inheritdoc */
@@ -1520,6 +1600,12 @@ class Dataset[T] private[sql](
     withSameTypedPlan {
       RepartitionByExpression(partitionExprs.map(_.expr), logicalPlan, numPartitions)
     }
+  }
+
+  /** @inheritdoc */
+  def repartitionById(numPartitions: Int, partitionIdExpr: Column): Dataset[T] = {
+    val directShufflePartitionIdCol = Column(DirectShufflePartitionID(partitionIdExpr.expr))
+    repartitionByExpression(Some(numPartitions), Seq(directShufflePartitionIdCol))
   }
 
   protected def repartitionByRange(
@@ -1705,8 +1791,7 @@ class Dataset[T] private[sql](
         fr.inputFiles
       case r: HiveTableRelation =>
         r.tableMeta.storage.locationUri.map(_.toString).toArray
-      case DataSourceV2ScanRelation(DataSourceV2Relation(table: FileTable, _, _, _, _),
-          _, _, _, _) =>
+      case ExtractV2ScanInfo(ExtractV2Table(table: FileTable), _, _) =>
         table.fileIndex.inputFiles
     }.flatten
     files.toSet.toArray
@@ -1917,11 +2002,18 @@ class Dataset[T] private[sql](
   override def sample(fraction: Double, seed: Long): Dataset[T] = super.sample(fraction, seed)
 
   /** @inheritdoc */
-  override def sample(fraction: Double): Dataset[T] = super.sample(fraction)
+  override def sample(fraction: Double): Dataset[T] = {
+    withSameTypedPlan {
+      Sample(0.0, fraction, withReplacement = false, None, logicalPlan)
+    }
+  }
 
   /** @inheritdoc */
-  override def sample(withReplacement: Boolean, fraction: Double): Dataset[T] =
-    super.sample(withReplacement, fraction)
+  override def sample(withReplacement: Boolean, fraction: Double): Dataset[T] = {
+    withSameTypedPlan {
+      Sample(0.0, fraction, withReplacement, None, logicalPlan)
+    }
+  }
 
   /** @inheritdoc */
   override def dropDuplicates(colNames: Array[String]): Dataset[T] = super.dropDuplicates(colNames)
@@ -2032,26 +2124,21 @@ class Dataset[T] private[sql](
   ////////////////////////////////////////////////////////////////////////////
 
   /**
-   * It adds a new long column with the name `name` that increases one by one.
-   * This is for 'distributed-sequence' default index in pandas API on Spark.
-   */
-  private[sql] def withSequenceColumn(name: String) = {
-    select(Column(DistributedSequenceID()).alias(name), col("*"))
-  }
-
-  /**
    * Converts a JavaRDD to a PythonRDD.
    */
   private[sql] def javaToPython: JavaRDD[Array[Byte]] = {
     val structType = schema  // capture it for closure
-    val rdd = queryExecution.toRdd.map(EvaluatePython.toJava(_, structType))
+    val binaryAsBytes = sparkSession.sessionState.conf.pysparkBinaryAsBytes  // capture config value
+    val rdd = queryExecution.toRdd.map(row =>
+      EvaluatePython.toJava(row, structType, binaryAsBytes))
     EvaluatePython.javaToPython(rdd)
   }
 
   private[sql] def collectToPython(): Array[Any] = {
     EvaluatePython.registerPicklers()
     withAction("collectToPython", queryExecution) { plan =>
-      val toJava: (Any) => Any = EvaluatePython.toJava(_, schema)
+      val binaryAsBytes = sparkSession.sessionState.conf.pysparkBinaryAsBytes
+      val toJava: (Any) => Any = EvaluatePython.toJava(_, schema, binaryAsBytes)
       val iter: Iterator[Array[Byte]] = new SerDeUtil.AutoBatchedPickler(
         plan.executeCollect().iterator.map(toJava))
       PythonRDD.serveIterator(iter, "serve-DataFrame")
@@ -2061,7 +2148,8 @@ class Dataset[T] private[sql](
   private[sql] def tailToPython(n: Int): Array[Any] = {
     EvaluatePython.registerPicklers()
     withAction("tailToPython", queryExecution) { plan =>
-      val toJava: (Any) => Any = EvaluatePython.toJava(_, schema)
+      val binaryAsBytes = sparkSession.sessionState.conf.pysparkBinaryAsBytes
+      val toJava: (Any) => Any = EvaluatePython.toJava(_, schema, binaryAsBytes)
       val iter: Iterator[Array[Byte]] = new SerDeUtil.AutoBatchedPickler(
         plan.executeTail(n).iterator.map(toJava))
       PythonRDD.serveIterator(iter, "serve-DataFrame")
@@ -2074,7 +2162,9 @@ class Dataset[T] private[sql](
     EvaluatePython.registerPicklers()
     val numRows = _numRows.max(0).min(ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH - 1)
     val rows = getRows(numRows, truncate).map(_.toArray).toArray
-    val toJava: (Any) => Any = EvaluatePython.toJava(_, ArrayType(ArrayType(StringType)))
+    val binaryAsBytes = sparkSession.sessionState.conf.pysparkBinaryAsBytes
+    val toJava: (Any) => Any =
+      EvaluatePython.toJava(_, ArrayType(ArrayType(StringType)), binaryAsBytes)
     val iter: Iterator[Array[Byte]] = new SerDeUtil.AutoBatchedPickler(
       rows.iterator.map(toJava))
     PythonRDD.serveIterator(iter, "serve-GetRows")
@@ -2228,9 +2318,11 @@ class Dataset[T] private[sql](
    */
   private def withAction[U](name: String, qe: QueryExecution)(action: SparkPlan => U) = {
     SQLExecution.withNewExecutionId(qe, Some(name)) {
-      QueryExecution.withInternalError(s"""The "$name" action failed.""") {
-        qe.executedPlan.resetMetrics()
-        action(qe.executedPlan)
+      qe.withQueryExecutionId(sparkSession) {
+        QueryExecution.withInternalError(s"""The "$name" action failed.""") {
+          qe.executedPlan.resetMetrics()
+          action(qe.executedPlan)
+        }
       }
     }
   }
@@ -2308,14 +2400,13 @@ class Dataset[T] private[sql](
   }
 
   /** Convert to an RDD of serialized ArrowRecordBatches. */
-  private[sql] def toArrowBatchRdd(plan: SparkPlan): RDD[Array[Byte]] = {
+  private def toArrowBatchRddImpl(
+      plan: SparkPlan,
+      maxRecordsPerBatch: Int,
+      timeZoneId: String,
+      errorOnDuplicatedFieldNames: Boolean,
+      largeVarTypes: Boolean): RDD[Array[Byte]] = {
     val schemaCaptured = this.schema
-    val maxRecordsPerBatch = sparkSession.sessionState.conf.arrowMaxRecordsPerBatch
-    val timeZoneId = sparkSession.sessionState.conf.sessionLocalTimeZone
-    val errorOnDuplicatedFieldNames =
-      sparkSession.sessionState.conf.pandasStructHandlingMode == "legacy"
-    val largeVarTypes =
-      sparkSession.sessionState.conf.arrowUseLargeVarTypes
     plan.execute().mapPartitionsInternal { iter =>
       val context = TaskContext.get()
       ArrowConverters.toBatchIterator(
@@ -2329,8 +2420,25 @@ class Dataset[T] private[sql](
     }
   }
 
-  // This is only used in tests, for now.
-  private[sql] def toArrowBatchRdd: RDD[Array[Byte]] = {
+  private[sql] def toArrowBatchRdd(
+      maxRecordsPerBatch: Int,
+      timeZoneId: String,
+      errorOnDuplicatedFieldNames: Boolean,
+      largeVarTypes: Boolean): RDD[Array[Byte]] = {
+    toArrowBatchRddImpl(queryExecution.executedPlan,
+      maxRecordsPerBatch, timeZoneId, errorOnDuplicatedFieldNames, largeVarTypes)
+  }
+
+  private[sql] def toArrowBatchRdd(plan: SparkPlan): RDD[Array[Byte]] = {
+    toArrowBatchRddImpl(
+      plan,
+      sparkSession.sessionState.conf.arrowMaxRecordsPerBatch,
+      sparkSession.sessionState.conf.sessionLocalTimeZone,
+      sparkSession.sessionState.conf.pandasStructHandlingMode == "legacy",
+      sparkSession.sessionState.conf.arrowUseLargeVarTypes)
+  }
+
+  private[spark] def toArrowBatchRdd: RDD[Array[Byte]] = {
     toArrowBatchRdd(queryExecution.executedPlan)
   }
 }

@@ -16,19 +16,21 @@
 #
 
 import math
-
-from typing import Any, TYPE_CHECKING, List, Optional, Union, Sequence
 from types import ModuleType
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Union
+
 from pyspark.errors import PySparkValueError
-from pyspark.sql import Column, functions as F
+from pyspark.sql import Column
+from pyspark.sql import functions as F
 from pyspark.sql.internal import InternalFunction as SF
 from pyspark.sql.pandas.utils import require_minimum_pandas_version
 from pyspark.sql.utils import NumpyHelper, require_minimum_plotly_version
 
 if TYPE_CHECKING:
-    from pyspark.sql import DataFrame, Row
     import pandas as pd
     from plotly.graph_objs import Figure
+
+    from pyspark.sql import DataFrame, Row
 
 
 class PySparkTopNPlotBase:
@@ -48,7 +50,8 @@ class PySparkTopNPlotBase:
 
 class PySparkSampledPlotBase:
     def get_sampled(self, sdf: "DataFrame") -> "pd.DataFrame":
-        from pyspark.sql import Observation, functions as F
+        from pyspark.sql import Observation
+        from pyspark.sql import functions as F
 
         max_rows = int(
             sdf._session.conf.get("spark.sql.pyspark.plotting.max_rows")  # type: ignore[arg-type]
@@ -329,8 +332,10 @@ class PySparkPlotAccessor:
             Name of column to be used as the category labels for the pie plot.
         y : str, optional
             Name of the column to plot. If not provided, `subplots=True` must be passed at `kwargs`.
+        subplots : bool, default False, optional (passed via `kwargs`)
+            If True, create a separate subplot for each numeric column in the DataFrame.
         **kwargs
-            Additional keyword arguments.
+            Additional keyword arguments. See also `subplots` above.
 
         Returns
         -------
@@ -371,7 +376,8 @@ class PySparkPlotAccessor:
         ----------
         column: str or list of str, optional
             Column name or list of names to be used for creating the box plot.
-            If None (default), all numeric columns will be used.
+            If None (default), all numeric columns will be used. If no numeric columns exist,
+            behavior may depend on the plot backend.
         **kwargs
             Extra arguments to `precision`: refer to a float that is used by
             pyspark to compute approximate statistics for building a boxplot.
@@ -424,7 +430,8 @@ class PySparkPlotAccessor:
             See KernelDensity in PySpark for more information.
         column: str or list of str, optional
             Column name or list of names to be used for creating the kde plot.
-            If None (default), all numeric columns will be used.
+            If None (default), all numeric columns will be used. If no numeric columns exist,
+            behavior may depend on the plot backend.
         ind : List of float, NumPy array or integer, optional
             Evaluation points for the estimated PDF. If None (default),
             1000 equally spaced points are used. If `ind` is a NumPy array, the
@@ -454,7 +461,7 @@ class PySparkPlotAccessor:
         self, column: Optional[Union[str, List[str]]] = None, bins: int = 10, **kwargs: Any
     ) -> "Figure":
         """
-        Draw one histogram of the DataFrame’s columns.
+        Draw one histogram of the DataFrame's columns.
 
         A `histogram`_ is a representation of the distribution of data.
 
@@ -463,8 +470,9 @@ class PySparkPlotAccessor:
         Parameters
         ----------
         column: str or list of str, optional
-            Column name or list of names to be used for creating the hostogram plot.
-            If None (default), all numeric columns will be used.
+            Column name or list of names to be used for creating the histogram plot.
+            If None (default), all numeric columns will be used. If no numeric columns exist,
+            behavior may depend on the plot backend.
         bins : integer, default 10
             Number of histogram bins to be used.
         **kwargs
@@ -525,9 +533,9 @@ class PySparkKdePlotBase:
         ind: Sequence[float],
     ) -> Column:
         # refers to org.apache.spark.mllib.stat.KernelDensity
-        assert bw_method is not None and isinstance(
-            bw_method, (int, float)
-        ), "'bw_method' must be set as a scalar number."
+        assert bw_method is not None and isinstance(bw_method, (int, float)), (
+            "'bw_method' must be set as a scalar number."
+        )
 
         assert ind is not None, "'ind' must be a scalar array."
 

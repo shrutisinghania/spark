@@ -19,8 +19,6 @@ package org.apache.spark.sql.connector.write;
 
 import org.apache.spark.annotation.Evolving;
 
-import java.util.Map;
-
 /**
  * An interface that defines how to write the data to data source for batch processing.
  * <p>
@@ -87,11 +85,18 @@ public interface BatchWrite {
    * disable this behavior by overriding {@link #useCommitCoordinator()}. If disabled, multiple
    * tasks may have committed successfully and one successful commit message per task will be
    * passed to this commit method. The remaining commit messages are ignored by Spark.
+   * <p>
+   * Note: this method signals that all data for this write operation has been successfully written.
+   * When this write is part of a
+   * {@link org.apache.spark.sql.connector.catalog.transactions.Transaction}, connector
+   * implementations should stage the written data durably but must not make it visible to readers.
+   * Changes are propagated and made visible only when the enclosing transaction is committed via
+   * {@link org.apache.spark.sql.connector.catalog.transactions.Transaction#commit()}.
    */
   void commit(WriterCommitMessage[] messages);
 
   /**
-   * Commits this writing job with a list of commit messages and operation metrics.
+   * Commits this writing job with a list of commit messages and write summary.
    * <p>
    * If this method fails (by throwing an exception), this writing job is considered to to have been
    * failed, and {@link #abort(WriterCommitMessage[])} would be called. The state of the destination
@@ -105,31 +110,11 @@ public interface BatchWrite {
    * <p>
    * @param messages a list of commit messages from successful data writers, produced by
    *                 {@link DataWriter#commit()}.
-   * @param metrics a map of operation metrics collected from the query producing write.
-   *                The keys will be prefixed by operation type, eg `merge`.
-   *                <p>
-   *                Currently supported metrics are:
-   *                <ul>
-   *                  <li>Operation Type = `merge`
-   *                    <ul>
-   *                      <li>`numTargetRowsCopied`: number of target rows copied unmodified because
-   *                      they did not match any action</li>
-   *                      <li>`numTargetRowsDeleted`: number of target rows deleted</li>
-   *                      <li>`numTargetRowsUpdated`: number of target rows updated</li>
-   *                      <li>`numTargetRowsInserted`: number of target rows inserted</li>
-   *                      <li>`numTargetRowsMatchedUpdated`: number of target rows updated by a
-   *                      matched clause</li>
-   *                      <li>`numTargetRowsMatchedDeleted`: number of target rows deleted by a
-   *                      matched clause</li>
-   *                      <li>`numTargetRowsNotMatchedBySourceUpdated`: number of target rows
-   *                      updated by a not matched by source clause</li>
-   *                      <li>`numTargetRowsNotMatchedBySourceDeleted`: number of target rows
-   *                      deleted by a not matched by source clause</li>
-   *                    </ul>
-   *                  </li>
-   *                </ul>
+   * @param summary an informational summary collected in a best-effort from the operation
+   *                producing write. Currently supported summary fields are provided through
+   *                implementations of {@link WriteSummary}.
    */
-  default void commit(WriterCommitMessage[] messages, Map<String, Long> metrics) {
+  default void commit(WriterCommitMessage[] messages, WriteSummary summary) {
     commit(messages);
   }
 

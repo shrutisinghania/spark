@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import Callable, Generic, Optional, Type, Union, TYPE_CHECKING
 import warnings
+from typing import TYPE_CHECKING, Callable, Generic, Optional, Type, Union
 
 from pyspark.pandas._typing import T
 
@@ -357,12 +357,14 @@ def register_index_accessor(name: str) -> Callable[[Type[T]], Type[T]]:
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
+
     import numpy
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.extensions
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -374,7 +376,7 @@ def _test() -> None:
         .appName("pyspark.pandas.extensions tests")
         .getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.extensions,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

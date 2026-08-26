@@ -14,14 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from typing import overload, Callable, Optional, TypeVar, Union
+from typing import Callable, Optional, TypeVar, Union, overload
 
 from pyspark.serializers import NoOpSerializer
 from pyspark.storagelevel import StorageLevel
 from pyspark.streaming import DStream
 from pyspark.streaming.context import StreamingContext
 from pyspark.util import _print_missing_jar
-
 
 __all__ = ["KinesisUtils", "InitialPositionInStream", "MetricsLevel", "utf8_decoder"]
 
@@ -63,8 +62,7 @@ class KinesisUtils:
         stsAssumeRoleArn: Optional[str] = ...,
         stsSessionName: Optional[str] = ...,
         stsExternalId: Optional[str] = ...,
-    ) -> "DStream[Optional[str]]":
-        ...
+    ) -> "DStream[Optional[str]]": ...
 
     @staticmethod
     @overload
@@ -84,8 +82,7 @@ class KinesisUtils:
         stsAssumeRoleArn: Optional[str] = ...,
         stsSessionName: Optional[str] = ...,
         stsExternalId: Optional[str] = ...,
-    ) -> "DStream[T]":
-        ...
+    ) -> "DStream[T]": ...
 
     @staticmethod
     def createStream(

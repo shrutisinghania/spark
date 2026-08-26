@@ -375,6 +375,14 @@ logging into the data sources.
     <td>read</td>
   </tr>
   <tr>
+    <td><code>preferTimestampNanos</code></td>
+    <td>false</td>
+    <td>
+      When the option is set to <code>true</code>, a driver TIMESTAMP column that reports a sub-microsecond fractional-second scale (7-9) is inferred as one of the nanosecond-capable timestamp types (<code>TIMESTAMP_NTZ(p)</code> when <code>preferTimestampNTZ</code> is also <code>true</code>, otherwise <code>TIMESTAMP_LTZ(p)</code>). Otherwise such columns keep the historical microsecond mapping. This option only takes effect when the <code>spark.sql.timestampNanosTypes.enabled</code> preview flag is enabled; when that flag is off, setting this option alone leaves the inferred schema unchanged.
+    </td>
+    <td>read</td>
+  </tr>
+  <tr>
     <td><code>hint</code></td>
     <td>(none)</td>
     <td>
@@ -389,12 +397,17 @@ Before using <code>keytab</code> and <code>principal</code> configuration option
 * The included JDBC driver version supports kerberos authentication with keytab.
 * There is a built-in connection provider which supports the used database.
 
-There is a built-in connection providers for the following databases:
+There are built-in connection providers for the following databases:
+* Databricks
 * DB2
-* MariaDB
-* MS Sql
+* Derby (deprecated)
+* H2
+* MariaDB and MySQL
+* Microsoft SQL Server
 * Oracle
 * PostgreSQL
+* Snowflake
+* Teradata
 
 If the requirements are not met, please consider using the <code>JdbcConnectionProvider</code> developer API to handle custom authentication.
 

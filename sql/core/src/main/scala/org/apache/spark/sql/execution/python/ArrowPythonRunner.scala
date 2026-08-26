@@ -18,30 +18,41 @@
 package org.apache.spark.sql.execution.python
 
 import java.io.DataOutputStream
+import java.util
 
 import org.apache.spark.api.python._
+import org.apache.spark.internal.config.{ConfigEntry, OptionalConfigEntry}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.python.EvalPythonExec.ArgumentMetadata
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.util.ArrowUtils
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-abstract class BaseArrowPythonRunner(
+abstract class BaseArrowPythonRunner[IN, OUT <: AnyRef](
     funcs: Seq[(ChainedPythonFunctions, Long)],
     evalType: Int,
     argOffsets: Array[Array[Int]],
-    _schema: StructType,
-    _timeZoneId: String,
+    override protected val schema: StructType,
+    override protected val timeZoneId: String,
     protected override val largeVarTypes: Boolean,
-    protected override val workerConf: Map[String, String],
     override val pythonMetrics: Map[String, SQLMetric],
-    jobArtifactUUID: Option[String])
-  extends BasePythonRunner[Iterator[InternalRow], ColumnarBatch](
+    jobArtifactUUID: Option[String],
+    sessionUUID: Option[String])
+  extends BasePythonRunner[IN, OUT](
     funcs.map(_._1), evalType, argOffsets, jobArtifactUUID, pythonMetrics)
-  with BasicPythonArrowInput
-  with BasicPythonArrowOutput {
+  with PythonArrowInput[IN]
+  with PythonArrowOutput[OUT] {
+  ArrowUtils.failDuplicatedFieldNames(schema)
 
+  override val envVars: util.Map[String, String] = {
+    val envVars = new util.HashMap(funcs.head._1.funcs.head.envVars)
+    sessionUUID.foreach { uuid =>
+      envVars.put("PYSPARK_SPARK_SESSION_UUID", uuid)
+    }
+    envVars
+  }
   override val pythonExec: String =
     SQLConf.get.pysparkWorkerPythonExecutable.getOrElse(
       funcs.head._1.funcs.head.pythonExec)
@@ -51,22 +62,35 @@ abstract class BaseArrowPythonRunner(
   override val killOnIdleTimeout: Boolean = SQLConf.get.pythonUDFWorkerKillOnIdleTimeout
   override val tracebackDumpIntervalSeconds: Long =
     SQLConf.get.pythonUDFWorkerTracebackDumpIntervalSeconds
-
-  override val errorOnDuplicatedFieldNames: Boolean = true
+  override val killWorkerOnFlushFailure: Boolean =
+    SQLConf.get.pythonUDFDaemonKillWorkerOnFlushFailure
 
   override val hideTraceback: Boolean = SQLConf.get.pysparkHideTraceback
   override val simplifiedTraceback: Boolean = SQLConf.get.pysparkSimplifiedTraceback
+  override val tracebackWithLocals: Boolean = SQLConf.get.pysparkTracebackWithLocals
 
-  // Use lazy val to initialize the fields before these are accessed in [[PythonArrowInput]]'s
-  // constructor.
-  override protected lazy val timeZoneId: String = _timeZoneId
-  override protected lazy val schema: StructType = _schema
   override val bufferSize: Int = SQLConf.get.pandasUDFBufferSize
   require(
     bufferSize >= 4,
     "Pandas execution requires more than 4 bytes. Please set higher buffer. " +
       s"Please change '${SQLConf.PANDAS_UDF_BUFFER_SIZE.key}'.")
 }
+
+abstract class RowInputArrowPythonRunner(
+    funcs: Seq[(ChainedPythonFunctions, Long)],
+    evalType: Int,
+    argOffsets: Array[Array[Int]],
+    schema: StructType,
+    timeZoneId: String,
+    largeVarTypes: Boolean,
+    pythonMetrics: Map[String, SQLMetric],
+    jobArtifactUUID: Option[String],
+    sessionUUID: Option[String])
+  extends BaseArrowPythonRunner[Iterator[InternalRow], ColumnarBatch](
+    funcs, evalType, argOffsets, schema, timeZoneId, largeVarTypes,
+    pythonMetrics, jobArtifactUUID, sessionUUID)
+  with BasicPythonArrowInput
+  with BasicPythonArrowOutput
 
 /**
  * Similar to `PythonUDFRunner`, but exchange data with Python worker via Arrow stream.
@@ -75,19 +99,21 @@ class ArrowPythonRunner(
     funcs: Seq[(ChainedPythonFunctions, Long)],
     evalType: Int,
     argOffsets: Array[Array[Int]],
-    _schema: StructType,
-    _timeZoneId: String,
+    schema: StructType,
+    timeZoneId: String,
     largeVarTypes: Boolean,
-    workerConf: Map[String, String],
+    pythonRunnerConf: Map[String, String],
     pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
-    profiler: Option[String])
-  extends BaseArrowPythonRunner(
-    funcs, evalType, argOffsets, _schema, _timeZoneId, largeVarTypes, workerConf,
-    pythonMetrics, jobArtifactUUID) {
+    sessionUUID: Option[String])
+  extends RowInputArrowPythonRunner(
+    funcs, evalType, argOffsets, schema, timeZoneId, largeVarTypes,
+    pythonMetrics, jobArtifactUUID, sessionUUID) {
+
+  override protected def runnerConf: Map[String, String] = super.runnerConf ++ pythonRunnerConf
 
   override protected def writeUDF(dataOut: DataOutputStream): Unit =
-    PythonUDFRunner.writeUDFs(dataOut, funcs, argOffsets, profiler)
+    PythonUDFRunner.writeUDFs(dataOut, funcs, argOffsets)
 }
 
 /**
@@ -98,50 +124,80 @@ class ArrowPythonWithNamedArgumentRunner(
     funcs: Seq[(ChainedPythonFunctions, Long)],
     evalType: Int,
     argMetas: Array[Array[ArgumentMetadata]],
-    _schema: StructType,
-    _timeZoneId: String,
+    schema: StructType,
+    timeZoneId: String,
     largeVarTypes: Boolean,
-    workerConf: Map[String, String],
+    pythonRunnerConf: Map[String, String],
     pythonMetrics: Map[String, SQLMetric],
     jobArtifactUUID: Option[String],
-    profiler: Option[String])
-  extends BaseArrowPythonRunner(
-    funcs, evalType, argMetas.map(_.map(_.offset)), _schema, _timeZoneId, largeVarTypes, workerConf,
-    pythonMetrics, jobArtifactUUID) {
+    sessionUUID: Option[String],
+    // Per-UDF element-wise nesting depth, parallel to `funcs` (see
+    // `PythonUDF.elementwiseNestingDepth`). Empty (the default) means depth 1 for every UDF, so the
+    // many non-element-wise construction sites need not pass it.
+    elementwiseNestingDepths: Seq[Int] = Nil)
+  extends RowInputArrowPythonRunner(
+    funcs, evalType, argMetas.map(_.map(_.offset)), schema, timeZoneId, largeVarTypes,
+    pythonMetrics, jobArtifactUUID, sessionUUID) {
+
+  override protected def runnerConf: Map[String, String] = super.runnerConf ++ pythonRunnerConf
+
+  override protected def evalConf: Map[String, String] =
+    ArrowPythonRunner.elementwiseEvalConf(
+      super.evalConf, evalType, schema, elementwiseNestingDepths)
 
   override protected def writeUDF(dataOut: DataOutputStream): Unit = {
-    if (evalType == PythonEvalType.SQL_ARROW_BATCHED_UDF) {
-      PythonWorkerUtils.writeUTF(schema.json, dataOut)
-    }
-    PythonUDFRunner.writeUDFs(dataOut, funcs, argMetas, profiler)
+    PythonUDFRunner.writeUDFs(dataOut, funcs, argMetas)
   }
 }
 
 object ArrowPythonRunner {
+  /**
+   * Adds the `input_type` (and, for element-wise UDFs, the per-UDF `elementwise_nesting`) entries
+   * an Arrow runner sends to the worker via eval-conf. An element-wise UDF receives each argument
+   * as an `array<T>` column and flattens it, so like the Arrow batched UDF it needs the input
+   * schema to convert the incoming Arrow types; a lifted UDF from *nested* lambdas re-nests more
+   * than one level, so it also needs its per-UDF nesting depth. Shared by row and columnar runners.
+   */
+  def elementwiseEvalConf(
+      base: Map[String, String],
+      evalType: Int,
+      schema: StructType,
+      elementwiseNestingDepths: Seq[Int]): Map[String, String] = {
+    if (PythonEvalType.isElementwiseUDF(evalType)) {
+      base ++ Map(
+        "input_type" -> schema.json,
+        "elementwise_nesting" -> elementwiseNestingDepths.mkString(","))
+    } else if (evalType == PythonEvalType.SQL_ARROW_BATCHED_UDF) {
+      base ++ Map("input_type" -> schema.json)
+    } else {
+      base
+    }
+  }
+
   /** Return Map with conf settings to be used in ArrowPythonRunner */
   def getPythonRunnerConfMap(conf: SQLConf): Map[String, String] = {
-    val timeZoneConf = Seq(SQLConf.SESSION_LOCAL_TIMEZONE.key -> conf.sessionLocalTimeZone)
-    val pandasColsByName = Seq(SQLConf.PANDAS_GROUPED_MAP_ASSIGN_COLUMNS_BY_NAME.key ->
-      conf.pandasGroupedMapAssignColumnsByName.toString)
-    val arrowSafeTypeCheck = Seq(SQLConf.PANDAS_ARROW_SAFE_TYPE_CONVERSION.key ->
-      conf.arrowSafeTypeConversion.toString)
-    val arrowAyncParallelism = conf.pythonUDFArrowConcurrencyLevel.map(v =>
-      Seq(SQLConf.PYTHON_UDF_ARROW_CONCURRENCY_LEVEL.key -> v.toString)
-    ).getOrElse(Seq.empty)
-    val useLargeVarTypes = Seq(SQLConf.ARROW_EXECUTION_USE_LARGE_VAR_TYPES.key ->
-      conf.arrowUseLargeVarTypes.toString)
-    val legacyPandasConversion = Seq(
-      SQLConf.PYTHON_TABLE_UDF_LEGACY_PANDAS_CONVERSION_ENABLED.key ->
-      conf.legacyPandasConversion.toString)
-    val legacyPandasConversionUDF = Seq(
-      SQLConf.PYTHON_UDF_LEGACY_PANDAS_CONVERSION_ENABLED.key ->
-      conf.legacyPandasConversionUDF.toString)
-    val intToDecimalCoercion = Seq(
-      SQLConf.PYTHON_UDF_PANDAS_INT_TO_DECIMAL_COERCION_ENABLED.key ->
-      conf.getConf(SQLConf.PYTHON_UDF_PANDAS_INT_TO_DECIMAL_COERCION_ENABLED, false).toString)
-    Map(timeZoneConf ++ pandasColsByName ++ arrowSafeTypeCheck ++
-      arrowAyncParallelism ++ useLargeVarTypes ++
-      intToDecimalCoercion ++
-      legacyPandasConversion ++ legacyPandasConversionUDF: _*)
+    val confMap = collection.mutable.Map.empty[String, String]
+    Seq(
+      SQLConf.SESSION_LOCAL_TIMEZONE,
+      SQLConf.PANDAS_GROUPED_MAP_ASSIGN_COLUMNS_BY_NAME,
+      SQLConf.PANDAS_ARROW_SAFE_TYPE_CONVERSION,
+      SQLConf.ARROW_EXECUTION_USE_LARGE_VAR_TYPES,
+      SQLConf.PYTHON_TABLE_UDF_LEGACY_PANDAS_CONVERSION_ENABLED,
+      SQLConf.PYTHON_UDF_LEGACY_PANDAS_CONVERSION_ENABLED,
+      SQLConf.PYTHON_UDF_MAP_IN_BATCH_LEGACY_ACCEPT_ANY_ITERABLE_ENABLED,
+      SQLConf.PYTHON_UDF_PANDAS_INT_TO_DECIMAL_COERCION_ENABLED,
+      SQLConf.PYTHON_UDF_PANDAS_PREFER_INT_EXTENSION_DTYPE,
+      SQLConf.PYSPARK_BINARY_AS_BYTES,
+      // Optional
+      SQLConf.PYTHON_UDF_ARROW_CONCURRENCY_LEVEL,
+      SQLConf.PYTHON_UDF_PROFILER,
+      SQLConf.PYTHON_DATA_SOURCE_PROFILER
+    ).foreach {
+      case c: OptionalConfigEntry[_] =>
+        conf.getConf(c).foreach(v => confMap.update(c.key, v.toString))
+      case c: ConfigEntry[_] =>
+        confMap.update(c.key, conf.getConf(c).toString)
+    }
+    confMap.toMap
   }
 }

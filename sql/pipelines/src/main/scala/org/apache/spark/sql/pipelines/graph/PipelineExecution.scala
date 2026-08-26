@@ -46,10 +46,14 @@ class PipelineExecution(context: PipelineUpdateContext) {
   def startPipeline(): Unit = synchronized {
     // Initialize the graph.
     val resolvedGraph = resolveGraph()
+    if (context.fullRefreshTables.nonEmpty) {
+      State.reset(resolvedGraph, context)
+    }
+
     val initializedGraph = DatasetManager.materializeDatasets(resolvedGraph, context)
 
     // Execute the graph.
-    graphExecution = Option(
+    graphExecution = Some(
       new TriggeredGraphExecution(initializedGraph, context, onCompletion = terminationReason => {
         context.eventCallback(constructTerminationEvent(terminationReason))
       })
@@ -106,7 +110,8 @@ class PipelineExecution(context: PipelineUpdateContext) {
 
   private def resolveGraph(): DataflowGraph = {
     try {
-      context.unresolvedGraph.resolve().validate()
+      val sessionCaseSensitive = context.spark.sessionState.conf.caseSensitiveAnalysis
+      context.unresolvedGraph.resolve(sessionCaseSensitive).validate(sessionCaseSensitive)
     } catch {
       case e: UnresolvedPipelineException =>
         handleInvalidPipeline(e)
@@ -114,7 +119,7 @@ class PipelineExecution(context: PipelineUpdateContext) {
     }
   }
 
-  /** Waits for the execution to complete. Only used in tests */
+  /** Waits for the execution to complete. */
   private[sql] def awaitCompletion(): Unit = {
     graphExecution.foreach(_.awaitCompletion())
   }

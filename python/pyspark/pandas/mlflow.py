@@ -18,19 +18,19 @@
 """
 MLflow-related functions to load models and apply them to pandas-on-Spark dataframes.
 """
-from typing import List, Union
-from typing import Any
 
-import pandas as pd
+from typing import Any, List, Union
+
 import numpy as np
+import pandas as pd
 
-from pyspark.sql.types import DataType
-from pyspark.sql.functions import struct
-from pyspark.pandas._typing import Label, Dtype
-from pyspark.pandas.utils import lazy_property, default_session
+from pyspark.pandas._typing import Dtype, Label
 from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.series import Series, first_series
 from pyspark.pandas.typedef import as_spark_type
+from pyspark.pandas.utils import default_session, lazy_property
+from pyspark.sql.functions import struct
+from pyspark.sql.types import DataType
 
 __all__ = ["PythonModelWrapper", "load_model"]
 
@@ -141,7 +141,7 @@ def load_model(
     >>> import mlflow.sklearn
     >>> from tempfile import mkdtemp
     >>> d = mkdtemp("pandas_on_spark_mlflow")
-    >>> set_tracking_uri("file:%s"%d)
+    >>> set_tracking_uri(f"sqlite:///{d}/mlflow.db")
     >>> client = MlflowClient()
     >>> exp_id = mlflow.create_experiment("my_experiment")
     >>> exp = mlflow.set_experiment("my_experiment")
@@ -203,11 +203,12 @@ def load_model(
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.mlflow
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -216,7 +217,7 @@ def _test() -> None:
     spark = (
         SparkSession.builder.master("local[4]").appName("pyspark.pandas.mlflow tests").getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.mlflow,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

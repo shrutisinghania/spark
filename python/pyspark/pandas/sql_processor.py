@@ -16,19 +16,19 @@
 #
 
 import _string  # type: ignore[import-not-found]
-from typing import Any, Dict, Optional, Union, List
 import inspect
+from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 
-from pyspark.sql import SparkSession, DataFrame as SDataFrame
 from pyspark import pandas as ps  # For running doctests and reference resolution in PyCharm.
-from pyspark.pandas.utils import default_session
 from pyspark.pandas.frame import DataFrame
-from pyspark.pandas.series import Series
 from pyspark.pandas.internal import InternalFrame
 from pyspark.pandas.namespace import _get_index_map
-
+from pyspark.pandas.series import Series
+from pyspark.pandas.utils import default_session
+from pyspark.sql import DataFrame as SDataFrame
+from pyspark.sql import SparkSession
 
 __all__ = ["sql"]
 
@@ -293,13 +293,12 @@ class SQLProcessor:
         0   True  False
         """
         blocks = _string.formatter_parser(self._statement)
-        # TODO: use a string builder
-        res = ""
+        res = []
         try:
             for pre, inner, _, _ in blocks:
                 var_next = "" if inner is None else self._convert(inner)
-                res = res + pre + var_next
-            self._normalized_statement = res
+                res.append(pre + var_next)
+            self._normalized_statement = "".join(res)
 
             sdf = self._session.sql(self._normalized_statement)
         finally:
@@ -361,11 +360,12 @@ class SQLProcessor:
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.sql_processor
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -376,7 +376,7 @@ def _test() -> None:
         .appName("pyspark.pandas.sql_processor tests")
         .getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.sql_processor,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

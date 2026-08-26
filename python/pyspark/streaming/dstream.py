@@ -17,9 +17,10 @@
 
 import operator
 import time
-from itertools import chain
 from datetime import datetime
+from itertools import chain
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Generic,
@@ -30,18 +31,17 @@ from typing import (
     Tuple,
     TypeVar,
     Union,
-    TYPE_CHECKING,
     cast,
     overload,
 )
 
-from py4j.protocol import Py4JJavaError
 from py4j.java_gateway import JavaObject
+from py4j.protocol import Py4JJavaError
 
-from pyspark.storagelevel import StorageLevel
-from pyspark.streaming.util import rddToFileName, TransformFunction
-from pyspark.core.rdd import portable_hash, RDD
+from pyspark.core.rdd import RDD, portable_hash
 from pyspark.resultiterable import ResultIterable
+from pyspark.storagelevel import StorageLevel
+from pyspark.streaming.util import TransformFunction, rddToFileName
 
 if TYPE_CHECKING:
     from pyspark.serializers import Serializer
@@ -215,12 +215,10 @@ class DStream(Generic[T_co]):
         return self.transform(lambda rdd: rdd.partitionBy(numPartitions, partitionFunc))
 
     @overload
-    def foreachRDD(self: "DStream[T]", func: Callable[[RDD[T]], None]) -> None:
-        ...
+    def foreachRDD(self: "DStream[T]", func: Callable[[RDD[T]], None]) -> None: ...
 
     @overload
-    def foreachRDD(self: "DStream[T]", func: Callable[[datetime, RDD[T]], None]) -> None:
-        ...
+    def foreachRDD(self: "DStream[T]", func: Callable[[datetime, RDD[T]], None]) -> None: ...
 
     def foreachRDD(
         self: "DStream[T]",
@@ -383,14 +381,14 @@ class DStream(Generic[T_co]):
     #     return self.foreachRDD(saveAsPickleFile)
 
     @overload
-    def transform(self: "DStream[T]", func: Callable[[RDD[T]], RDD[U]]) -> "TransformedDStream[U]":
-        ...
+    def transform(
+        self: "DStream[T]", func: Callable[[RDD[T]], RDD[U]]
+    ) -> "TransformedDStream[U]": ...
 
     @overload
     def transform(
         self: "DStream[T]", func: Callable[[datetime, RDD[T]], RDD[U]]
-    ) -> "TransformedDStream[U]":
-        ...
+    ) -> "TransformedDStream[U]": ...
 
     def transform(
         self: "DStream[T]",
@@ -418,8 +416,7 @@ class DStream(Generic[T_co]):
         func: Callable[[RDD[T], RDD[U]], RDD[V]],
         other: "DStream[U]",
         keepSerializer: bool = ...,
-    ) -> "DStream[V]":
-        ...
+    ) -> "DStream[V]": ...
 
     @overload
     def transformWith(
@@ -427,8 +424,7 @@ class DStream(Generic[T_co]):
         func: Callable[[datetime, RDD[T], RDD[U]], RDD[V]],
         other: "DStream[U]",
         keepSerializer: bool = ...,
-    ) -> "DStream[V]":
-        ...
+    ) -> "DStream[V]": ...
 
     def transformWith(
         self: "DStream[T]",
@@ -818,7 +814,8 @@ class DStream(Generic[T_co]):
             return DStream(dstream.asJavaDStream(), self._ssc, self._sc.serializer)
         else:
             return reduced.window(windowDuration, slideDuration).reduceByKey(
-                func, numPartitions  # type: ignore[arg-type]
+                func,  # type: ignore[arg-type]
+                numPartitions,
             )
 
     def updateStateByKey(
@@ -883,16 +880,14 @@ class TransformedDStream(DStream[U]):
     """
 
     @overload
-    def __init__(self: DStream[U], prev: DStream[T], func: Callable[[RDD[T]], RDD[U]]):
-        ...
+    def __init__(self: DStream[U], prev: DStream[T], func: Callable[[RDD[T]], RDD[U]]): ...
 
     @overload
     def __init__(
         self: DStream[U],
         prev: DStream[T],
         func: Callable[[datetime, RDD[T]], RDD[U]],
-    ):
-        ...
+    ): ...
 
     def __init__(
         self,
@@ -911,9 +906,9 @@ class TransformedDStream(DStream[U]):
         if type(prev) is TransformedDStream and not prev.is_cached and not prev.is_checkpointed:
             prev_func: Callable = prev.func
             func = cast(Callable[[datetime, RDD[T]], RDD[U]], func)
-            self.func: Union[
-                Callable[[RDD[T]], RDD[U]], Callable[[datetime, RDD[T]], RDD[U]]
-            ] = lambda t, rdd: func(t, prev_func(t, rdd))
+            self.func: Union[Callable[[RDD[T]], RDD[U]], Callable[[datetime, RDD[T]], RDD[U]]] = (
+                lambda t, rdd: func(t, prev_func(t, rdd))
+            )
             self.prev: DStream[T] = prev.prev
         else:
             self.prev = prev

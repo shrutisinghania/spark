@@ -19,14 +19,14 @@ package org.apache.spark.sql.connect.planner
 
 import scala.jdk.CollectionConverters._
 
-import com.google.protobuf.ByteString
+import com.google.protobuf.{Any, ByteString, StringValue}
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.connect.proto
 import org.apache.spark.connect.proto.Expression.{Alias, ExpressionString, UnresolvedStar}
 import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.{UnresolvedAlias, UnresolvedFunction, UnresolvedRelation}
+import org.apache.spark.sql.catalyst.analysis.{RelationTimeTravel, UnresolvedAlias, UnresolvedFunction, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, UnsafeProjection}
 import org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan}
@@ -157,6 +157,65 @@ class SparkConnectPlannerSuite extends SparkFunSuite with SparkConnectPlanTest {
     val res = transform(proto.Relation.newBuilder.setRead(readWithTable).build())
     assert(res !== null)
     assert(res.nodeName == "UnresolvedRelation")
+  }
+
+  test("Read with at syntax time travel") {
+    // Version time travel
+    val read = proto.Read
+      .newBuilder()
+      .setNamedTable(proto.Read.NamedTable.newBuilder.setUnparsedIdentifier("name@v1").build())
+      .build()
+    val res = transform(proto.Relation.newBuilder.setRead(read).build())
+    res match {
+      case RelationTimeTravel(relation: UnresolvedRelation, timestamp, version) =>
+        assert(relation.multipartIdentifier === Seq("name"))
+        assert(timestamp.isEmpty)
+        assert(version === Some("1"))
+      case other => fail(s"Expected RelationTimeTravel but got: $other")
+    }
+
+    // Timestamp time travel
+    val tsRead = read.toBuilder
+      .setNamedTable(
+        proto.Read.NamedTable.newBuilder.setUnparsedIdentifier("name@20190129003758000").build())
+      .build()
+    transform(proto.Relation.newBuilder.setRead(tsRead).build()) match {
+      case RelationTimeTravel(relation: UnresolvedRelation, timestamp, version) =>
+        assert(relation.multipartIdentifier === Seq("name"))
+        assert(timestamp.isDefined)
+        assert(version.isEmpty)
+      case other => fail(s"Expected RelationTimeTravel but got: $other")
+    }
+
+    // Streaming reads do not support time travel.
+    val streamingRead = read.toBuilder.setIsStreaming(true).build()
+    val e = intercept[AnalysisException] {
+      transform(proto.Relation.newBuilder.setRead(streamingRead).build())
+    }
+    assert(e.getCondition === "UNSUPPORTED_FEATURE.TIME_TRAVEL")
+    val streamingTsRead = tsRead.toBuilder.setIsStreaming(true).build()
+    val tsErr = intercept[AnalysisException] {
+      transform(proto.Relation.newBuilder.setRead(streamingTsRead).build())
+    }
+    assert(tsErr.getCondition === "UNSUPPORTED_FEATURE.TIME_TRAVEL")
+
+    // A non-time-travel '@' suffix is a parse error.
+    val badRead = read.toBuilder
+      .setNamedTable(proto.Read.NamedTable.newBuilder.setUnparsedIdentifier("name@foo").build())
+      .build()
+    val pe = intercept[AnalysisException] {
+      transform(proto.Relation.newBuilder.setRead(badRead).build())
+    }
+    assert(pe.getCondition === "PARSE_SYNTAX_ERROR")
+
+    // A backticked '@' name stays a literal table name.
+    val quotedRead = read.toBuilder
+      .setNamedTable(proto.Read.NamedTable.newBuilder.setUnparsedIdentifier("`name@v1`").build())
+      .build()
+    transform(proto.Relation.newBuilder.setRead(quotedRead).build()) match {
+      case u: UnresolvedRelation => assert(u.multipartIdentifier === Seq("name@v1"))
+      case other => fail(s"Expected a literal UnresolvedRelation but got: $other")
+    }
   }
 
   test("Simple Table with options") {
@@ -597,6 +656,18 @@ class SparkConnectPlannerSuite extends SparkFunSuite with SparkConnectPlanTest {
     assert(array(2).toString == InternalRow(3, "kafka", 3, "kafka").toString)
   }
 
+  test("SPARK-58341: transform SQL with 5 or more positional arguments binds in order") {
+    val sql = proto.SQL
+      .newBuilder()
+      .setQuery("SELECT ?, ?, ?, ?, ?, ?")
+    (1 to 6).foreach { v =>
+      sql.addPosArguments(proto.Expression.newBuilder().setLiteral(toLiteralProto(v)))
+    }
+
+    val df = Dataset.ofRows(spark, transform(proto.Relation.newBuilder.setSql(sql).build()))
+    assert(df.collect() === Array(Row(1, 2, 3, 4, 5, 6)))
+  }
+
   test("transform UnresolvedStar with target field") {
     val rows = (0 until 10).map { i =>
       InternalRow(InternalRow(InternalRow(i, i + 1)))
@@ -962,6 +1033,69 @@ class SparkConnectPlannerSuite extends SparkFunSuite with SparkConnectPlanTest {
       !aggregateExpression.containsPattern(TreePattern.UNRESOLVED_ORDINAL)))
   }
 
+  test("SPARK-51820 Literals in SortOrder should only be replaced under Sort node") {
+    val schema = StructType(Seq(StructField("col1", IntegerType)))
+    val data = Seq(InternalRow(1))
+    val inputRows = data.map { row =>
+      val proj = UnsafeProjection.create(schema)
+      proj(row).copy()
+    }
+    val localRelation = createLocalRelationProto(schema, inputRows)
+
+    val sumFunction = proto.Expression
+      .newBuilder()
+      .setUnresolvedFunction(
+        proto.Expression.UnresolvedFunction
+          .newBuilder()
+          .setFunctionName("sum")
+          .addArguments(
+            proto.Expression
+              .newBuilder()
+              .setUnresolvedAttribute(proto.Expression.UnresolvedAttribute
+                .newBuilder()
+                .setUnparsedIdentifier("col1"))))
+      .build()
+
+    val windowExpression = proto.Expression
+      .newBuilder()
+      .setWindow(
+        proto.Expression.Window
+          .newBuilder()
+          .setWindowFunction(sumFunction)
+          .addOrderSpec(
+            proto.Expression.SortOrder
+              .newBuilder()
+              .setChild(proto.Expression
+                .newBuilder()
+                .setLiteral(proto.Expression.Literal.newBuilder().setInteger(4)))
+              .setDirection(proto.Expression.SortOrder.SortDirection.SORT_DIRECTION_ASCENDING)
+              .setNullOrdering(proto.Expression.SortOrder.NullOrdering.SORT_NULLS_FIRST)))
+      .build()
+
+    val aliasedWindowExpression = proto.Expression
+      .newBuilder()
+      .setAlias(
+        proto.Expression.Alias
+          .newBuilder()
+          .setExpr(windowExpression)
+          .addName("sum_over"))
+      .build()
+
+    val project = proto.Project
+      .newBuilder()
+      .setInput(localRelation)
+      .addExpressions(aliasedWindowExpression)
+      .build()
+
+    val result = transform(proto.Relation.newBuilder().setProject(project).build())
+    val df = Dataset.ofRows(spark, result)
+
+    val collected = df.collect()
+    assert(collected.length == 1)
+    assert(df.schema.fields.head.name == "sum_over")
+    assert(collected(0).getAs[Long]("sum_over") == 1L)
+  }
+
   test("Time literal") {
     val project = proto.Project.newBuilder
       .addExpressions(
@@ -1005,5 +1139,24 @@ class SparkConnectPlannerSuite extends SparkFunSuite with SparkConnectPlanTest {
         "23:59:59.999999999",
         "23:59:59.999999999",
         "23:59:59.999999999").toString)
+  }
+
+  test("No handler found for extension shows extension type URL - Relation extension") {
+    val extension = StringValue
+      .newBuilder()
+      .setValue("unknown-relation")
+      .build()
+    val relation = proto.Relation
+      .newBuilder()
+      .setExtension(Any.pack(extension))
+      .build()
+
+    val intercepted = intercept[InvalidPlanInput] {
+      transform(relation)
+    }
+
+    assert(
+      intercepted.getMessage.contains("No handler found for extension type: " +
+        "type.googleapis.com/google.protobuf.StringValue"))
   }
 }

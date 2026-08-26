@@ -23,8 +23,9 @@ import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
 import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.TransformWithStateKeyValueRowSchemaUtils._
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.statefulprocessor.ImplicitGroupingKeyTracker
+import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.timers.TimerStateUtils
 import org.apache.spark.sql.execution.streaming.operators.stateful.transformwithstate.ttl.StateTTL
-import org.apache.spark.sql.execution.streaming.state.StateStoreErrors
+import org.apache.spark.sql.execution.streaming.state.{IndexBasedStatePartitionKeyExtractor, NoopStatePartitionKeyExtractor, OfflineStateRepartitionErrors, StatePartitionKeyExtractor, StateStore, StateStoreErrors, StateStoreId}
 import org.apache.spark.sql.types._
 
 /**
@@ -116,14 +117,14 @@ class StateTypesEncoder[V](
       throw StateStoreErrors.implicitKeyNotFound(stateName)
     }
 
-    keySerializer.apply(keyOption.get).asInstanceOf[UnsafeRow]
+    keySerializer(keyOption.get).asInstanceOf[UnsafeRow]
   }
 
   /**
    * Encode the specified value in Spark UnsafeRow with no ttl.
    */
   def encodeValue(value: V): UnsafeRow = {
-    objToRowSerializer.apply(value).asInstanceOf[UnsafeRow]
+    objToRowSerializer(value).asInstanceOf[UnsafeRow]
   }
 
   /**
@@ -131,15 +132,15 @@ class StateTypesEncoder[V](
    * with provided ttl expiration.
    */
   def encodeValue(value: V, expirationMs: Long): UnsafeRow = {
-    val objRow: InternalRow = objToRowSerializer.apply(value)
-    valueTTLProjection.apply(InternalRow(objRow, expirationMs))
+    val objRow: InternalRow = objToRowSerializer(value)
+    valueTTLProjection(InternalRow(objRow, expirationMs))
   }
 
   def decodeValue(row: UnsafeRow): V = {
     if (hasTtl) {
-      rowToObjDeserializer.apply(row.getStruct(0, valEncoder.schema.length))
+      rowToObjDeserializer(row.getStruct(0, valEncoder.schema.length))
     } else {
-      rowToObjDeserializer.apply(row)
+      rowToObjDeserializer(row)
     }
   }
 
@@ -212,14 +213,14 @@ class CompositeKeyStateEncoder[K, V](
       throw StateStoreErrors.implicitKeyNotFound(stateName)
     }
     val groupingKey = keyOption.get
-    val groupingKeyRow = groupingKeySerializer.apply(groupingKey)
+    val groupingKeyRow = groupingKeySerializer(groupingKey)
 
     // Create the final unsafeRow mapping column name "key" to the keyRow
     groupingKeyProjection(InternalRow(groupingKeyRow))
   }
 
   def encodeUserKey(userKey: K): UnsafeRow = {
-    val userKeyRow = userKeySerializer.apply(userKey)
+    val userKeyRow = userKeySerializer(userKey)
 
     // Create the final unsafeRow mapping column name "userKey" to the userKeyRow
     userKeyProjection(InternalRow(userKeyRow))
@@ -236,8 +237,8 @@ class CompositeKeyStateEncoder[K, V](
     }
     val groupingKey = keyOption.get
 
-    val keyRow = groupingKeySerializer.apply(groupingKey)
-    val userKeyRow = userKeySerializer.apply(userKey)
+    val keyRow = groupingKeySerializer(groupingKey)
+    val userKeyRow = userKeySerializer(userKey)
 
     // Create the final unsafeRow combining the keyRow and userKeyRow
     compositeKeyProjection(InternalRow(keyRow, userKeyRow))
@@ -252,7 +253,7 @@ class CompositeKeyStateEncoder[K, V](
    * Only user key is returned though grouping key also exist in the row.
    */
   def decodeCompositeKey(row: UnsafeRow): K = {
-    userKeyRowToObjDeserializer.apply(row.getStruct(1, userKeyEnc.schema.length))
+    userKeyRowToObjDeserializer(row.getStruct(1, userKeyEnc.schema.length))
   }
 }
 
@@ -263,7 +264,7 @@ class TTLEncoder(schema: StructType) {
 
   // Take a groupingKey UnsafeRow and turn it into a (expirationMs, groupingKey) UnsafeRow.
   def encodeTTLRow(expirationMs: Long, elementKey: UnsafeRow): UnsafeRow = {
-    ttlKeyProjection.apply(
+    ttlKeyProjection(
       InternalRow(expirationMs, elementKey.asInstanceOf[InternalRow]))
   }
 }
@@ -293,21 +294,145 @@ class TimerKeyEncoder(keyExprEnc: ExpressionEncoder[Any]) {
   private val secIndexKeyProjection = UnsafeProjection.create(keySchemaForSecIndex)
 
   def encodedKey(groupingKey: Any, expiryTimestampMs: Long): UnsafeRow = {
-    val keyRow = keySerializer.apply(groupingKey)
-    keyRowProjection.apply(InternalRow(keyRow, expiryTimestampMs))
+    val keyRow = keySerializer(groupingKey)
+    keyRowProjection(InternalRow(keyRow, expiryTimestampMs))
   }
 
   def encodeSecIndexKey(groupingKey: Any, expiryTimestampMs: Long): UnsafeRow = {
-    val keyRow = keySerializer.apply(groupingKey)
-    secIndexKeyProjection.apply(InternalRow(expiryTimestampMs, keyRow))
+    val keyRow = keySerializer(groupingKey)
+    secIndexKeyProjection(InternalRow(expiryTimestampMs, keyRow))
   }
 
   def encodePrefixKey(groupingKey: Any): UnsafeRow = {
-    val keyRow = keySerializer.apply(groupingKey)
-    prefixKeyProjection.apply(InternalRow(keyRow))
+    val keyRow = keySerializer(groupingKey)
+    prefixKeyProjection(InternalRow(keyRow))
   }
 
   def decodePrefixKey(retUnsafeRow: UnsafeRow): Any = {
-    keyDeserializer.apply(retUnsafeRow)
+    keyDeserializer(retUnsafeRow)
+  }
+}
+
+/**
+ * For MapState main CF, the state key is the composite key (grouping key + user key) i.e.
+ * StructType("key": StructType, "userKey": StructType). The partition key
+ * is the grouping key i.e. first field.
+ */
+class MapStatePartitionKeyExtractor(stateKeySchema: StructType)
+  extends IndexBasedStatePartitionKeyExtractor(stateKeySchema, partitionKeyIndex = 0)
+
+/**
+ * TTL main CF have state keys with schema (expirationMs, elementKey). The partition key
+ * is the elementKey part. This is used by Value and List TTL main CF.
+ */
+class TTLStatePartitionKeyExtractor(stateKeySchema: StructType)
+  extends IndexBasedStatePartitionKeyExtractor(stateKeySchema, partitionKeyIndex = 1)
+
+/**
+ * For MapTTL CF, TTL keys have schema (expirationMs, elementKey),
+ * but for map, the elementKey is the composite key (grouping key, user key).
+ * Hence we need to extract the composite key from TTL key,
+ * then extract the grouping key from the composite key.
+ */
+class MapTTLStatePartitionKeyExtractor(stateKeySchema: StructType)
+  extends StatePartitionKeyExtractor {
+  // This will extract the compositeKey from the TTL key
+  private lazy val compositeKeyExtractor = new TTLStatePartitionKeyExtractor(stateKeySchema)
+  // This will extract the grouping key from the compositeKey
+  private lazy val partitionKeyExtractor =
+    new MapStatePartitionKeyExtractor(compositeKeyExtractor.partitionKeySchema)
+
+  override lazy val partitionKeySchema: StructType = partitionKeyExtractor.partitionKeySchema
+
+  override def partitionKey(stateKeyRow: UnsafeRow): UnsafeRow = {
+    partitionKeyExtractor.partitionKey(compositeKeyExtractor.partitionKey(stateKeyRow))
+  }
+}
+
+/**
+ * For extracting partition keys from Timer state keys (both event & processing time)
+ * Timer state has two key schemas:
+ * - Primary index CF: (key, expiryTimestampMs)
+ * - Secondary index CF: (expiryTimestampMs, key)
+ * The partition key for both is just the key field.
+ */
+class TimerStatePartitionKeyExtractor(
+  stateKeySchema: StructType, isSecondaryIndex: Boolean = false)
+  extends IndexBasedStatePartitionKeyExtractor(
+    stateKeySchema, partitionKeyIndex = if (isSecondaryIndex) 1 else 0)
+
+object TransformWithStatePartitionKeyExtractorFactory {
+  def create(
+      storeName: String,
+      colFamilyName: String,
+      stateKeySchema: StructType,
+      stateVariableInfo: TransformWithStateVariableInfo): StatePartitionKeyExtractor = {
+    require(storeName == StateStoreId.DEFAULT_STORE_NAME, "Store name must be default")
+    require(colFamilyName != StateStore.DEFAULT_COL_FAMILY_NAME, "Use non-default CF")
+
+    if (stateVariableInfo.ttlEnabled) {
+      createForTTL(colFamilyName, stateKeySchema, stateVariableInfo)
+    } else {
+      createForStateVarType(colFamilyName, stateKeySchema, stateVariableInfo)
+    }
+  }
+
+  private def createForTTL(
+      colFamilyName: String,
+      stateKeySchema: StructType,
+      stateVariableInfo: TransformWithStateVariableInfo): StatePartitionKeyExtractor = {
+    // TTL main CF
+    if (StateStoreColumnFamilySchemaUtils.isTtlColFamilyName(colFamilyName)) {
+      val stateName = StateStoreColumnFamilySchemaUtils
+        .getStateNameFromTtlColFamily(colFamilyName)
+      require(stateName == stateVariableInfo.stateName, "State name must match")
+
+      stateVariableInfo.stateVariableType match {
+        case StateVariableType.MapState => new MapTTLStatePartitionKeyExtractor(stateKeySchema)
+        case StateVariableType.ListState | StateVariableType.ValueState =>
+          new TTLStatePartitionKeyExtractor(stateKeySchema)
+        case _ => throw OfflineStateRepartitionErrors.unsupportedTransformWithStateVarTypeError(
+          checkpointLocation = "",
+          stateVariableInfo.stateVariableType.toString,
+          stateVariableInfo.ttlEnabled,
+          colFamilyName)
+      }
+    } else if (StateStoreColumnFamilySchemaUtils.isMinExpiryIndexCFName(colFamilyName)) {
+      val stateName = StateStoreColumnFamilySchemaUtils
+        .getStateNameFromMinExpiryIndexCFName(colFamilyName)
+      require(stateName == stateVariableInfo.stateName, "State name must match")
+
+      new NoopStatePartitionKeyExtractor(stateKeySchema)
+    } else if (StateStoreColumnFamilySchemaUtils.isCountIndexCFName(colFamilyName)) {
+      val stateName = StateStoreColumnFamilySchemaUtils
+        .getStateNameFromCountIndexCFName(colFamilyName)
+      require(stateName == stateVariableInfo.stateName, "State name must match")
+
+      new NoopStatePartitionKeyExtractor(stateKeySchema)
+    } else {
+      // TTL is enabled but this is the main CF for the state variable data
+      createForStateVarType(colFamilyName, stateKeySchema, stateVariableInfo)
+    }
+  }
+
+  private def createForStateVarType(
+      colFamilyName: String,
+      stateKeySchema: StructType,
+      stateVariableInfo: TransformWithStateVariableInfo): StatePartitionKeyExtractor = {
+    stateVariableInfo.stateVariableType match {
+      case StateVariableType.ListState | StateVariableType.ValueState =>
+        new NoopStatePartitionKeyExtractor(stateKeySchema)
+      case StateVariableType.MapState => new MapStatePartitionKeyExtractor(stateKeySchema)
+      case StateVariableType.TimerState =>
+        require(TimerStateUtils.isTimerCFName(colFamilyName),
+          s"Column family name must be for a timer: $colFamilyName")
+        new TimerStatePartitionKeyExtractor(
+          stateKeySchema, TimerStateUtils.isTimerSecondaryIndexCF(colFamilyName))
+      case _ => throw OfflineStateRepartitionErrors.unsupportedTransformWithStateVarTypeError(
+        checkpointLocation = "",
+        stateVariableInfo.stateVariableType.toString,
+        stateVariableInfo.ttlEnabled,
+        colFamilyName)
+    }
   }
 }

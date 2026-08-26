@@ -213,6 +213,7 @@ message ApplicationAttemptInfo {
   optional string spark_user = 6;
   bool completed = 7;
   optional string app_spark_version = 8;
+  optional int32 exit_code = 9;
 }
 
 message ApplicationInfo {
@@ -424,6 +425,7 @@ message SQLExecutionUIData {
   repeated int64 stages = 12;
   bool metric_values_is_null = 13;
   map<int64, string> metric_values = 14;
+  optional string query_id = 15;
 }
 
 message SparkPlanGraphNode {

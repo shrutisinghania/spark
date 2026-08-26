@@ -21,16 +21,19 @@ import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, Growable}
 import scala.util.{Left, Right}
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.{DataTypeMismatch, TypeCheckSuccess}
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.optimizer.NormalizeFloatingNumbers
 import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.catalyst.types.PhysicalDataType
 import org.apache.spark.sql.catalyst.util.{ArrayData, GenericArrayData, TypeUtils, UnsafeRowUtils}
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLExpr
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryErrorsBase}
 import org.apache.spark.sql.errors.DataTypeErrors.{toSQLId, toSQLType}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.types.StringTypeWithCollation
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.{ByteArray, UTF8String}
@@ -48,11 +51,16 @@ abstract class Collect[T <: Growable[Any] with Iterable[Any]] extends TypedImper
 
   override def nullable: Boolean = false
 
-  override def dataType: DataType = ArrayType(child.dataType, false)
+  // Subclasses can override bufferContainsNull to indicate if the result array contains nulls
+  override def dataType: DataType = ArrayType(child.dataType, bufferContainsNull)
 
   override def defaultResult: Option[Literal] = Option(Literal.create(Array(), dataType))
 
   protected def convertToBufferElement(value: Any): Any
+
+  // Subclasses can override this to allow nulls in buffer
+  // (e.g., CollectList with ignoreNulls=false)
+  protected def bufferContainsNull: Boolean = false
 
   override def update(buffer: T, input: InternalRow): T = {
     val value = child.eval(input)
@@ -72,7 +80,7 @@ abstract class Collect[T <: Growable[Any] with Iterable[Any]] extends TypedImper
   protected val bufferElementType: DataType
 
   private lazy val projection = UnsafeProjection.create(
-    Array[DataType](ArrayType(elementType = bufferElementType, containsNull = false)))
+    Array[DataType](ArrayType(elementType = bufferElementType, containsNull = bufferContainsNull)))
   private lazy val row = new UnsafeRow(1)
 
   override def serialize(obj: T): Array[Byte] = {
@@ -90,9 +98,16 @@ abstract class Collect[T <: Growable[Any] with Iterable[Any]] extends TypedImper
 
 /**
  * Collect a list of elements.
+ *
+ * @param ignoreNulls when true (IGNORE NULLS), null values are excluded from the result array.
+ *                    When false (RESPECT NULLS), null values are included in the result array.
  */
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Collects and returns a list of non-unique elements.",
+  arguments = """
+    Arguments:
+      * expr - An expression of any type whose values are collected into a list.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (1), (2), (1) AS tab(col);
@@ -107,14 +122,31 @@ abstract class Collect[T <: Growable[Any] with Iterable[Any]] extends TypedImper
 case class CollectList(
     child: Expression,
     mutableAggBufferOffset: Int = 0,
-    inputAggBufferOffset: Int = 0) extends Collect[mutable.ArrayBuffer[Any]]
+    inputAggBufferOffset: Int = 0,
+    ignoreNulls: Boolean = true) extends Collect[mutable.ArrayBuffer[Any]]
   with UnaryLike[Expression] {
 
-  def this(child: Expression) = this(child, 0, 0)
+  def this(child: Expression) = this(child, 0, 0, true)
+
+  // Buffer can contain nulls when ignoreNulls is false (RESPECT NULLS)
+  override protected def bufferContainsNull: Boolean = !ignoreNulls
 
   override lazy val bufferElementType = child.dataType
 
   override def convertToBufferElement(value: Any): Any = InternalRow.copyValue(value)
+
+  override def update(
+      buffer: mutable.ArrayBuffer[Any],
+      input: InternalRow): mutable.ArrayBuffer[Any] = {
+    val value = child.eval(input)
+    if (value != null) {
+      buffer += convertToBufferElement(value)
+    } else if (!ignoreNulls) {
+      // RESPECT NULLS: preserve null values in result
+      buffer += null
+    }
+    buffer
+  }
 
   override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate =
     copy(mutableAggBufferOffset = newMutableAggBufferOffset)
@@ -130,15 +162,33 @@ case class CollectList(
     new GenericArrayData(buffer.toArray)
   }
 
+  override def toString: String = {
+    val ignoreNullsStr = if (ignoreNulls) "" else " respect nulls"
+    s"$prettyName($child)$ignoreNullsStr"
+  }
+
+  override def sql(isDistinct: Boolean): String = {
+    val distinct = if (isDistinct) "DISTINCT " else ""
+    val nullsStr = if (ignoreNulls) "" else " RESPECT NULLS"
+    s"$prettyName($distinct${child.sql})$nullsStr"
+  }
+
   override protected def withNewChildInternal(newChild: Expression): CollectList =
     copy(child = newChild)
 }
 
 /**
  * Collect a set of unique elements.
+ *
+ * @param ignoreNulls when true (IGNORE NULLS), null values are excluded from the result array.
+ *                    When false (RESPECT NULLS), null values are included in the result array.
  */
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Collects and returns a set of unique elements.",
+  arguments = """
+    Arguments:
+      * expr - An expression of any type whose values are collected into a set.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (1), (2), (1) AS tab(col);
@@ -154,14 +204,41 @@ case class CollectList(
 case class CollectSet(
     child: Expression,
     mutableAggBufferOffset: Int = 0,
-    inputAggBufferOffset: Int = 0)
+    inputAggBufferOffset: Int = 0,
+    ignoreNulls: Boolean = true)
   extends Collect[mutable.HashSet[Any]] with QueryErrorsBase with UnaryLike[Expression] {
 
-  def this(child: Expression) = this(child, 0, 0)
+  def this(child: Expression) = this(child, 0, 0, true)
+
+  // Buffer can contain nulls when ignoreNulls is false (RESPECT NULLS)
+  override protected def bufferContainsNull: Boolean = !ignoreNulls
 
   override lazy val bufferElementType = child.dataType match {
     case BinaryType => ArrayType(ByteType)
+    // Float/double are keyed by their bit pattern (see convertToBufferElement), so the
+    // buffer holds the integral bits; eval() converts them back to float/double.
+    case DoubleType => LongType
+    case FloatType => IntegerType
     case other => other
+  }
+
+  override def update(
+      buffer: mutable.HashSet[Any],
+      input: InternalRow): mutable.HashSet[Any] = {
+    val value = child.eval(input)
+    if (value != null) {
+      buffer += convertToBufferElement(value)
+    } else if (!ignoreNulls) {
+      // RESPECT NULLS: preserve null value in result
+      buffer += null
+    }
+    buffer
+  }
+
+  @transient private lazy val complexNormalizer: Any => Any = {
+    val ref = BoundReference(0, child.dataType, nullable = true)
+    val proj = UnsafeProjection.create(NormalizeFloatingNumbers.normalize(ref))
+    (value: Any) => InternalRow.copyValue(proj(InternalRow(value)).get(0, child.dataType))
   }
 
   override def convertToBufferElement(value: Any): Any = child.dataType match {
@@ -171,13 +248,37 @@ case class CollectSet(
      * so we need to use a different catalyst value for arrays
      */
     case BinaryType => UnsafeArrayData.fromPrimitiveArray(value.asInstanceOf[Array[Byte]])
+    // mutable.HashSet[Any] compares boxed Double/Float with IEEE equality, where NaN != NaN,
+    // so normalizing the value alone wouldn't collapse NaNs - keying on doubleToLongBits/
+    // floatToIntBits does (and the NORMALIZER step keeps -0.0/0.0 deduped). Complex types
+    // instead dedup on a normalized UnsafeRow's binary form.
+    case DoubleType =>
+      java.lang.Double.doubleToLongBits(
+        NormalizeFloatingNumbers.DOUBLE_NORMALIZER(value).asInstanceOf[Double])
+    case FloatType =>
+      java.lang.Float.floatToIntBits(
+        NormalizeFloatingNumbers.FLOAT_NORMALIZER(value).asInstanceOf[Float])
+    case dt if NormalizeFloatingNumbers.needNormalize(dt) => complexNormalizer(value)
     case _ => InternalRow.copyValue(value)
   }
 
   override def eval(buffer: mutable.HashSet[Any]): Any = {
     val array = child.dataType match {
       case BinaryType =>
-        buffer.iterator.map(_.asInstanceOf[ArrayData].toByteArray()).toArray[Any]
+        buffer.iterator.map {
+          case null => null
+          case v => v.asInstanceOf[ArrayData].toByteArray()
+        }.toArray[Any]
+      case DoubleType =>
+        buffer.iterator.map {
+          case null => null
+          case v => java.lang.Double.longBitsToDouble(v.asInstanceOf[Long])
+        }.toArray[Any]
+      case FloatType =>
+        buffer.iterator.map {
+          case null => null
+          case v => java.lang.Float.intBitsToFloat(v.asInstanceOf[Int])
+        }.toArray[Any]
       case _ => buffer.toArray
     }
     new GenericArrayData(array)
@@ -208,7 +309,191 @@ case class CollectSet(
 
   override def createAggregationBuffer(): mutable.HashSet[Any] = mutable.HashSet.empty
 
+  override def toString: String = {
+    val ignoreNullsStr = if (ignoreNulls) "" else " respect nulls"
+    s"$prettyName($child)$ignoreNullsStr"
+  }
+
+  override def sql(isDistinct: Boolean): String = {
+    val distinct = if (isDistinct) "DISTINCT " else ""
+    val nullsStr = if (ignoreNulls) "" else " RESPECT NULLS"
+    s"$prettyName($distinct${child.sql})$nullsStr"
+  }
+
   override protected def withNewChildInternal(newChild: Expression): CollectSet =
+    copy(child = newChild)
+}
+
+/**
+ * Collect the distinct union of the elements of an array-typed input across rows.
+ *
+ * Unlike collect_set, whose input is a scalar and whose output is the set of those scalars,
+ * collect_union's input is itself an array and its output is the set of the array's
+ * *elements* unioned across all rows. The aggregation buffer holds only the distinct
+ * elements (a set), so its size is bounded by the element universe rather than by the
+ * number of input rows.
+ *
+ * Null handling mirrors collect_set: by default (IGNORE NULLS) null elements are dropped.
+ * With RESPECT NULLS, one null element is kept, in which case collect_union is equivalent to
+ * `array_distinct(flatten(collect_list(arr)))`.
+ *
+ * @param ignoreNulls when true (IGNORE NULLS, the default), null elements are excluded from
+ *                    the result array. When false (RESPECT NULLS), a single null element is
+ *                    kept.
+ */
+@ExpressionDescription(
+  usage =
+    "_FUNC_(expr) - Collects and returns the distinct union of the elements of array `expr`.",
+  arguments = """
+    Arguments:
+      * expr - An array expression whose elements are collected into a set across rows.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(col) FROM VALUES (array(1, 2)), (array(2, 3)), (array(1)) AS tab(col);
+       [1,2,3]
+  """,
+  note = """
+    The function is non-deterministic because the order of collected results depends
+    on the order of the rows which may be non-deterministic after a shuffle.
+  """,
+  group = "agg_funcs",
+  since = "4.3.0")
+case class CollectUnion(
+    child: Expression,
+    mutableAggBufferOffset: Int = 0,
+    inputAggBufferOffset: Int = 0,
+    ignoreNulls: Boolean = true)
+  extends Collect[mutable.HashSet[Any]] with QueryErrorsBase with UnaryLike[Expression] {
+
+  def this(child: Expression) = this(child, 0, 0, true)
+
+  // The input is guarded by checkInputDataTypes to be an ArrayType; this is its element type.
+  private lazy val elementType: DataType = child.dataType match {
+    case ArrayType(et, _) => et
+    case other => other
+  }
+
+  // The result array contains a null only when null elements are respected (RESPECT NULLS).
+  override protected def bufferContainsNull: Boolean = !ignoreNulls
+
+  // Result is array<elementType>; containsNull is true iff null elements are kept.
+  override def dataType: DataType = ArrayType(elementType, containsNull = bufferContainsNull)
+
+  // The buffer stores distinct elements. Mirror CollectSet's keying so equality is correct
+  // for float/double (bit pattern) and binary (byte array) element types.
+  override lazy val bufferElementType: DataType = elementType match {
+    case BinaryType => ArrayType(ByteType)
+    case DoubleType => LongType
+    case FloatType => IntegerType
+    case other => other
+  }
+
+  @transient private lazy val complexNormalizer: Any => Any = {
+    val ref = BoundReference(0, elementType, nullable = true)
+    val proj = UnsafeProjection.create(NormalizeFloatingNumbers.normalize(ref))
+    (value: Any) => InternalRow.copyValue(proj(InternalRow(value)).get(0, elementType))
+  }
+
+  override def convertToBufferElement(value: Any): Any = elementType match {
+    // See CollectSet.convertToBufferElement for why binary/float/double are keyed specially.
+    case BinaryType => UnsafeArrayData.fromPrimitiveArray(value.asInstanceOf[Array[Byte]])
+    case DoubleType =>
+      java.lang.Double.doubleToLongBits(
+        NormalizeFloatingNumbers.DOUBLE_NORMALIZER(value).asInstanceOf[Double])
+    case FloatType =>
+      java.lang.Float.floatToIntBits(
+        NormalizeFloatingNumbers.FLOAT_NORMALIZER(value).asInstanceOf[Float])
+    case dt if NormalizeFloatingNumbers.needNormalize(dt) => complexNormalizer(value)
+    case _ => InternalRow.copyValue(value)
+  }
+
+  // Iterate the input array and add each element to the set. NULL input arrays are skipped;
+  // a NULL element is dropped when ignoreNulls (IGNORE NULLS) and kept otherwise (RESPECT
+  // NULLS), where the HashSet naturally dedups it to a single null.
+  override def update(
+      buffer: mutable.HashSet[Any],
+      input: InternalRow): mutable.HashSet[Any] = {
+    val arr = child.eval(input)
+    if (arr != null) {
+      arr.asInstanceOf[ArrayData].foreach(elementType, (_, element: Any) =>
+        if (element != null) {
+          buffer += convertToBufferElement(element)
+        } else if (!ignoreNulls) {
+          buffer += null
+        })
+    }
+    buffer
+  }
+
+  override def eval(buffer: mutable.HashSet[Any]): Any = {
+    val array = elementType match {
+      case BinaryType =>
+        buffer.iterator.map {
+          case null => null
+          case v => v.asInstanceOf[ArrayData].toByteArray()
+        }.toArray[Any]
+      case DoubleType =>
+        buffer.iterator.map {
+          case null => null
+          case v => java.lang.Double.longBitsToDouble(v.asInstanceOf[Long])
+        }.toArray[Any]
+      case FloatType =>
+        buffer.iterator.map {
+          case null => null
+          case v => java.lang.Float.intBitsToFloat(v.asInstanceOf[Int])
+        }.toArray[Any]
+      case _ => buffer.toArray
+    }
+    new GenericArrayData(array)
+  }
+
+  override def checkInputDataTypes(): TypeCheckResult = child.dataType match {
+    case ArrayType(et, _)
+        if !et.existsRecursively(_.isInstanceOf[MapType]) && UnsafeRowUtils.isBinaryStable(et) =>
+      TypeCheckResult.TypeCheckSuccess
+    case ArrayType(_, _) =>
+      DataTypeMismatch(
+        errorSubClass = "UNSUPPORTED_INPUT_TYPE",
+        messageParameters = Map(
+          "functionName" -> toSQLId(prettyName),
+          "dataType" -> (s"${toSQLType(MapType)} " + "or \"COLLATED STRING\"")
+        )
+      )
+    case _ =>
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_INPUT_TYPE",
+        messageParameters = Map(
+          "paramIndex" -> ordinalNumber(0),
+          "requiredType" -> toSQLType(ArrayType),
+          "inputSql" -> toSQLExpr(child),
+          "inputType" -> toSQLType(child.dataType)
+        )
+      )
+  }
+
+  override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate =
+    copy(mutableAggBufferOffset = newMutableAggBufferOffset)
+
+  override def withNewInputAggBufferOffset(newInputAggBufferOffset: Int): ImperativeAggregate =
+    copy(inputAggBufferOffset = newInputAggBufferOffset)
+
+  override def prettyName: String = "collect_union"
+
+  override def createAggregationBuffer(): mutable.HashSet[Any] = mutable.HashSet.empty
+
+  override def toString: String = {
+    val ignoreNullsStr = if (ignoreNulls) "" else " respect nulls"
+    s"$prettyName($child)$ignoreNullsStr"
+  }
+
+  override def sql(isDistinct: Boolean): String = {
+    val distinct = if (isDistinct) "DISTINCT " else ""
+    val nullsStr = if (ignoreNulls) "" else " RESPECT NULLS"
+    s"$prettyName($distinct${child.sql})$nullsStr"
+  }
+
+  override protected def withNewChildInternal(newChild: Expression): CollectUnion =
     copy(child = newChild)
 }
 
@@ -283,10 +568,13 @@ private[aggregate] object CollectTopK {
   arguments = """
     Arguments:
       * expr - a string or binary expression to be concatenated.
+        An expression that evaluates to a string or binary.
       * delimiter - an optional string or binary foldable expression used to separate the input values.
         If NULL, the concatenation will be performed without a delimiter. Default is NULL.
+        An expression that evaluates to a string, binary, or null. Must be a constant.
       * key - an optional expression for ordering the input values. Multiple keys can be specified.
         If none are specified, the order of the rows in the result is non-deterministic.
+        An expression of any type.
   """,
   examples = """
     Examples:
@@ -322,7 +610,8 @@ case class ListAgg(
     inputAggBufferOffset: Int = 0)
   extends Collect[mutable.ArrayBuffer[Any]]
   with SupportsOrderingWithinGroup
-  with ImplicitCastInputTypes {
+  with ImplicitCastInputTypes
+  with AliasHelper {
 
   override def orderingFilled: Boolean = orderExpressions.nonEmpty
 
@@ -528,10 +817,166 @@ case class ListAgg(
     if (someOrder.isEmpty) {
       return true
     }
-    if (someOrder.size == 1 && someOrder.head.child.semanticEquals(child)) {
+    if (someOrder.size == 1 &&
+        trimAliases(someOrder.head.child).semanticEquals(trimAliases(child))) {
       return true
     }
     false
+  }
+
+  /**
+   * Returns true if the order value may be ambiguous after DISTINCT deduplication.
+   *
+   * For LISTAGG(DISTINCT child) WITHIN GROUP (ORDER BY order_expr), correctness requires
+   * a functional dependency (child -> order_expr, where equality is defined by GROUP BY
+   * semantics): each distinct child value must map to exactly one order value. Otherwise,
+   * after deduplication on child, the order value is ambiguous.
+   *
+   * When child = Cast(order_expr, T) where T is STRING or BINARY (LISTAGG's accepted input
+   * types), the functional dependency (child -> order_expr) is satisfied since casting to
+   * string/binary is injective for the types we allow. However, the cast must also be
+   * equality-preserving (order_expr -> child): GROUP BY-equal order values must produce
+   * GROUP BY-equal child values. Otherwise, the DISTINCT rewrite (which groups by child) may
+   * split values that should be in the same group, causing over-counting.
+   * For example, Float/Double violate this because -0.0 and 0.0 are GROUP BY-equal but cast
+   * to different strings. This is checked by [[isCastEqualityPreserving]] and
+   * [[isCastTargetEqualityPreserving]].
+   *
+   * Currently only detects these conditions for Cast.
+   * TODO(SPARK-55718): extend to detect other functional dependencies.
+   *
+   * Returns false when the order expression matches the child (i.e., [[needSaveOrderValue]]
+   * is false). Otherwise, the behavior depends on the
+   * [[SQLConf.LISTAGG_ALLOW_DISTINCT_CAST_WITH_ORDER]] config:
+   *  - If enabled, delegates to [[checkOrderValueDeterminism]] to determine whether the
+   *    order value is uniquely determined by the child.
+   *  - If disabled, any mismatch is considered ambiguous.
+   *
+   * @return true if ambiguity exists, false if the order value is deterministic
+   * @see [[throwDistinctOrderError]] to throw the appropriate error when this returns true
+   */
+  def hasDistinctOrderAmbiguity: Boolean = {
+    needSaveOrderValue && {
+      if (SQLConf.get.listaggAllowDistinctCastWithOrder) {
+        checkOrderValueDeterminism match {
+          case OrderDeterminismResult.Deterministic => false
+          case _ => true
+        }
+      } else {
+        true
+      }
+    }
+  }
+
+  def throwDistinctOrderError(): Nothing = {
+    if (SQLConf.get.listaggAllowDistinctCastWithOrder) {
+      checkOrderValueDeterminism match {
+        case OrderDeterminismResult.NonDeterministicMismatch =>
+          throwFunctionAndOrderExpressionMismatchError()
+        case OrderDeterminismResult.NonDeterministicCast(inputType, castType) =>
+          throwFunctionAndOrderExpressionUnsafeCastError(inputType, castType)
+        case OrderDeterminismResult.Deterministic =>
+          throw SparkException.internalError(
+            "ListAgg.throwDistinctOrderError should not be called when the cast is safe")
+      }
+    } else {
+      throwFunctionAndOrderExpressionMismatchError()
+    }
+  }
+
+  private def throwFunctionAndOrderExpressionMismatchError() = {
+    throw QueryCompilationErrors.functionAndOrderExpressionMismatchError(
+      prettyName, child, orderExpressions)
+  }
+
+  private def throwFunctionAndOrderExpressionUnsafeCastError(
+      inputType: DataType, castType: DataType) = {
+    throw QueryCompilationErrors.functionAndOrderExpressionUnsafeCastError(
+      prettyName, inputType, castType)
+  }
+
+  /**
+   * Checks whether the order value is uniquely determined by the child value.
+   *
+   * Currently only handles the case where child = Cast(order_expr, T). If the cast is
+   * equality-preserving, the order value is deterministic (each child string maps back to
+   * exactly one original value). Otherwise, returns
+   * [[OrderDeterminismResult.NonDeterministicMismatch]].
+   *
+   * @see [[hasDistinctOrderAmbiguity]]
+   */
+  private def checkOrderValueDeterminism: OrderDeterminismResult = {
+    if (orderExpressions.size != 1) return OrderDeterminismResult.NonDeterministicMismatch
+    child match {
+      case Cast(castChild, castType, _, _)
+        if trimAliases(orderExpressions.head.child).semanticEquals(trimAliases(castChild)) =>
+          if (isCastEqualityPreserving(castChild.dataType) &&
+              isCastTargetEqualityPreserving(castType)) {
+            OrderDeterminismResult.Deterministic
+          } else {
+            OrderDeterminismResult.NonDeterministicCast(castChild.dataType, castType)
+          }
+      case _ => OrderDeterminismResult.NonDeterministicMismatch
+    }
+  }
+
+  /**
+   * Returns true if casting `dt` to string/binary preserves equality semantics: values that
+   * are GROUP BY-equal must cast to equal results, and different results must imply different
+   * original values. Types like Float/Double are unsafe because IEEE 754 negative zero (-0.0)
+   * and positive zero (0.0) are equal but produce different string representations.
+   *
+   * @see [[checkOrderValueDeterminism]]
+   */
+  private def isCastEqualityPreserving(dt: DataType): Boolean = dt match {
+    case _: IntegerType | LongType | ShortType | ByteType => true
+    case _: DecimalType => true
+    case _: DateType | TimestampNTZType | _: TimestampNTZNanosType => true
+    case _: TimeType => true
+    case _: CalendarIntervalType => true
+    case _: YearMonthIntervalType => true
+    case _: DayTimeIntervalType => true
+    case BooleanType => true
+    case BinaryType => true
+    case st: StringType => st.isUTF8BinaryCollation
+    case _: DoubleType | FloatType => false
+    // During DST fall-back, two distinct UTC epochs can format to the same local time string
+    // because the default format omits the timezone offset. NTZ types are safe (use UTC).
+    case _: TimestampType | _: TimestampLTZNanosType => false
+    case _ => false
+  }
+
+  /**
+   * Returns true if the cast target type preserves equality semantics for DISTINCT
+   * deduplication. A non-binary-equality collation on the target [[StringType]] can cause
+   * different source values to become equal after casting (e.g., "ABC" and "abc" are different
+   * under UTF8_BINARY but equal under UTF8_LCASE).
+   *
+   * @see [[checkOrderValueDeterminism]]
+   */
+  private def isCastTargetEqualityPreserving(dt: DataType): Boolean = dt match {
+    case st: StringType => st.isUTF8BinaryCollation
+    case BinaryType => true
+    case _ => false
+  }
+
+  /**
+   * Result of checking whether the order value is uniquely determined by the child value
+   * after DISTINCT deduplication. Currently only handles Cast.
+   */
+  private sealed trait OrderDeterminismResult
+
+  private object OrderDeterminismResult {
+    /** The order value is uniquely determined by the child value. */
+    case object Deterministic extends OrderDeterminismResult
+
+    /** Non-deterministic: cannot establish a child -> order functional dependency. */
+    case object NonDeterministicMismatch extends OrderDeterminismResult
+
+    /** Non-deterministic: the cast does not preserve equality semantics. */
+    case class NonDeterministicCast(
+        inputType: DataType,
+        castType: DataType) extends OrderDeterminismResult
   }
 
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): Expression =

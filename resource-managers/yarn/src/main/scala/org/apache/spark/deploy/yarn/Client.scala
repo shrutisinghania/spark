@@ -208,6 +208,7 @@ private[spark] class Client(
       val newApp = yarnClient.createApplication()
       val newAppResponse = newApp.getNewApplicationResponse()
       this.appId = newAppResponse.getApplicationId()
+      logInfo(log"Application ID is assigned: ${MDC(LogKeys.APP_ID, appId)}")
 
       // The app staging dir based on the STAGING_DIR configuration if configured
       // otherwise based on the users home directory.
@@ -332,7 +333,7 @@ private[spark] class Client(
         appContext.setLogAggregationContext(logAggregationContext)
       } catch {
         case NonFatal(e) =>
-          logWarning(log"Ignoring ${MDC(LogKeys.CONFIG, ROLLED_LOG_INCLUDE_PATTERN.key)}} " +
+          logWarning(log"Ignoring ${MDC(LogKeys.CONFIG, ROLLED_LOG_INCLUDE_PATTERN.key)} " +
             log"because the version of YARN does not support it", e)
       }
     }
@@ -705,12 +706,12 @@ private[spark] class Client(
           // No configuration, so fall back to uploading local jar files.
           logWarning(
             log"Neither ${MDC(LogKeys.CONFIG, SPARK_JARS.key)} nor " +
-              log"${MDC(LogKeys.CONFIG2, SPARK_ARCHIVE.key)}} is set, falling back to uploading " +
+              log"${MDC(LogKeys.CONFIG2, SPARK_ARCHIVE.key)} is set, falling back to uploading " +
               log"libraries under SPARK_HOME.")
           val jarsDir = new File(YarnCommandBuilderUtils.findJarsDir(
             sparkConf.getenv("SPARK_HOME")))
-          val jarsArchive = File.createTempFile(LOCALIZED_LIB_DIR, ".zip",
-            new File(Utils.getLocalDir(sparkConf)))
+          val jarsArchive = Files.createTempFile(
+            Paths.get(Utils.getLocalDir(sparkConf)), LOCALIZED_LIB_DIR, ".zip").toFile
           val bufferSize = sparkConf.get(BUFFER_SIZE)
           Using.resource(new ZipOutputStream(
             new BufferedOutputStream(new FileOutputStream(jarsArchive), bufferSize))) {
@@ -897,8 +898,8 @@ private[spark] class Client(
       }
     }
 
-    val confArchive = File.createTempFile(LOCALIZED_CONF_DIR, ".zip",
-      new File(Utils.getLocalDir(sparkConf)))
+    val confArchive = Files.createTempFile(
+      Paths.get(Utils.getLocalDir(sparkConf)), LOCALIZED_CONF_DIR, ".zip").toFile
     val confStream = new ZipOutputStream(new FileOutputStream(confArchive))
 
     logDebug(s"Creating an archive with the config files for distribution at $confArchive.")
@@ -1046,6 +1047,16 @@ private[spark] class Client(
     amContainer.setEnvironment(launchEnv.asJava)
 
     val javaOpts = ListBuffer[String]()
+
+    // Set Active Processor Count
+    val limitAPC = if (isClusterMode) {
+      sparkConf.get(DRIVER_LIMIT_ACTIVE_PROCESSOR_COUNT_ENABLED)
+    } else {
+      sparkConf.get(YARN_AM_LIMIT_ACTIVE_PROCESSOR_COUNT_ENABLED)
+    }
+    if (limitAPC) {
+      javaOpts += s"-XX:ActiveProcessorCount=${amCores}"
+    }
 
     javaOpts += s"-Djava.net.preferIPv6Addresses=${Utils.preferIPv6}"
 

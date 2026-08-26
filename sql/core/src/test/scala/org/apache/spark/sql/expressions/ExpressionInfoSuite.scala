@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.expressions
 
-import org.apache.spark.{SparkFunSuite, SparkIllegalArgumentException}
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.HiveResult.hiveResultString
@@ -27,7 +27,7 @@ import org.apache.spark.tags.SlowSQLTest
 import org.apache.spark.util.{ThreadUtils, Utils}
 
 @SlowSQLTest
-class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
+class ExpressionInfoSuite extends SharedSparkSession {
 
   test("Replace _FUNC_ in ExpressionInfo") {
     val info = spark.sessionState.catalog.lookupFunctionInfo(FunctionIdentifier("upper"))
@@ -56,19 +56,22 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
     }
 
     val validGroups = Seq(
-      "agg_funcs", "array_funcs", "binary_funcs", "bitwise_funcs", "collection_funcs",
+      "agg_funcs", "array_funcs", "avro_funcs", "binary_funcs", "bitwise_funcs", "collection_funcs",
       "predicate_funcs", "conditional_funcs", "conversion_funcs", "csv_funcs", "datetime_funcs",
       "generator_funcs", "hash_funcs", "json_funcs", "lambda_funcs", "map_funcs", "math_funcs",
-      "misc_funcs", "string_funcs", "struct_funcs", "window_funcs", "xml_funcs", "table_funcs",
-      "url_funcs", "variant_funcs").sorted
+      "misc_funcs", "protobuf_funcs", "sketch_funcs", "string_funcs", "struct_funcs",
+      "window_funcs", "xml_funcs", "table_funcs", "url_funcs", "variant_funcs", "vector_funcs",
+      "st_funcs").sorted
     val invalidGroupName = "invalid_group_funcs"
     checkError(
       exception = intercept[SparkIllegalArgumentException] {
         new ExpressionInfo(
           "testClass", null, "testName", null, "", "", "", invalidGroupName, "", "", "")
       },
-      condition = "_LEGACY_ERROR_TEMP_3202",
+      condition = "MALFORMED_EXPRESSION_INFO.GROUP",
+      sqlState = Some("22023"),
       parameters = Map(
+        "fieldName" -> "group",
         "exprName" -> "testName",
         "group" -> invalidGroupName,
         "validGroups" -> validGroups.mkString("[", ", ", "]")))
@@ -92,8 +95,10 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
         new ExpressionInfo(
           "testClass", null, "testName", null, "", "", "", "", "", "", invalidSource)
       },
-      condition = "_LEGACY_ERROR_TEMP_3203",
+      condition = "MALFORMED_EXPRESSION_INFO.SOURCE",
+      sqlState = Some("22023"),
       parameters = Map(
+        "fieldName" -> "source",
         "exprName" -> "testName",
         "source" -> invalidSource,
         "validSources" -> validSources.sorted.mkString("[", ", ", "]")))
@@ -105,8 +110,9 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       exception = intercept[SparkIllegalArgumentException] {
         new ExpressionInfo("testClass", null, "testName", null, "", "", invalidNote, "", "", "", "")
       },
-      condition = "_LEGACY_ERROR_TEMP_3201",
-      parameters = Map("exprName" -> "testName", "note" -> invalidNote))
+      condition = "MALFORMED_EXPRESSION_INFO.NOTE",
+      sqlState = Some("22023"),
+      parameters = Map("fieldName" -> "note", "exprName" -> "testName", "note" -> invalidNote))
 
     val invalidSince = "-3.0.0"
     checkError(
@@ -114,8 +120,9 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
         new ExpressionInfo(
           "testClass", null, "testName", null, "", "", "", "", invalidSince, "", "")
       },
-      condition = "_LEGACY_ERROR_TEMP_3204",
-      parameters = Map("since" -> invalidSince, "exprName" -> "testName"))
+      condition = "MALFORMED_EXPRESSION_INFO.SINCE",
+      sqlState = Some("22023"),
+      parameters = Map("fieldName" -> "since", "since" -> invalidSince, "exprName" -> "testName"))
 
     val invalidDeprecated = "  invalid deprecated"
     checkError(
@@ -123,8 +130,12 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
         new ExpressionInfo(
           "testClass", null, "testName", null, "", "", "", "", "", invalidDeprecated, "")
       },
-      condition = "_LEGACY_ERROR_TEMP_3205",
-      parameters = Map("exprName" -> "testName", "deprecated" -> invalidDeprecated))
+      condition = "MALFORMED_EXPRESSION_INFO.DEPRECATED",
+      sqlState = Some("22023"),
+      parameters = Map(
+        "fieldName" -> "deprecated",
+        "exprName" -> "testName",
+        "deprecated" -> invalidDeprecated))
   }
 
   test("using _FUNC_ instead of function names in examples") {
@@ -163,10 +174,38 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
   }
 
   test("SPARK-32870: Default expressions in FunctionRegistry should have their " +
-    "usage, examples, since, and group filled") {
+    "usage, examples, arguments, since, and group filled") {
     val ignoreSet = Set(
       // Cast aliases do not need examples
       "org.apache.spark.sql.catalyst.expressions.Cast")
+
+    // Functions that take no arguments are exempt from the `arguments` documentation
+    // requirement, since there is nothing to describe.
+    val noArgumentsSet = Set(
+      "org.apache.spark.sql.catalyst.expressions.Collations",
+      "org.apache.spark.sql.catalyst.expressions.CumeDist",
+      "org.apache.spark.sql.catalyst.expressions.CurDateExpressionBuilder",
+      "org.apache.spark.sql.catalyst.expressions.CurrentCatalog",
+      "org.apache.spark.sql.catalyst.expressions.CurrentDatabase",
+      "org.apache.spark.sql.catalyst.expressions.CurrentDate",
+      "org.apache.spark.sql.catalyst.expressions.CurrentPath",
+      "org.apache.spark.sql.catalyst.expressions.CurrentTimeZone",
+      "org.apache.spark.sql.catalyst.expressions.CurrentTimestamp",
+      "org.apache.spark.sql.catalyst.expressions.CurrentUser",
+      "org.apache.spark.sql.catalyst.expressions.EulerNumber",
+      "org.apache.spark.sql.catalyst.expressions.InputFileBlockLength",
+      "org.apache.spark.sql.catalyst.expressions.InputFileBlockStart",
+      "org.apache.spark.sql.catalyst.expressions.InputFileName",
+      "org.apache.spark.sql.catalyst.expressions.LocalTimestamp",
+      "org.apache.spark.sql.catalyst.expressions.MonotonicallyIncreasingID",
+      "org.apache.spark.sql.catalyst.expressions.Now",
+      "org.apache.spark.sql.catalyst.expressions.Pi",
+      "org.apache.spark.sql.catalyst.plans.logical.PythonWorkerLogs",
+      "org.apache.spark.sql.catalyst.expressions.RowNumber",
+      "org.apache.spark.sql.catalyst.expressions.SQLKeywords",
+      "org.apache.spark.sql.catalyst.expressions.SparkPartitionID",
+      "org.apache.spark.sql.catalyst.expressions.SparkVersion",
+      "org.apache.spark.sql.catalyst.expressions.Uuid")
 
     spark.sessionState.functionRegistry.listFunction().foreach { funcId =>
       val info = spark.sessionState.catalog.lookupFunctionInfo(funcId)
@@ -178,6 +217,9 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
           assert(info.getSince.matches("[0-9]+\\.[0-9]+\\.[0-9]+"))
           assert(info.getGroup.nonEmpty)
 
+          if (!noArgumentsSet.contains(info.getClassName)) {
+            assert(info.getArguments.nonEmpty)
+          }
           if (info.getArguments.nonEmpty) {
             assert(info.getArguments.startsWith("\n    Arguments:\n"))
             assert(info.getArguments.endsWith("\n  "))
@@ -206,9 +248,12 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       "org.apache.spark.sql.catalyst.expressions.CurrentDate",
       "org.apache.spark.sql.catalyst.expressions.CurDateExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimestamp",
+      "org.apache.spark.sql.catalyst.expressions.CurrentTimestampExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimeZone",
       "org.apache.spark.sql.catalyst.expressions.Now",
+      "org.apache.spark.sql.catalyst.expressions.NowExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.LocalTimestamp",
+      "org.apache.spark.sql.catalyst.expressions.LocalTimestampExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTime",
       // Random output without a seed
       "org.apache.spark.sql.catalyst.expressions.Rand",
@@ -247,6 +292,8 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       val clonedSpark = spark.cloneSession()
       // Coalescing partitions can change result order, so disable it.
       clonedSpark.conf.set(SQLConf.COALESCE_PARTITIONS_ENABLED.key, false)
+      // parse_sql examples require the experimental feature flag.
+      clonedSpark.conf.set(SQLConf.PARSE_SQL_ENABLED.key, true)
       val info = clonedSpark.sessionState.catalog.lookupFunctionInfo(funcId)
       val className = info.getClassName
       if (!ignoreSet.contains(className)) {

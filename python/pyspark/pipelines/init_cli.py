@@ -19,19 +19,16 @@ from pathlib import Path
 
 SPEC = """
 name: {{ name }}
-definitions:
+storage: {{ storage_root }}
+libraries:
   - glob:
-      include: transformations/**/*.py
-  - glob:
-      include: transformations/**/*.sql
+      include: transformations/**
 """
 
-PYTHON_EXAMPLE = """from pyspark import pipelines as sdp
-from pyspark.sql import DataFrame, SparkSession
+PYTHON_EXAMPLE = """from pyspark import pipelines as dp
+from pyspark.sql import DataFrame
 
-spark = SparkSession.active()
-
-@sdp.materialized_view
+@dp.materialized_view
 def example_python_materialized_view() -> DataFrame:
     return spark.range(10)
 """
@@ -45,12 +42,25 @@ WHERE id % 2 = 0
 def init(name: str) -> None:
     """Generates a simple pipeline project."""
     project_dir = Path.cwd() / name
+    if project_dir.exists():
+        raise FileExistsError(
+            f"Directory '{name}' already exists. "
+            "Please choose a different name or remove the existing directory."
+        )
     project_dir.mkdir(parents=True, exist_ok=False)
 
+    # Create the storage directory
+    storage_dir = project_dir / "pipeline-storage"
+    storage_dir.mkdir(parents=True)
+
+    # Create absolute file URI for storage path
+    storage_path = f"file://{storage_dir.resolve()}"
+
     # Write the spec file to the project directory
-    spec_file = project_dir / "pipeline.yml"
-    with open(spec_file, "w") as f:
-        f.write(SPEC.replace("{{ name }}", name))
+    spec_file = project_dir / "spark-pipeline.yml"
+    with open(spec_file, "w", encoding="utf-8") as f:
+        spec_content = SPEC.replace("{{ name }}", name).replace("{{ storage_root }}", storage_path)
+        f.write(spec_content)
 
     # Create the transformations directory
     transformations_dir = project_dir / "transformations"
@@ -58,12 +68,12 @@ def init(name: str) -> None:
 
     # Create the Python example file
     python_example_file = transformations_dir / "example_python_materialized_view.py"
-    with open(python_example_file, "w") as f:
+    with open(python_example_file, "w", encoding="utf-8") as f:
         f.write(PYTHON_EXAMPLE)
 
     # Create the SQL example file
     sql_example_file = transformations_dir / "example_sql_materialized_view.sql"
-    with open(sql_example_file, "w") as f:
+    with open(sql_example_file, "w", encoding="utf-8") as f:
         f.write(SQL_EXAMPLE)
 
     print(f"Pipeline project '{name}' created successfully. To run your pipeline:")

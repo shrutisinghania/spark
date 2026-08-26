@@ -33,7 +33,7 @@ private object MathFunctionsTestData {
   case class NullDoubles(a: java.lang.Double)
 }
 
-class MathFunctionsSuite extends QueryTest with SharedSparkSession {
+class MathFunctionsSuite extends SharedSparkSession {
   import MathFunctionsTestData._
   import testImplicits._
 
@@ -117,6 +117,15 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
     )
   }
 
+  test("different NaN comparison") {
+    assert(QueryTest.compare(
+      java.lang.Double.longBitsToDouble(0x7ff8000000000000L),
+      java.lang.Double.longBitsToDouble(0xfff8000000000000L)))
+    assert(QueryTest.compare(
+      java.lang.Float.intBitsToFloat(0x7fc00000),
+      java.lang.Float.intBitsToFloat(0xffc00000)))
+  }
+
   test("sin") {
     testOneToOneMathFunction(sin, math.sin)
   }
@@ -136,7 +145,15 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
 
   test("asinh") {
     testOneToOneMathFunction(asinh,
-      (x: Double) => math.log(x + math.sqrt(x * x + 1)) )
+      (x: Double) => {
+        val ax = Math.abs(x)
+        val w = if (ax.isInfinite || ax.isNaN) ax
+        else if (ax < 1.0 / (1 << 28)) ax
+        else if (ax > (1 << 28)) StrictMath.log(ax) + StrictMath.log(2.0)
+        else if (ax > 2.0) StrictMath.log(2.0 * ax + 1.0 / (math.sqrt(x * x + 1.0) + ax))
+        else StrictMath.log1p(ax + x * x / (1.0 + math.sqrt(1.0 + x * x)))
+        Math.copySign(w, x)
+      })
   }
 
   test("cos") {
@@ -158,7 +175,13 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
 
   test("acosh") {
     testOneToOneMathFunction(acosh,
-      (x: Double) => math.log(x + math.sqrt(x * x - 1)) )
+      (x: Double) => {
+        if (x < 1.0) Double.NaN
+        else if (x >= (1 << 28)) StrictMath.log(x) + StrictMath.log(2.0)
+        else if (x == 1.0) 0.0
+        else if (x > 2.0) StrictMath.log(2.0 * x - 1.0 / (x + math.sqrt(x * x - 1.0)))
+        else { val t = x - 1.0; StrictMath.log1p(t + math.sqrt(2.0 * t + t * t)) }
+      })
   }
 
   test("tan") {
@@ -299,6 +322,46 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
 
   test("rint") {
     testOneToOneMathFunction(rint, math.rint)
+  }
+
+  test("truncate") {
+    val df = Seq(5, 55, 555).map(Tuple1(_)).toDF("a")
+    checkAnswer(
+      df.select(truncate($"a", lit(-1)), truncate($"a", lit(-2))),
+      Seq(Row(0, 0), Row(50, 0), Row(550, 500))
+    )
+    // Truncation rounds toward zero, unlike floor for negative values.
+    val df2 = Seq(1234.5678, -1234.5678).map(Tuple1(_)).toDF("a")
+    checkAnswer(
+      df2.select(truncate($"a", lit(2))),
+      Seq(Row(1234.56), Row(-1234.56))
+    )
+    checkAnswer(
+      df2.selectExpr("truncate(a, 2)"),
+      Seq(Row(1234.56), Row(-1234.56))
+    )
+    // The truncate(Column, Int) and truncate(Column) overloads.
+    checkAnswer(
+      df2.select(truncate($"a", 2)),
+      Seq(Row(1234.56), Row(-1234.56))
+    )
+    checkAnswer(
+      df2.select(truncate($"a")),
+      Seq(Row(1234.0), Row(-1234.0))
+    )
+    // Decimal input, the type that motivated the new Decimal.changePrecision rounding mode.
+    val df3 = Seq(BigDecimal("1234.5678"), BigDecimal("-1234.5678")).map(Tuple1(_)).toDF("a")
+    checkAnswer(
+      df3.select(truncate($"a", lit(2))),
+      Seq(Row(BigDecimal("1234.56")), Row(BigDecimal("-1234.56")))
+    )
+    // NaN and Infinity are returned unchanged, matching RoundBase's other rounding modes.
+    val df4 = Seq(Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity)
+      .map(Tuple1(_)).toDF("a")
+    checkAnswer(
+      df4.select(truncate($"a", lit(2))),
+      Seq(Row(Double.NaN), Row(Double.PositiveInfinity), Row(Double.NegativeInfinity))
+    )
   }
 
   test("round/bround/ceil/floor") {

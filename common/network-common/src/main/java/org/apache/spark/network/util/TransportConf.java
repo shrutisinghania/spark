@@ -28,6 +28,7 @@ import io.netty.util.NettyRuntime;
  */
 public class TransportConf {
 
+  private final String SPARK_NETWORK_DEFAULT_IO_MODE_KEY = "spark.io.mode.default";
   private final String SPARK_NETWORK_IO_MODE_KEY;
   private final String SPARK_NETWORK_IO_PREFERDIRECTBUFS_KEY;
   private final String SPARK_NETWORK_IO_CONNECTIONTIMEOUT_KEY;
@@ -86,9 +87,10 @@ public class TransportConf {
     return module;
   }
 
-  /** IO mode: nio or epoll */
+  /** IO mode: NIO, EPOLL, KQUEUE, or AUTO */
   public String ioMode() {
-    return conf.get(SPARK_NETWORK_IO_MODE_KEY, "NIO").toUpperCase(Locale.ROOT);
+    String defaultIOMode = conf.get(SPARK_NETWORK_DEFAULT_IO_MODE_KEY, "AUTO");
+    return conf.get(SPARK_NETWORK_IO_MODE_KEY, defaultIOMode).toUpperCase(Locale.ROOT);
   }
 
   /** If true, we will prefer allocating off-heap byte buffers within Netty. */
@@ -471,6 +473,7 @@ public class TransportConf {
    * spark.shuffle.server.chunkFetchHandlerThreadsPercent. The returned value is rounded off to
    * ceiling of the nearest integer.
    */
+  @Deprecated(since = "4.2.0", forRemoval = true)
   public int chunkFetchHandlerThreads() {
     if (!this.getModuleName().equalsIgnoreCase("shuffle")) {
       return 0;
@@ -486,6 +489,7 @@ public class TransportConf {
    * Whether to use a separate EventLoopGroup to process ChunkFetchRequest messages, it is decided
    * by the config `spark.shuffle.server.chunkFetchHandlerThreadsPercent` is set or not.
    */
+  @Deprecated(since = "4.2.0", forRemoval = true)
   public boolean separateChunkFetchRequest() {
     return conf.getInt("spark.shuffle.server.chunkFetchHandlerThreadsPercent", 0) > 0;
   }
@@ -498,6 +502,7 @@ public class TransportConf {
    * handling finalizeShuffleMerge requests are percentage of io.serverThreads (if defined) else it
    * is a percentage of 2 * #cores.
    */
+  @Deprecated(since = "4.2.0", forRemoval = true)
   public int finalizeShuffleMergeHandlerThreads() {
     if (!this.getModuleName().equalsIgnoreCase("shuffle")) {
       return 0;
@@ -515,6 +520,7 @@ public class TransportConf {
    * Whether to use a separate EventLoopGroup to process FinalizeShuffleMerge messages, it is
    * decided by the config `spark.shuffle.server.finalizeShuffleMergeThreadsPercent` is set or not.
    */
+  @Deprecated(since = "4.2.0", forRemoval = true)
   public boolean separateFinalizeShuffleMerge() {
     return conf.getInt("spark.shuffle.server.finalizeShuffleMergeThreadsPercent", 0) > 0;
   }
@@ -526,6 +532,16 @@ public class TransportConf {
    */
   public boolean useOldFetchProtocol() {
     return conf.getBoolean("spark.shuffle.useOldFetchProtocol", false);
+  }
+
+  /**
+   * Whether to replace the client worker EventLoopGroup when a netty worker event loop is detected
+   * as dead (a connection is rejected with "event executor terminated"). A dead loop is never
+   * replaced within a fixed-size group and keeps being handed out by the round-robin chooser, so
+   * without this the degradation is permanent. On by default. See SPARK-58292.
+   */
+  public boolean recreateWorkerGroupOnDeadEventLoop() {
+    return conf.getBoolean("spark.network.recreateWorkerGroupOnDeadEventLoop", true);
   }
 
   /** Whether to enable sasl retries or not. The number of retries is dictated by the config

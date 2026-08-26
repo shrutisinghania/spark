@@ -99,22 +99,43 @@ case class UnionLoopRef(
  * A wrapper for CTE definition plan with a unique ID.
  * @param child The CTE definition query plan.
  * @param id    The unique ID for this CTE definition.
- * @param originalPlanWithPredicates The original query plan before predicate pushdown and the
- *                                   predicates that have been pushed down into `child`. This is
- *                                   a temporary field used by optimization rules for CTE predicate
- *                                   pushdown to help ensure rule idempotency.
+ * @param originalPlanWithPredicates The base plan of the last predicate pushdown and the
+ *                                   predicates that have been pushed down into `child`. The
+ *                                   base plan (the definition's child at the time of the last
+ *                                   pushdown, with the filter that pushdown inserted removed)
+ *                                   is recorded but not read back: the rule rebuilds from the
+ *                                   definition's current child and only consults the
+ *                                   predicates, both to detect newly appeared predicates and
+ *                                   to locate the previous pushdown for removal. This is a
+ *                                   temporary field used by optimization rules for CTE
+ *                                   predicate pushdown to help ensure rule idempotency.
  * @param underSubquery If true, it means we don't need to add a shuffle for this CTE relation as
  *                      subquery reuse will be applied to reuse CTE relation output.
  * @param maxDepth The maximal depth of a recursion in a recursive CTE.
+ * @param forceSkipInline If true, this CTE relation will never be inlined by [[InlineCTE]],
+ *                        regardless of determinism or reference count. This lets a producer
+ *                        force the CTE to be materialized instead of duplicated, e.g. when the
+ *                        CTE wraps a non-deterministic source that must be evaluated exactly once.
  */
 case class CTERelationDef(
     child: LogicalPlan,
     id: Long = CTERelationDef.newId,
     originalPlanWithPredicates: Option[(LogicalPlan, Seq[Expression])] = None,
     underSubquery: Boolean = false,
-    maxDepth: Option[Int] = None) extends UnaryNode {
+    maxDepth: Option[Int] = None,
+    forceSkipInline: Boolean = false) extends UnaryNode {
 
   final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
+
+  // Keep the default string representation stable when `forceSkipInline` is not set, so that
+  // existing plan comparisons and golden files are unaffected by the new field.
+  override def stringArgs: Iterator[Any] = {
+    if (forceSkipInline) {
+      super.stringArgs
+    } else {
+      super.stringArgs.toArray.dropRight(1).iterator
+    }
+  }
 
   override def maxRows: Option[Long] = if (conf.getConf(SQLConf.CTE_RELATION_DEF_MAX_ROWS)) {
     child.maxRows
@@ -128,7 +149,7 @@ case class CTERelationDef(
   override def output: Seq[Attribute] = if (resolved) child.output else Nil
 
   lazy val hasSelfReferenceAsCTERef: Boolean = child.collectFirstWithSubqueries {
-    case CTERelationRef(this.id, _, _, _, _, true, _) => true
+    case CTERelationRef(this.id, _, _, _, _, true, _, _) => true
   }.getOrElse(false)
   lazy val hasSelfReferenceInAnchor: Boolean = {
     val unionNode: Option[Union] = child match {
@@ -144,7 +165,7 @@ case class CTERelationDef(
     }
     if (unionNode.isDefined) {
       unionNode.get.children.head.collectFirstWithSubqueries {
-        case CTERelationRef(this.id, _, _, _, _, true, _) => true
+        case CTERelationRef(this.id, _, _, _, _, true, _, _) => true
       }.getOrElse(false)
     } else {
       false
@@ -160,7 +181,7 @@ case class CTERelationDef(
     }
     if (withCTENode.isDefined) {
       withCTENode.exists(_.cteDefs.exists(_.collectFirstWithSubqueries {
-        case CTERelationRef(this.id, _, _, _, _, true, _) => true
+        case CTERelationRef(this.id, _, _, _, _, true, _, _) => true
       }.isDefined))
     } else {
       false
@@ -186,6 +207,8 @@ object CTERelationDef {
  * @param statsOpt             The optional statistics inferred from the corresponding CTE
  *                             definition.
  * @param recursive            If this is a recursive reference.
+ * @param isUnlimitedRecursion If the node is a (non-recursive) reference to a recursive CTE that
+ *                             should be executed without a limit to the number of rows it returns.
  */
 case class CTERelationRef(
     cteId: Long,
@@ -194,11 +217,17 @@ case class CTERelationRef(
     override val isStreaming: Boolean,
     statsOpt: Option[Statistics] = None,
     recursive: Boolean = false,
-    override val maxRows: Option[Long] = None) extends LeafNode with MultiInstanceRelation {
+    override val maxRows: Option[Long] = None,
+    isUnlimitedRecursion: Boolean = false) extends LeafNode with MultiInstanceRelation {
 
   final override val nodePatterns: Seq[TreePattern] = Seq(CTE)
 
   override lazy val resolved: Boolean = _resolved
+
+  override def stringArgs: Iterator[Any] = {
+    // We omit the false value of isUnlimitedRecursion in golden files.
+    if (isUnlimitedRecursion) super.stringArgs else super.stringArgs.toArray.init.iterator
+  }
 
   override def newInstance(): LogicalPlan = {
     // CTERelationRef inherits the output attributes from a query, which may contain duplicated
@@ -209,7 +238,11 @@ case class CTERelationRef(
     // attributes `a` have the same id, but `Project('a, CTERelationRef(a#2, a#3))` can't be
     // resolved.
     val oldAttrToNewAttr = AttributeMap(output.zip(output.map(_.newInstance())))
-    copy(output = output.map(attr => oldAttrToNewAttr(attr)))
+    if (conf.getConf(SQLConf.LEGACY_CTE_DUPLICATE_ATTRIBUTE_NAMES)) {
+      copy(output = output.map(attr => oldAttrToNewAttr(attr)))
+    } else {
+      copy(output = output.map(attr => attr.withExprId(oldAttrToNewAttr(attr).exprId)))
+    }
   }
 
   def withNewStats(statsOpt: Option[Statistics]): CTERelationRef = copy(statsOpt = statsOpt)

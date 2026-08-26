@@ -18,14 +18,14 @@
 import unittest
 from collections import defaultdict
 
-from pyspark.errors import RetriesExceeded
 from pyspark.testing.connectutils import (
-    should_test_connect,
     connect_requirement_message,
+    should_test_connect,
 )
 
 if should_test_connect:
     import grpc
+
     from pyspark.sql.connect.client.core import Retrying
     from pyspark.sql.connect.client.retries import RetryPolicy
 
@@ -88,7 +88,7 @@ class RetryTests(unittest.TestCase):
 
     def test_exceed_retries(self):
         # Exceed the retries.
-        with self.assertRaises(RetriesExceeded):
+        with self.assertRaises(TestError):
             for attempt in Retrying(TestPolicy(max_retries=2)):
                 with attempt:
                     self.stub(5, grpc.StatusCode.INTERNAL)
@@ -117,7 +117,7 @@ class RetryTests(unittest.TestCase):
     def test_specific_exception_exceed_retries(self):
         # Exceed the retries.
         policy = TestPolicySpecificError(max_retries=2, specific_code=grpc.StatusCode.UNAVAILABLE)
-        with self.assertRaises(RetriesExceeded):
+        with self.assertRaises(TestError):
             for attempt in Retrying(policy):
                 with attempt:
                     self.stub(5, grpc.StatusCode.UNAVAILABLE)
@@ -157,7 +157,7 @@ class RetryTests(unittest.TestCase):
         policy1 = TestPolicySpecificError(max_retries=2, specific_code=grpc.StatusCode.INTERNAL)
         policy2 = TestPolicySpecificError(max_retries=4, specific_code=grpc.StatusCode.INTERNAL)
 
-        with self.assertRaises(RetriesExceeded):
+        with self.assertRaises(TestError):
             for attempt in Retrying([policy1, policy2]):
                 with attempt:
                     self.stub(10, grpc.StatusCode.INTERNAL)
@@ -167,13 +167,6 @@ class RetryTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_retry import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

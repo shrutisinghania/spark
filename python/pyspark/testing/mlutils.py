@@ -19,10 +19,10 @@ import numpy as np
 
 from pyspark import keyword_only
 from pyspark.ml import Estimator, Model, Transformer, UnaryTransformer
+from pyspark.ml.classification import ClassificationModel, Classifier
 from pyspark.ml.evaluation import Evaluator
 from pyspark.ml.param import Param, Params, TypeConverters
 from pyspark.ml.param.shared import HasMaxIter, HasRegParam
-from pyspark.ml.classification import Classifier, ClassificationModel
 from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
 from pyspark.ml.wrapper import _java2py
 from pyspark.sql import DataFrame, SparkSession
@@ -99,10 +99,10 @@ class SparkSessionTestCase(PySparkTestCase):
 
 
 class MockDataset(DataFrame):
-    def __new__(cls) -> "DataFrame":
-        self = object.__new__(cls)
-        self.__init__()
-        return self
+    def __new__(cls, *args, **kwargs):
+        # DataFrame by default creates classic DataFrame, we need this to
+        # overwrite the default behavior.
+        return object.__new__(cls)
 
     def __init__(self):
         self.index = 0
@@ -110,7 +110,7 @@ class MockDataset(DataFrame):
 
 class HasFake(Params):
     def __init__(self):
-        super(HasFake, self).__init__()
+        super().__init__()
         self.fake = Param(self, "fake", "fake param")
 
     def getFake(self):
@@ -119,7 +119,7 @@ class HasFake(Params):
 
 class MockTransformer(Transformer, HasFake):
     def __init__(self):
-        super(MockTransformer, self).__init__()
+        super().__init__()
         self.dataset_index = None
 
     def _transform(self, dataset):
@@ -137,7 +137,7 @@ class MockUnaryTransformer(UnaryTransformer, DefaultParamsReadable, DefaultParam
     )
 
     def __init__(self, shiftVal=1):
-        super(MockUnaryTransformer, self).__init__()
+        super().__init__()
         self._setDefault(shift=1)
         self._set(shift=shiftVal)
 
@@ -161,7 +161,7 @@ class MockUnaryTransformer(UnaryTransformer, DefaultParamsReadable, DefaultParam
 
 class MockEstimator(Estimator, HasFake):
     def __init__(self):
-        super(MockEstimator, self).__init__()
+        super().__init__()
         self.dataset_index = None
 
     def _fit(self, dataset):
@@ -198,7 +198,7 @@ class DummyLogisticRegression(
         regParam=0.0,
         rawPredictionCol="rawPrediction",
     ):
-        super(DummyLogisticRegression, self).__init__()
+        super().__init__()
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
 
@@ -229,12 +229,12 @@ class DummyLogisticRegressionModel(
     DefaultParamsWritable,
 ):
     def __init__(self):
-        super(DummyLogisticRegressionModel, self).__init__()
+        super().__init__()
 
     def _transform(self, dataset):
         # A dummy transform impl which always predict label 1
-        from pyspark.sql.functions import array, lit
         from pyspark.ml.functions import array_to_vector
+        from pyspark.sql.functions import array, lit
 
         rawPredCol = self.getRawPredictionCol()
         if rawPredCol:

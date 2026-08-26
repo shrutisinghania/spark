@@ -15,16 +15,17 @@
 # limitations under the License.
 #
 import inspect
+import math
 from typing import TYPE_CHECKING, Union
 
 import pandas as pd
 
 from pyspark.pandas.plot import (
-    HistogramPlotBase,
-    name_like_string,
-    PandasOnSparkPlotAccessor,
     BoxPlotBase,
+    HistogramPlotBase,
     KdePlotBase,
+    PandasOnSparkPlotAccessor,
+    name_like_string,
 )
 
 if TYPE_CHECKING:
@@ -49,31 +50,56 @@ def plot_pandas_on_spark(data: Union["ps.DataFrame", "ps.Series"], kind: str, **
 
 
 def plot_pie(data: Union["ps.DataFrame", "ps.Series"], **kwargs):
+    import plotly.graph_objs as go
     from plotly import express
+    from plotly.subplots import make_subplots
 
     data = PandasOnSparkPlotAccessor.pandas_plot_data_map["pie"](data)
+    subplots = kwargs.pop("subplots", False)
+    col_wrap = kwargs.pop("col_wrap", None)
 
     if isinstance(data, pd.Series):
         pdf = data.to_frame()
         return express.pie(pdf, values=pdf.columns[0], names=pdf.index, **kwargs)
     elif isinstance(data, pd.DataFrame):
-        values = kwargs.pop("y", None)
-        default_names = None
-        if values is not None:
-            default_names = data.index
+        if subplots:
+            cols = list(data.columns)
+            if col_wrap is not None and col_wrap < 1:
+                raise ValueError("col_wrap must be a positive integer, got %d." % col_wrap)
+            ncols = col_wrap if col_wrap is not None else min(len(cols), 3)
+            nrows = math.ceil(len(cols) / ncols)
+            fig = make_subplots(
+                rows=nrows,
+                cols=ncols,
+                specs=[[{"type": "pie"}] * ncols for _ in range(nrows)],
+                subplot_titles=[str(c) for c in cols],
+            )
+            for i, col in enumerate(cols):
+                fig.add_trace(
+                    go.Pie(labels=data.index, values=data[col], name=str(col)),
+                    row=i // ncols + 1,
+                    col=i % ncols + 1,
+                )
+            return fig
+        else:
+            values = kwargs.pop("y", None)
+            default_names = None
+            if values is not None:
+                default_names = data.index
 
-        return express.pie(
-            data,
-            values=kwargs.pop("values", values),
-            names=kwargs.pop("names", default_names),
-            **kwargs,
-        )
+            return express.pie(
+                data,
+                values=kwargs.pop("values", values),
+                names=kwargs.pop("names", default_names),
+                **kwargs,
+            )
     else:
         raise RuntimeError("Unexpected type: [%s]" % type(data))
 
 
 def plot_histogram(data: Union["ps.DataFrame", "ps.Series"], **kwargs):
     import plotly.graph_objs as go
+
     import pyspark.pandas as ps
 
     bins = kwargs.get("bins", 10)
@@ -122,6 +148,7 @@ def plot_histogram(data: Union["ps.DataFrame", "ps.Series"], **kwargs):
 
 def plot_box(data: Union["ps.DataFrame", "ps.Series"], **kwargs):
     import plotly.graph_objs as go
+
     import pyspark.pandas as ps
     from pyspark.sql.types import NumericType
 
@@ -216,6 +243,7 @@ def plot_box(data: Union["ps.DataFrame", "ps.Series"], **kwargs):
 
 def plot_kde(data: Union["ps.DataFrame", "ps.Series"], **kwargs):
     from plotly import express
+
     import pyspark.pandas as ps
 
     if isinstance(data, ps.DataFrame) and "color" not in kwargs:

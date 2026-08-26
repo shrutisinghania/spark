@@ -15,11 +15,13 @@
 # limitations under the License.
 #
 import os
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from pyspark.errors import PySparkTypeError, PySparkValueError, PySparkAssertionError
+from pyspark.errors import PySparkAssertionError, PySparkTypeError, PySparkValueError
+from pyspark.serializers import CPickleSerializer
 from pyspark.sql.column import Column
 from pyspark.sql.dataframe import DataFrame
+from pyspark.sql.types import Row
 from pyspark.sql.utils import is_remote
 
 if TYPE_CHECKING:
@@ -88,8 +90,12 @@ class Observation:
         if name is not None:
             if not isinstance(name, str):
                 raise PySparkTypeError(
-                    errorClass="NOT_STR",
-                    messageParameters={"arg_name": "name", "arg_type": type(name).__name__},
+                    errorClass="NOT_EXPECTED_TYPE",
+                    messageParameters={
+                        "arg_name": "name",
+                        "expected_type": "str",
+                        "arg_type": type(name).__name__,
+                    },
                 )
             if name == "":
                 raise PySparkValueError(
@@ -144,23 +150,26 @@ class Observation:
         if self._jo is None:
             raise PySparkAssertionError(errorClass="NO_OBSERVE_BEFORE_GET", messageParameters={})
 
-        jmap = self._jo.getAsJava()
-        # return a pure Python dict, not jmap which is a py4j JavaMap
-        return {k: v for k, v in jmap.items()}
+        assert self._jvm is not None
+        utils = getattr(self._jvm, "org.apache.spark.sql.api.python.PythonSQLUtils")
+        jrow = self._jo.getRow()
+        row: Row = CPickleSerializer().loads(utils.toPyRow(jrow))
+        return row.asDict(recursive=False)
 
 
 def _test() -> None:
     import doctest
     import sys
+
+    import pyspark.sql.observation
     from pyspark.core.context import SparkContext
     from pyspark.sql import SparkSession
-    import pyspark.sql.observation
 
     globs = pyspark.sql.observation.__dict__.copy()
     sc = SparkContext("local[4]", "PythonTest")
     globs["spark"] = SparkSession(sc)
 
-    (failure_count, test_count) = doctest.testmod(pyspark.sql.observation, globs=globs)
+    failure_count, test_count = doctest.testmod(pyspark.sql.observation, globs=globs)
     sc.stop()
     if failure_count:
         sys.exit(-1)

@@ -15,13 +15,13 @@
 # limitations under the License.
 #
 from threading import RLock
-from typing import overload, Dict, Union, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional, Union, overload
 
 from pyspark.resource.requests import (
+    ExecutorResourceRequest,
+    ExecutorResourceRequests,
     TaskResourceRequest,
     TaskResourceRequests,
-    ExecutorResourceRequests,
-    ExecutorResourceRequest,
 )
 
 if TYPE_CHECKING:
@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 
 
 class ResourceProfile:
-
     """
     Resource profile to associate with an RDD. A :class:`pyspark.resource.ResourceProfile`
     allows the user to specify executor and task requirements for an RDD that will get
@@ -85,8 +84,7 @@ class ResourceProfile:
     """
 
     @overload
-    def __init__(self, _java_resource_profile: "JavaObject"):
-        ...
+    def __init__(self, _java_resource_profile: "JavaObject"): ...
 
     @overload
     def __init__(
@@ -94,8 +92,7 @@ class ResourceProfile:
         _java_resource_profile: None = ...,
         _exec_req: Optional[Dict[str, ExecutorResourceRequest]] = ...,
         _task_req: Optional[Dict[str, TaskResourceRequest]] = ...,
-    ):
-        ...
+    ): ...
 
     def __init__(
         self,
@@ -182,7 +179,6 @@ class ResourceProfile:
 
 
 class ResourceProfileBuilder:
-
     """
     Resource profile Builder to build a resource profile to associate with an RDD.
     A ResourceProfile allows the user to specify executor and task requirements for
@@ -326,11 +322,12 @@ class ResourceProfileBuilder:
 def _test() -> None:
     import doctest
     import sys
+
     from pyspark import SparkContext
 
     globs = globals().copy()
     globs["sc"] = SparkContext("local[4]", "profile tests")
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         globs=globs, optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
     )
     globs["sc"].stop()

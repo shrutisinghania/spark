@@ -22,9 +22,11 @@ import java.lang.{Long => JLong}
 import java.util.UUID
 
 import scala.jdk.CollectionConverters._
+import scala.math.BigDecimal.RoundingMode
 import scala.util.control.NonFatal
 
-import com.fasterxml.jackson.databind.{DeserializationFeature, ObjectMapper}
+import com.fasterxml.jackson.core.JsonParser
+import com.fasterxml.jackson.databind.{DeserializationContext, DeserializationFeature, JsonDeserializer, JsonNode, ObjectMapper}
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.fasterxml.jackson.module.scala.{ClassTagExtensions, DefaultScalaModule}
 import org.json4s._
@@ -35,11 +37,37 @@ import org.json4s.jackson.JsonMethods._
 import org.apache.spark.annotation.Evolving
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.expressions.GenericRowWithSchema
-import org.apache.spark.sql.streaming.SafeJsonSerializer.{safeDoubleToJValue, safeMapToJValue}
+import org.apache.spark.sql.streaming.SafeJsonSerializer.{safeDecimalToJValue, safeMapToJValue}
 import org.apache.spark.sql.streaming.SinkProgress.DEFAULT_NUM_OUTPUT_ROWS
 
 /**
  * Information about updates made to stateful operators in a [[StreamingQuery]] during a trigger.
+ *
+ * @param operatorName
+ *   Name of the stateful operator this progress describes.
+ * @param numRowsTotal
+ *   Number of state rows held by the operator after this trigger.
+ * @param numRowsUpdated
+ *   Number of state rows updated during this trigger.
+ * @param allUpdatesTimeMs
+ *   Time taken, in milliseconds, to apply all state updates in this trigger.
+ * @param numRowsRemoved
+ *   Number of state rows removed during this trigger.
+ * @param allRemovalsTimeMs
+ *   Time taken, in milliseconds, to remove all evicted state rows in this trigger.
+ * @param commitTimeMs
+ *   Time taken, in milliseconds, to commit the state changes of this trigger.
+ * @param memoryUsedBytes
+ *   Memory used, in bytes, by the operator's state store.
+ * @param numRowsDroppedByWatermark
+ *   Number of input rows dropped because their event time was older than the watermark.
+ * @param numShufflePartitions
+ *   Number of shuffle partitions the operator ran with.
+ * @param numStateStoreInstances
+ *   Number of state store instances backing the operator.
+ * @param customMetrics
+ *   Custom metrics specific to the stateful operator or state store implementation, keyed by
+ *   metric name.
  */
 @Evolving
 class StateOperatorProgress private[spark] (
@@ -54,7 +82,10 @@ class StateOperatorProgress private[spark] (
     val numRowsDroppedByWatermark: Long,
     val numShufflePartitions: Long,
     val numStateStoreInstances: Long,
-    val customMetrics: ju.Map[String, JLong] = new ju.HashMap())
+    val customMetrics: ju.Map[String, JLong] = new ju.HashMap(),
+    // Names of customMetrics entries treated as snapshots of state-store status;
+    // preserved by copyForNoExecution() and not surfaced in JSON output.
+    private[spark] val snapshotCustomMetricNames: Set[String] = Set.empty)
     extends Serializable {
 
   /** The compact JSON representation of this progress. */
@@ -65,20 +96,48 @@ class StateOperatorProgress private[spark] (
 
   private[sql] def copy(
       newNumRowsUpdated: Long,
-      newNumRowsDroppedByWatermark: Long): StateOperatorProgress =
+      newNumRowsDroppedByWatermark: Long,
+      newNumRowsRemoved: Long): StateOperatorProgress =
     new StateOperatorProgress(
       operatorName = operatorName,
       numRowsTotal = numRowsTotal,
       numRowsUpdated = newNumRowsUpdated,
       allUpdatesTimeMs = allUpdatesTimeMs,
-      numRowsRemoved = numRowsRemoved,
+      numRowsRemoved = newNumRowsRemoved,
       allRemovalsTimeMs = allRemovalsTimeMs,
       commitTimeMs = commitTimeMs,
       memoryUsedBytes = memoryUsedBytes,
       numRowsDroppedByWatermark = newNumRowsDroppedByWatermark,
       numShufflePartitions = numShufflePartitions,
       numStateStoreInstances = numStateStoreInstances,
-      customMetrics = customMetrics)
+      customMetrics = customMetrics,
+      snapshotCustomMetricNames = snapshotCustomMetricNames)
+
+  /**
+   * Returns a copy of this progress suitable for a no-data trigger event. Per-batch fields (row
+   * counts, time-Ms fields, and customMetrics entries not in `snapshotCustomMetricNames`) are
+   * zeroed; snapshot fields and snapshot customMetrics entries are preserved.
+   */
+  private[sql] def copyForNoExecution(): StateOperatorProgress = {
+    val newCustomMetrics = new ju.HashMap[String, JLong](customMetrics.size())
+    customMetrics.forEach { (k, v) =>
+      newCustomMetrics.put(k, if (snapshotCustomMetricNames.contains(k)) v else 0L)
+    }
+    new StateOperatorProgress(
+      operatorName = operatorName,
+      numRowsTotal = numRowsTotal,
+      numRowsUpdated = 0L,
+      allUpdatesTimeMs = 0L,
+      numRowsRemoved = 0L,
+      allRemovalsTimeMs = 0L,
+      commitTimeMs = 0L,
+      memoryUsedBytes = memoryUsedBytes,
+      numRowsDroppedByWatermark = 0L,
+      numShufflePartitions = numShufflePartitions,
+      numStateStoreInstances = numStateStoreInstances,
+      customMetrics = newCustomMetrics,
+      snapshotCustomMetricNames = snapshotCustomMetricNames)
+  }
 
   private[sql] def jsonValue: JValue = {
     ("operatorName" -> JString(operatorName)) ~
@@ -139,6 +198,8 @@ class StateOperatorProgress private[spark] (
  *   Information about operators in the query that store state.
  * @param sources
  *   detailed statistics on data being read from each of the streaming sources.
+ * @param sink
+ *   detailed statistics on data being written to the sink.
  * @since 2.1.0
  */
 @Evolving
@@ -183,14 +244,26 @@ class StreamingQueryProgress private[spark] (
       ("batchId" -> JInt(batchId)) ~
       ("batchDuration" -> JInt(batchDuration)) ~
       ("numInputRows" -> JInt(numInputRows)) ~
-      ("inputRowsPerSecond" -> safeDoubleToJValue(inputRowsPerSecond)) ~
-      ("processedRowsPerSecond" -> safeDoubleToJValue(processedRowsPerSecond)) ~
-      ("durationMs" -> safeMapToJValue[JLong](durationMs, v => JInt(v.toLong))) ~
-      ("eventTime" -> safeMapToJValue[String](eventTime, s => JString(s))) ~
+      ("inputRowsPerSecond" -> safeDecimalToJValue(inputRowsPerSecond)) ~
+      ("processedRowsPerSecond" -> safeDecimalToJValue(processedRowsPerSecond)) ~
+      ("durationMs" -> safeMapToJValue[JLong](durationMs, (_, v) => JInt(v.toLong))) ~
+      ("eventTime" -> safeMapToJValue[String](eventTime, (_, s) => JString(s))) ~
       ("stateOperators" -> JArray(stateOperators.map(_.jsonValue).toList)) ~
       ("sources" -> JArray(sources.map(_.jsonValue).toList)) ~
       ("sink" -> sink.jsonValue) ~
-      ("observedMetrics" -> safeMapToJValue[Row](observedMetrics, row => row.jsonValue))
+      ("observedMetrics" -> {
+        // TODO: SPARK-54391
+        // In Spark connect, the observedMetrics is serialized but is not deserialized properly when
+        // being sent back to the client and the schema is null. So calling row.jsonValue will throw
+        // an exception so we need to catch the exception and return JNothing.
+        // This is because the Row.jsonValue method is a one way method and there is no reverse
+        // method to convert the JSON back to a Row.
+        try {
+          safeMapToJValue[Row](observedMetrics, (_, row) => row.jsonValue)
+        } catch {
+          case NonFatal(e) => JNothing
+        }
+      })
   }
 }
 
@@ -207,6 +280,19 @@ private[spark] object StreamingQueryProgress {
 
   private[spark] def fromJson(json: String): StreamingQueryProgress =
     mapper.readValue[StreamingQueryProgress](json)
+}
+
+// SPARK-54390: Custom deserializer that converts JSON objects to strings for offset fields
+private class ObjectToStringDeserializer extends JsonDeserializer[String] {
+  override def deserialize(parser: JsonParser, context: DeserializationContext): String = {
+    val node: JsonNode = parser.readValueAsTree()
+    if (node.isTextual) {
+      node.asText()
+    } else {
+      // Convert JSON object/array to string representation
+      node.toString
+    }
+  }
 }
 
 /**
@@ -232,12 +318,19 @@ private[spark] object StreamingQueryProgress {
 @Evolving
 class SourceProgress protected[spark] (
     val description: String,
+    // SPARK-54390: Use a custom deserializer to convert the JSON object to a string.
+    @JsonDeserialize(using = classOf[ObjectToStringDeserializer])
     val startOffset: String,
+    @JsonDeserialize(using = classOf[ObjectToStringDeserializer])
     val endOffset: String,
+    @JsonDeserialize(using = classOf[ObjectToStringDeserializer])
     val latestOffset: String,
     val numInputRows: Long,
-    val inputRowsPerSecond: Double,
-    val processedRowsPerSecond: Double,
+    // The NaN is used in deserialization to indicate the value was not set.
+    // The NaN is then used to not output this field in the JSON.
+    // In Spark connect, we need to ensure that the default value is Double.NaN instead of 0.0.
+    val inputRowsPerSecond: Double = Double.NaN,
+    val processedRowsPerSecond: Double = Double.NaN,
     val metrics: ju.Map[String, String] = Map[String, String]().asJava)
     extends Serializable {
 
@@ -255,15 +348,28 @@ class SourceProgress protected[spark] (
       ("endOffset" -> tryParse(endOffset)) ~
       ("latestOffset" -> tryParse(latestOffset)) ~
       ("numInputRows" -> JInt(numInputRows)) ~
-      ("inputRowsPerSecond" -> safeDoubleToJValue(inputRowsPerSecond)) ~
-      ("processedRowsPerSecond" -> safeDoubleToJValue(processedRowsPerSecond)) ~
-      ("metrics" -> safeMapToJValue[String](metrics, s => JString(s)))
+      ("inputRowsPerSecond" -> safeDecimalToJValue(inputRowsPerSecond)) ~
+      ("processedRowsPerSecond" -> safeDecimalToJValue(processedRowsPerSecond)) ~
+      ("metrics" -> safeMapToJValue[String](
+        metrics,
+        (metricsName, s) =>
+          // SPARK-53690:
+          // Convert the metric value to a formatted decimal string to avoid exponentials
+          // This ensures that large numbers are represented as fixed-point decimals
+          // instead of scientific notation to improving readability.
+          // Any metrics which is generated as double needs to be added in if condition
+          // for converting it to fixed-point decimals in representation.
+          JString(if (metricsName == "avgOffsetsBehindLatest") {
+            BigDecimal(s).setScale(1, RoundingMode.HALF_UP).toString
+          } else {
+            s
+          })))
   }
 
-  private def tryParse(json: String) = try {
+  private def tryParse(json: String): JValue = try {
     parse(json)
   } catch {
-    case NonFatal(e) => JString(json)
+    case NonFatal(_) => JString(json)
   }
 }
 
@@ -272,10 +378,12 @@ class SourceProgress protected[spark] (
  * trigger. See [[StreamingQueryProgress]] for more information.
  *
  * @param description
- *   Description of the source corresponding to this status.
+ *   Description of the sink corresponding to this status.
  * @param numOutputRows
  *   Number of rows written to the sink or -1 for Continuous Mode (temporarily) or Sink V1 (until
  *   decommissioned).
+ * @param metrics
+ *   Sink-specific metrics reported for this trigger, keyed by metric name.
  * @since 2.1.0
  */
 @Evolving
@@ -301,7 +409,7 @@ class SinkProgress protected[spark] (
   private[sql] def jsonValue: JValue = {
     ("description" -> JString(description)) ~
       ("numOutputRows" -> JInt(numOutputRows)) ~
-      ("metrics" -> safeMapToJValue[String](metrics, s => JString(s)))
+      ("metrics" -> safeMapToJValue[String](metrics, (_, s) => JString(s)))
   }
 }
 
@@ -316,14 +424,37 @@ private[sql] object SinkProgress {
 }
 
 private object SafeJsonSerializer {
+
+  /** Convert Double to JValue while handling empty or infinite values */
   def safeDoubleToJValue(value: Double): JValue = {
     if (value.isNaN || value.isInfinity) JNothing else JDouble(value)
   }
 
-  /** Convert map to JValue while handling empty maps. Also, this sorts the keys. */
-  def safeMapToJValue[T](map: ju.Map[String, T], valueToJValue: T => JValue): JValue = {
+  /**
+   * Convert map to JValue while handling empty maps. Also, this sorts the keys. Function is
+   * written as generic (T) to handle variety of types
+   *   - Returns `JNothing` if the map is null or empty.
+   *   - Sorts the keys alphabetically to ensure deterministic JSON output.
+   *   - Converts each map entry to a JValue using the provided function, which also receives the
+   *     key.
+   *   - Combines all entries into a single `JObject`.
+   *
+   * @param map
+   *   A Java Map[String, T] to convert
+   * @param valueToJValue
+   *   Function that takes a key and value and returns a corresponding JValue
+   * @return
+   *   A JObject representing the map, or JNothing if the map is null or empty
+   */
+  def safeMapToJValue[T](map: ju.Map[String, T], valueToJValue: (String, T) => JValue): JValue = {
     if (map == null || map.isEmpty) return JNothing
     val keys = map.asScala.keySet.toSeq.sorted
-    keys.map { k => k -> valueToJValue(map.get(k)): JObject }.reduce(_ ~ _)
+    keys.map { k => k -> valueToJValue(k, map.get(k)): JObject }.reduce(_ ~ _)
+  }
+
+  /** Convert BigDecimal to JValue while handling empty or infinite values */
+  def safeDecimalToJValue(value: Double): JValue = {
+    if (value.isNaN || value.isInfinity) JNothing
+    else JDecimal(BigDecimal(value).setScale(1, RoundingMode.HALF_UP))
   }
 }

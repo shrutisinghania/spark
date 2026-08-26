@@ -14,16 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from pyspark.errors import PySparkValueError, PySparkTypeError
-from pyspark.sql.connect.utils import check_dependencies
-
-check_dependencies(__name__)
-
-from typing import Any, Dict, Optional, Union, cast
 import warnings
+from typing import Any, Dict, Optional, Union, cast
 
 from pyspark import _NoValue
 from pyspark._globals import _NoValueType
+from pyspark.errors import PySparkTypeError, PySparkValueError
 from pyspark.sql.conf import RuntimeConfig as PySparkRuntimeConfig
 from pyspark.sql.connect import proto
 from pyspark.sql.connect.client import SparkConnectClient
@@ -124,9 +120,10 @@ class RuntimeConf:
         """Assert that an object is of type str."""
         if not isinstance(obj, str):
             raise PySparkTypeError(
-                errorClass="NOT_STR",
+                errorClass="NOT_EXPECTED_TYPE",
                 messageParameters={
                     "arg_name": identifier,
+                    "expected_type": "str",
                     "arg_type": type(obj).__name__,
                 },
             )
@@ -136,11 +133,12 @@ RuntimeConf.__doc__ = PySparkRuntimeConfig.__doc__
 
 
 def _test() -> None:
+    import doctest
     import os
     import sys
-    import doctest
-    from pyspark.sql import SparkSession as PySparkSession
+
     import pyspark.sql.connect.conf
+    from pyspark.sql import SparkSession as PySparkSession
 
     globs = pyspark.sql.connect.conf.__dict__.copy()
     globs["spark"] = (
@@ -149,7 +147,7 @@ def _test() -> None:
         .getOrCreate()
     )
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.connect.conf,
         globs=globs,
         optionflags=doctest.ELLIPSIS

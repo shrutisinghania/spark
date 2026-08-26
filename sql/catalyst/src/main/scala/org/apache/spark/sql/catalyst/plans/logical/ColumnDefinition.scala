@@ -22,7 +22,8 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions.{AnalysisAwareExpression, Expression, Literal, UnaryExpression, Unevaluable}
 import org.apache.spark.sql.catalyst.parser.ParserInterface
 import org.apache.spark.sql.catalyst.trees.TreePattern.{ANALYSIS_AWARE_EXPRESSION, TreePattern}
-import org.apache.spark.sql.catalyst.util.{GeneratedColumn, IdentityColumn, V2ExpressionBuilder}
+import org.apache.spark.sql.catalyst.util.{CharVarcharUtils, GeneratedColumn, IdentityColumn, V2ExpressionBuilder}
+import org.apache.spark.sql.catalyst.util.FieldMetadataUtils.FIELD_ID_METADATA_KEY
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns.validateDefaultValueExpr
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumnsUtils.{CURRENT_DEFAULT_COLUMN_METADATA_KEY, EXISTS_DEFAULT_COLUMN_METADATA_KEY}
 import org.apache.spark.sql.connector.catalog.{Column => V2Column, ColumnDefaultValue, DefaultValue, IdentityColumnSpec}
@@ -31,10 +32,18 @@ import org.apache.spark.sql.connector.expressions.LiteralValue
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.connector.ColumnImpl
 import org.apache.spark.sql.types.{DataType, Metadata, MetadataBuilder, StructField}
+import org.apache.spark.sql.util.SchemaUtils
 
 /**
- * Column definition for tables. This is an expression so that analyzer can resolve the default
- * value expression in DDL commands automatically.
+ * User-specified column definition for CREATE/REPLACE TABLE commands. This is an expression so that
+ * analyzer can resolve the default value expression automatically.
+ *
+ * For CREATE/REPLACE TABLE commands, columns are created from scratch, so we store the
+ * user-specified default value as both the current default and exists default, in methods
+ * `toV1Column` and `toV2Column`.
+ *
+ * Note that ColumnDefinition is meant to be used in DDL statements like CREATE or REPLACE.
+ * That's why it does not have a notion of column IDs as they must be assigned by connectors.
  */
 case class ColumnDefinition(
     name: String,
@@ -42,18 +51,30 @@ case class ColumnDefinition(
     nullable: Boolean = true,
     comment: Option[String] = None,
     defaultValue: Option[DefaultValueExpression] = None,
-    generationExpression: Option[String] = None,
+    generationExpression: Option[GeneratedColumnExpression] = None,
     identityColumnSpec: Option[IdentityColumnSpec] = None,
     metadata: Metadata = Metadata.empty) extends Expression with Unevaluable {
   assert(
     generationExpression.isEmpty || identityColumnSpec.isEmpty,
     "A ColumnDefinition cannot contain both a generation expression and an identity column spec.")
 
-  override def children: Seq[Expression] = defaultValue.toSeq
+  override def children: Seq[Expression] = defaultValue.toSeq ++ generationExpression.toSeq
 
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[Expression]): Expression = {
-    copy(defaultValue = newChildren.headOption.map(_.asInstanceOf[DefaultValueExpression]))
+    val hasDefault = defaultValue.isDefined
+    val hasGenExpr = generationExpression.isDefined
+    val newDefault = if (hasDefault) {
+      Some(newChildren.head.asInstanceOf[DefaultValueExpression])
+    } else {
+      None
+    }
+    val newGenExpr = if (hasGenExpr) {
+      Some(newChildren.last.asInstanceOf[GeneratedColumnExpression])
+    } else {
+      None
+    }
+    copy(defaultValue = newDefault, generationExpression = newGenExpr)
   }
 
   def toV2Column(statement: String): V2Column = {
@@ -63,9 +84,10 @@ case class ColumnDefinition(
       nullable,
       comment.orNull,
       defaultValue.map(_.toV2(statement, name)).orNull,
-      generationExpression.orNull,
+      generationExpression.map(_.toV2).orNull,
       identityColumnSpec.orNull,
-      if (metadata == Metadata.empty) null else metadata.json)
+      if (metadata == Metadata.empty) null else metadata.json,
+      id = null /* must be assigned by connectors */)
   }
 
   def toV1Column: StructField = {
@@ -74,17 +96,17 @@ case class ColumnDefinition(
       metadataBuilder.putString("comment", c)
     }
     defaultValue.foreach { default =>
-      // For v1 CREATE TABLE command, we will resolve and execute the default value expression later
-      // in the rule `DataSourceAnalysis`. We just need to put the default value SQL string here.
-      metadataBuilder.putString(CURRENT_DEFAULT_COLUMN_METADATA_KEY, default.originalSQL)
+      metadataBuilder.putExpression(
+        CURRENT_DEFAULT_COLUMN_METADATA_KEY, default.originalSQL, Some(default.child))
       val existsSQL = default.child match {
         case l: Literal => l.sql
         case _ => default.originalSQL
       }
       metadataBuilder.putString(EXISTS_DEFAULT_COLUMN_METADATA_KEY, existsSQL)
     }
-    generationExpression.foreach { generationExpr =>
-      metadataBuilder.putString(GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY, generationExpr)
+    generationExpression.foreach { genExpr =>
+      metadataBuilder.putString(GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY,
+        genExpr.originalSQL)
     }
     encodeIdentityColumnSpec(metadataBuilder)
     StructField(name, dataType, nullable, metadataBuilder.build())
@@ -99,13 +121,33 @@ case class ColumnDefinition(
         spec.isAllowExplicitInsert)
     }
   }
+
+  /**
+   * Returns true if the default value's type has been coerced to match this column's dataType.
+   * After type coercion, the default value expression's dataType should match the column's
+   * dataType (with CHAR/VARCHAR replaced by STRING).
+   */
+  def isDefaultValueTypeCoerced: Boolean = defaultValue.forall { d =>
+    ColumnDefinition.isDefaultValueTypeMatched(d.child.dataType, dataType)
+  }
 }
 
 object ColumnDefinition {
 
+  /**
+   * Returns true if the default value's type matches the target column type.
+   * CHAR/VARCHAR types are replaced with STRING before comparison since type coercion
+   * converts them to STRING.
+   */
+  def isDefaultValueTypeMatched(defaultValueType: DataType, targetType: DataType): Boolean = {
+    val expectedType = CharVarcharUtils.replaceCharVarcharWithString(targetType)
+    defaultValueType == expectedType
+  }
+
   def fromV1Column(col: StructField, parser: ParserInterface): ColumnDefinition = {
     val metadataBuilder = new MetadataBuilder().withMetadata(col.metadata)
     metadataBuilder.remove("comment")
+    metadataBuilder.remove(FIELD_ID_METADATA_KEY)
     metadataBuilder.remove(CURRENT_DEFAULT_COLUMN_METADATA_KEY)
     metadataBuilder.remove(EXISTS_DEFAULT_COLUMN_METADATA_KEY)
     metadataBuilder.remove(GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY)
@@ -116,12 +158,17 @@ object ColumnDefinition {
     val hasDefaultValue = col.getCurrentDefaultValue().isDefined &&
       col.getExistenceDefaultValue().isDefined
     val defaultValue = if (hasDefaultValue) {
+      // `ColumnDefinition` is for CREATE/REPLACE TABLE commands, and it only needs one
+      // default value. Here we assume user wants the current default of the v1 column to be
+      // the default value of this column definition.
       val defaultValueSQL = col.getCurrentDefaultValue().get
       Some(DefaultValueExpression(parser.parseExpression(defaultValueSQL), defaultValueSQL))
     } else {
       None
     }
-    val generationExpr = GeneratedColumn.getGenerationExpression(col)
+    val generationExpr = GeneratedColumn.getGenerationExpression(col).map { sql =>
+      GeneratedColumnExpression(parser.parseExpression(sql), sql)
+    }
     val identityColumnSpec = if (col.metadata.contains(IdentityColumn.IDENTITY_INFO_START)) {
       Some(new IdentityColumnSpec(
         col.metadata.getLong(IdentityColumn.IDENTITY_INFO_START),
@@ -133,7 +180,7 @@ object ColumnDefinition {
     }
     ColumnDefinition(
       col.name,
-      col.dataType,
+      SchemaUtils.clearFieldIds(col.dataType),
       col.nullable,
       col.getComment(),
       defaultValue,
@@ -192,7 +239,7 @@ object ColumnDefinition {
         messageParameters = Map(
           "colName" -> col.name,
           "defaultValue" -> col.defaultValue.get.originalSQL,
-          "genExpr" -> col.generationExpression.get
+          "genExpr" -> col.generationExpression.get.originalSQL
         )
       )
     }
@@ -223,7 +270,9 @@ case class DefaultValueExpression(
   final override val nodePatterns: Seq[TreePattern] = Seq(ANALYSIS_AWARE_EXPRESSION)
 
   override def dataType: DataType = child.dataType
-  override def stringArgs: Iterator[Any] = Iterator(child, originalSQL)
+  override def prettyName: String = "default"
+  override def sql: String = s"DEFAULT $originalSQL"
+  override def stringArgs: Iterator[Any] = Iterator(child, s"sql='$originalSQL'")
   override def markAsAnalyzed(): DefaultValueExpression =
     copy(analyzedChild = Some(child))
   override protected def withNewChildInternal(newChild: Expression): Expression =

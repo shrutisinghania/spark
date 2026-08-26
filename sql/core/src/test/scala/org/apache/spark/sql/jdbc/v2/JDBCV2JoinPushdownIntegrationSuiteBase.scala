@@ -21,7 +21,7 @@ import java.sql.{Connection, DriverManager}
 import java.util.Properties
 
 import org.apache.spark.SparkConf
-import org.apache.spark.sql.{QueryTest, Row}
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.connector.DataSourcePushdownTestUtils
 import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
@@ -32,8 +32,7 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{DataType, DataTypes, StructField, StructType}
 
 trait JDBCV2JoinPushdownIntegrationSuiteBase
-  extends QueryTest
-  with SharedSparkSession
+  extends SharedSparkSession
   with DataSourcePushdownTestUtils {
   val catalogName: String = "join_pushdown_catalog"
   val namespace: String = "join_schema"
@@ -561,12 +560,34 @@ trait JDBCV2JoinPushdownIntegrationSuiteBase
     }
   }
 
-  test("Test left outer join should not be pushed down") {
+  test("Test left outer join with condition should be pushed down") {
     val sqlQuery =
       s"""
          |SELECT t1.id, t1.address, t2.surname
          |FROM $catalogAndNamespace.$casedJoinTableName1 t1
-         |LEFT JOIN $catalogAndNamespace.$casedJoinTableName2 t2 ON t1.id = t2.id
+         |LEFT JOIN $catalogAndNamespace.$casedJoinTableName2 t2
+         |ON t1.id = t2.id
+         |""".stripMargin
+
+    val rows = withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "false") {
+      sql(sqlQuery).collect().toSeq
+    }
+
+    assert(rows.nonEmpty)
+    withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "true") {
+      val df = sql(sqlQuery)
+      checkJoinPushed(df)
+      checkAnswer(df, rows)
+    }
+  }
+
+  test("Test left outer join without condition - no pushdown") {
+    val sqlQuery =
+      s"""
+         |SELECT * FROM
+         |$catalogAndNamespace.$casedJoinTableName1 a
+         |LEFT JOIN
+         |$catalogAndNamespace.$casedJoinTableName2 b
          |""".stripMargin
 
     val rows = withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "false") {
@@ -575,17 +596,40 @@ trait JDBCV2JoinPushdownIntegrationSuiteBase
 
     withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "true") {
       val df = sql(sqlQuery)
+
       checkJoinNotPushed(df)
       checkAnswer(df, rows)
     }
   }
 
-  test("Test right outer join should not be pushed down") {
+  test("Test right outer join with condition should be pushed down") {
     val sqlQuery =
       s"""
          |SELECT t1.id, t1.address, t2.surname
          |FROM $catalogAndNamespace.$casedJoinTableName1 t1
-         |RIGHT JOIN $catalogAndNamespace.$casedJoinTableName2 t2 ON t1.id = t2.id
+         |RIGHT JOIN $catalogAndNamespace.$casedJoinTableName2 t2
+         |ON t1.id = t2.id
+         |""".stripMargin
+
+    val rows = withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "false") {
+      sql(sqlQuery).collect().toSeq
+    }
+
+    assert(rows.nonEmpty)
+    withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "true") {
+      val df = sql(sqlQuery)
+      checkJoinPushed(df)
+      checkAnswer(df, rows)
+    }
+  }
+
+  test("Test right outer join without condition - no pushdown") {
+    val sqlQuery =
+      s"""
+         |SELECT * FROM
+         |$catalogAndNamespace.$casedJoinTableName1 a
+         |RIGHT JOIN
+         |$catalogAndNamespace.$casedJoinTableName2 b
          |""".stripMargin
 
     val rows = withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "false") {
@@ -594,6 +638,7 @@ trait JDBCV2JoinPushdownIntegrationSuiteBase
 
     withSQLConf(SQLConf.DATA_SOURCE_V2_JOIN_PUSHDOWN.key -> "true") {
       val df = sql(sqlQuery)
+
       checkJoinNotPushed(df)
       checkAnswer(df, rows)
     }

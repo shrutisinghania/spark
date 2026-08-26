@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -16,9 +15,8 @@
 # limitations under the License.
 #
 
-import inspect
 import array as pyarray
-import unittest
+import inspect
 
 import numpy as np
 
@@ -37,9 +35,9 @@ from pyspark.ml.feature import (
 from pyspark.ml.linalg import DenseVector, SparseVector, Vectors
 from pyspark.ml.param import Param, Params, TypeConverters
 from pyspark.ml.param.shared import HasInputCol, HasMaxIter, HasSeed
-from pyspark.ml.regression import LinearRegressionModel, GeneralizedLinearRegressionModel
+from pyspark.ml.regression import GeneralizedLinearRegressionModel, LinearRegressionModel
 from pyspark.ml.wrapper import JavaParams
-from pyspark.testing.mlutils import check_params, PySparkTestCase, SparkSessionTestCase
+from pyspark.testing.mlutils import PySparkTestCase, SparkSessionTestCase, check_params
 
 
 class ParamTypeConversionTests(PySparkTestCase):
@@ -50,14 +48,14 @@ class ParamTypeConversionTests(PySparkTestCase):
     def test_int(self):
         lr = LogisticRegression(maxIter=5.0)
         self.assertEqual(lr.getMaxIter(), 5)
-        self.assertTrue(type(lr.getMaxIter()) == int)
+        self.assertTrue(isinstance(lr.getMaxIter(), int))
         self.assertRaises(TypeError, lambda: LogisticRegression(maxIter="notAnInt"))
         self.assertRaises(TypeError, lambda: LogisticRegression(maxIter=5.1))
 
     def test_float(self):
         lr = LogisticRegression(tol=1)
         self.assertEqual(lr.getTol(), 1.0)
-        self.assertTrue(type(lr.getTol()) == float)
+        self.assertTrue(isinstance(lr.getTol(), float))
         self.assertRaises(TypeError, lambda: LogisticRegression(tol="notAFloat"))
 
     def test_vector(self):
@@ -79,7 +77,7 @@ class ParamTypeConversionTests(PySparkTestCase):
             tuple(lst),
         ]:
             converted = TypeConverters.toList(lst_like)
-            self.assertEqual(type(converted), list)
+            self.assertIsInstance(converted, list)
             self.assertListEqual(converted, lst)
 
     def test_list_int(self):
@@ -94,21 +92,21 @@ class ParamTypeConversionTests(PySparkTestCase):
         ]:
             vs = VectorSlicer(indices=indices)
             self.assertListEqual(vs.getIndices(), [1, 2])
-            self.assertTrue(all([type(v) == int for v in vs.getIndices()]))
+            self.assertTrue(all([isinstance(v, int) for v in vs.getIndices()]))
         self.assertRaises(TypeError, lambda: VectorSlicer(indices=["a", "b"]))
 
     def test_list_float(self):
         b = Bucketizer(splits=[1, 4])
         self.assertEqual(b.getSplits(), [1.0, 4.0])
-        self.assertTrue(all([type(v) == float for v in b.getSplits()]))
+        self.assertTrue(all([isinstance(v, float) for v in b.getSplits()]))
         self.assertRaises(TypeError, lambda: Bucketizer(splits=["a", 1.0]))
 
     def test_list_list_float(self):
         b = Bucketizer(splitsArray=[[-0.1, 0.5, 3], [-5, 1.5]])
         self.assertEqual(b.getSplitsArray(), [[-0.1, 0.5, 3.0], [-5.0, 1.5]])
-        self.assertTrue(all([type(v) == list for v in b.getSplitsArray()]))
-        self.assertTrue(all([type(v) == float for v in b.getSplitsArray()[0]]))
-        self.assertTrue(all([type(v) == float for v in b.getSplitsArray()[1]]))
+        self.assertTrue(all([isinstance(v, list) for v in b.getSplitsArray()]))
+        self.assertTrue(all([isinstance(v, float) for v in b.getSplitsArray()[0]]))
+        self.assertTrue(all([isinstance(v, float) for v in b.getSplitsArray()[1]]))
         self.assertRaises(TypeError, lambda: Bucketizer(splitsArray=["a", 1.0]))
         self.assertRaises(TypeError, lambda: Bucketizer(splitsArray=[[-5, 1.5], ["a", 1.0]]))
 
@@ -137,7 +135,7 @@ class TestParams(HasMaxIter, HasInputCol, HasSeed):
 
     @keyword_only
     def __init__(self, seed=None):
-        super(TestParams, self).__init__()
+        super().__init__()
         self._setDefault(maxIter=10)
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
@@ -159,7 +157,7 @@ class OtherTestParams(HasMaxIter, HasInputCol, HasSeed):
 
     @keyword_only
     def __init__(self, seed=None):
-        super(OtherTestParams, self).__init__()
+        super().__init__()
         self._setDefault(maxIter=10)
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
@@ -176,7 +174,7 @@ class OtherTestParams(HasMaxIter, HasInputCol, HasSeed):
 
 class HasThrowableProperty(Params):
     def __init__(self):
-        super(HasThrowableProperty, self).__init__()
+        super().__init__()
         self.p = Param(self, "none", "empty param")
 
     @property
@@ -195,14 +193,14 @@ class ParamTests(SparkSessionTestCase):
         maxIter = testParams.maxIter
         self.assertEqual(maxIter.name, "maxIter")
         self.assertEqual(maxIter.doc, "max number of iterations (>= 0).")
-        self.assertTrue(maxIter.parent == testParams.uid)
+        self.assertEqual(maxIter.parent, testParams.uid)
 
     def test_param(self):
         testParams = TestParams()
         maxIter = testParams.maxIter
         self.assertEqual(maxIter.name, "maxIter")
         self.assertEqual(maxIter.doc, "max number of iterations (>= 0).")
-        self.assertTrue(maxIter.parent == testParams.uid)
+        self.assertEqual(maxIter.parent, testParams.uid)
 
     def test_hasparam(self):
         testParams = TestParams()
@@ -388,10 +386,10 @@ class DefaultValuesTests(PySparkTestCase):
     def test_java_params(self):
         import re
 
-        import pyspark.ml.feature
         import pyspark.ml.classification
         import pyspark.ml.clustering
         import pyspark.ml.evaluation
+        import pyspark.ml.feature
         import pyspark.ml.pipeline
         import pyspark.ml.recommendation
         import pyspark.ml.regression
@@ -430,12 +428,6 @@ class DefaultValuesTests(PySparkTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.test_param import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

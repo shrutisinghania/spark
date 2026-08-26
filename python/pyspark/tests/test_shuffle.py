@@ -14,21 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
 import random
 import unittest
 from tempfile import TemporaryDirectory
-import os
 
 from py4j.protocol import Py4JJavaError
 
-from pyspark import shuffle, CPickleSerializer, SparkConf, SparkContext
+from pyspark import CPickleSerializer, SparkConf, SparkContext, shuffle
 from pyspark.shuffle import (
     Aggregator,
+    ExternalGroupBy,
     ExternalMerger,
     ExternalSorter,
-    SimpleAggregator,
     Merger,
-    ExternalGroupBy,
+    SimpleAggregator,
 )
 
 
@@ -256,12 +256,6 @@ class SorterTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_shuffle import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

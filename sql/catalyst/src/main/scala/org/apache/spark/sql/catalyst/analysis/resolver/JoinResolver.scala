@@ -19,23 +19,22 @@ package org.apache.spark.sql.catalyst.analysis.resolver
 
 import java.util.HashSet
 
-import org.apache.spark.sql.catalyst.analysis.{AnalysisErrorAt, NaturalAndUsingJoinResolution}
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, ExprId}
+import org.apache.spark.sql.catalyst.analysis.NaturalAndUsingJoinResolution
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, ExprId, NamedExpression}
 import org.apache.spark.sql.catalyst.plans.{JoinType, NaturalJoin, UsingJoin}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, JoinHint, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.util._
-import org.apache.spark.sql.types.BooleanType
 
 /**
  * Resolves [[Join]] operator by resolving its left and right children and its join condition. If
  * the unresolved join is [[NaturalJoin]] or [[UsingJoin]], the resulting operator will be
  * [[Project]], otherwise it will be [[Join]].
  */
-class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
-    extends TreeNodeResolver[Join, LogicalPlan] {
-  private val scopes = resolver.getNameScopes
-  private val expressionIdAssigner = expressionResolver.getExpressionIdAssigner
-  private val cteRegistry = resolver.getCteRegistry
+class JoinResolver(
+    override val resolver: Resolver,
+    override val expressionResolver: ExpressionResolver)
+    extends TreeNodeResolver[Join, LogicalPlan]
+    with JoinLikeResolver {
 
   /**
    * Resolves [[Join]] operator:
@@ -47,16 +46,16 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
    *  - Based on the type of [[Join]] (natural, using or other) perform additional transformations
    *  and resolve join condition.
    *  - Return the resulting [[Project]] or [[Join]] with new children optionally wrapped in
-   *  [[WithCTE]]. See [[CteScope]] scaladoc for more info.
+   *    [[WithCTE]]. See [[CteScope]] scaladoc for more info.
    */
   override def resolve(unresolvedJoin: Join): LogicalPlan = {
     val (resolvedLeftOperator: LogicalPlan, leftNameScope: NameScope) = resolveJoinChild(
-      unresolvedJoin = unresolvedJoin,
+      unresolvedOperator = unresolvedJoin,
       child = unresolvedJoin.left
     )
 
     val (resolvedRightOperator: LogicalPlan, rightNameScope: NameScope) = resolveJoinChild(
-      unresolvedJoin = unresolvedJoin,
+      unresolvedOperator = unresolvedJoin,
       child = unresolvedJoin.right
     )
 
@@ -79,26 +78,6 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
       leftNameScope = leftNameScope,
       rightNameScope = rightNameScope
     )
-  }
-
-  private def resolveJoinChild(
-      unresolvedJoin: Join,
-      child: LogicalPlan): (LogicalPlan, NameScope) = {
-    expressionIdAssigner.pushMapping()
-    scopes.pushScope()
-    cteRegistry.pushScopeForMultiChildOperator(
-      unresolvedOperator = unresolvedJoin,
-      unresolvedChild = child
-    )
-
-    try {
-      val resolvedLeftOperator = resolver.resolve(child)
-      (resolvedLeftOperator, scopes.current)
-    } finally {
-      cteRegistry.popScope()
-      scopes.popScope()
-      expressionIdAssigner.popMapping(collectChildMapping = true)
-    }
   }
 
   /**
@@ -161,6 +140,7 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
    *    - New project list becomes output list.
    *    - If [[Join]] was not a top level operator, append current hidden output to the project
    *    list.
+   *    - Store the resolved [[Join]] as the [[OperatorResolutionContextStack.baseOperator]].
    *    - Add qualified access only attributes from new hidden output as a tag to project node in
    *    order to stay compatible with fixed-point. This should never be used in single-pass, but it
    *    can happen that fixed-point uses the single-pass result, therefore we need to set the tag.
@@ -187,8 +167,10 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
         resolveName = conf.resolver
       )
 
-    val newOutputList = outputList.map { attribute =>
-      expressionIdAssigner.mapExpression(attribute)
+    val newOutputList = outputList.map { column =>
+      expressionResolver
+        .resolveExpressionTreeInOperator(column, unresolvedJoin)
+        .asInstanceOf[NamedExpression]
     }
 
     val resolvedCondition =
@@ -197,7 +179,7 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
     scopes.overwriteCurrent(
       output = Some(newOutputList.map(_.toAttribute)),
       hiddenOutput = Some(
-        computeHiddenOutputForNaturelAndUsingJoin(
+        computeHiddenOutputForNaturalAndUsingJoin(
           newHiddenOutput = hiddenList,
           oldHiddenOutput = scopes.current.hiddenOutput
         )
@@ -208,13 +190,17 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
       scopes.current.hiddenOutput.filter(_.qualifiedAccessOnly)
 
     val newProjectList =
-      if (unresolvedJoin.getTagValue(Resolver.TOP_LEVEL_OPERATOR).isEmpty) {
+      if (!unresolvedJoin.containsTag(ResolverTag.TOP_LEVEL_OPERATOR)) {
         newOutputList ++ qualifiedAccessOnlyColumnsFromHiddenOutput
       } else {
         newOutputList
       }
 
-    val project = Project(newProjectList, Join(left, right, joinType, resolvedCondition, hint))
+    val resolvedJoin = Join(left, right, joinType, resolvedCondition, hint)
+
+    operatorResolutionContextStack.current.baseOperator = Some(resolvedJoin)
+
+    val project = Project(newProjectList, resolvedJoin)
 
     project.setTagValue(Project.hiddenOutputTag, qualifiedAccessOnlyColumnsFromHiddenOutput)
 
@@ -238,7 +224,7 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
    * which has correct access qualifiers, and old versions of these attributes without new
    * qualifiers must be thrown away.
    */
-  private def computeHiddenOutputForNaturelAndUsingJoin(
+  private def computeHiddenOutputForNaturalAndUsingJoin(
       newHiddenOutput: Seq[Attribute],
       oldHiddenOutput: Seq[Attribute]
   ): Seq[Attribute] = {
@@ -256,7 +242,8 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
    * Resolve a join that is not [[NaturalJoin]] or [[UsingJoin]]. In order to resolve the join we
    * do the following:
    *  - Resolve join condition.
-   *  - Overwrite [[NameScope.output]] with join's output.
+   *  - Overwrite [[NameScope.output]] with join's output and overwrite [[NameScope.hiddenOutput]]
+   *    using the result of `computeHiddenOutputForRegularJoin` call.
    *  - Wrap the [[Join]] in [[WithCTE]] if necessary.
    */
   private def handleRegularJoin(
@@ -271,15 +258,20 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
       rightNameScope = rightNameScope
     )
 
+    val newOutput = Join.computeOutput(
+      joinType = partiallyResolvedJoin.joinType,
+      leftOutput = leftNameScope.output,
+      rightOutput = rightNameScope.output
+    )
+
+    val newHiddenOutput = computeHiddenOutputForRegularJoin(
+      mainOutput = newOutput,
+      oldHiddenOutput = scopes.current.hiddenOutput
+    )
+
     scopes.overwriteCurrent(
-      output = Some(
-        Join.computeOutput(
-          partiallyResolvedJoin.joinType,
-          leftNameScope.output,
-          rightNameScope.output
-        )
-      ),
-      hiddenOutput = Some(leftNameScope.hiddenOutput ++ rightNameScope.hiddenOutput)
+      output = Some(newOutput),
+      hiddenOutput = Some(newHiddenOutput)
     )
 
     val resolvedJoin = partiallyResolvedJoin.copy(condition = resolvedCondition)
@@ -291,61 +283,74 @@ class JoinResolver(resolver: Resolver, expressionResolver: ExpressionResolver)
   }
 
   /**
+   * Compute new hidden output for the regular [[Join]]s. This new output contains attributes from
+   * the main output (computed using the [[Join.computeOutput]]) the qualified access only
+   * attributes from the old hidden output. All the attributes must be unique and attributes from
+   * the main output take the precedence over the attributes from the old hidden output. Consider
+   * this query:
+   *
+   * {{{
+   * SELECT
+   *     col2 AS ltrl
+   * FROM
+   *     t1 AS t1_1
+   * LEFT SEMI JOIN
+   *     t1 AS t1_2
+   *     ON t1_1.col1 = t1_2.col1
+   * ORDER BY
+   *     col2;
+   * }}}
+   *
+   * In this example, hidden output would be `Seq(col1, col2)` which is the output of the [[Join]]
+   * itself (old hidden output attributes are filtered out as there are no qualified access only).
+   *
+   * Regarding qualified access only attributes, consider this query:
+   *
+   * {{{
+   *   SELECT
+   *     nt1.*,
+   *     nt2.*,
+   *     nt3.*
+   *   FROM
+   *     VALUES (1, 2) AS nt1(k, v)
+   *   NATURAL JOIN
+   *     VALUES (1, 2) AS nt2(k, v)
+   *   JOIN
+   *     VALUES (1, 2) AS nt3(k, v)
+   *   ON nt2.k = nt3.k;
+   * }}}
+   *
+   * In this example we have a regular [[Join]] on top of a natural [[Join]] which produces
+   * qualified access only attributes. These attributes have to be preserved so they can be queried
+   * aftewards in the project list and thus the hidden output of the regular join will be:
+   * [k, v, k, v, k, v] where the last to `k` and `v` are qualified access only attributes from the
+   * natural join.
+   */
+  private def computeHiddenOutputForRegularJoin(
+      mainOutput: Seq[Attribute],
+      oldHiddenOutput: Seq[Attribute]): Seq[Attribute] = {
+    val mainOutputLookup = new HashSet[ExprId](mainOutput.size)
+    mainOutput.foreach { attribute =>
+      mainOutputLookup.add(attribute.exprId)
+    }
+
+    val oldHiddenOutputQualifiedAccessOnlyAttributes = oldHiddenOutput.filter { attribute =>
+      !mainOutputLookup.contains(attribute.exprId) &&
+      attribute.qualifiedAccessOnly
+    }
+
+    mainOutput ++ oldHiddenOutputQualifiedAccessOnlyAttributes
+  }
+
+  /**
    * Computes the intersection of two child name scopes, by name.
    */
   private def getJoinNamesForNaturalJoin(
       leftNameScope: NameScope,
       rightNameScope: NameScope): Seq[String] = {
-    leftNameScope.output
-      .flatMap(attribute => rightNameScope.findAttributesByName(attribute.name))
-      .map(_.name)
-  }
-
-  /**
-   * Resolves join condition by __all__ attributes from child scopes. We need to overwrite current
-   * scope first to prepare for [[resolveExpressionTreeInOperator]]. [[Join]] will actually produce
-   * different output than the one we are setting here, so additional overwrite with correct values
-   * will be needed. Two overwrites are necessary because condition is resolved from original
-   * children outputs, whereas output of [[Join]] will either not contain all attributes or their
-   * nullabilities will be different.
-   */
-  private def resolveJoinCondition(
-      unresolvedJoin: Join,
-      unresolvedCondition: Option[Expression],
-      leftNameScope: NameScope,
-      rightNameScope: NameScope) = {
-    scopes.overwriteCurrent(
-      output = Some(leftNameScope.output ++ rightNameScope.output),
-      hiddenOutput = Some(leftNameScope.hiddenOutput ++ rightNameScope.hiddenOutput)
+    NaturalAndUsingJoinResolution.canonicalizedIntersect(
+      leftNameScope.output.map(_.name),
+      rightNameScope.output.map(_.name)
     )
-
-    val resolvedCondition = unresolvedCondition.map { condition =>
-      expressionResolver.resolveExpressionTreeInOperator(
-        condition,
-        unresolvedJoin
-      )
-    }
-
-    validateJoinConditionDataType(resolvedCondition, unresolvedJoin)
-
-    resolvedCondition
-  }
-
-  private def validateJoinConditionDataType(
-      condition: Option[Expression],
-      unresolvedJoin: Join): Unit = {
-    condition match {
-      case Some(condition) =>
-        if (condition.dataType != BooleanType) {
-          unresolvedJoin.failAnalysis(
-            errorClass = "JOIN_CONDITION_IS_NOT_BOOLEAN_TYPE",
-            messageParameters = Map(
-              "joinCondition" -> toSQLExpr(condition),
-              "conditionType" -> toSQLType(condition.dataType)
-            )
-          )
-        }
-      case None =>
-    }
   }
 }

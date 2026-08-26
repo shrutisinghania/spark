@@ -25,19 +25,23 @@ import scala.jdk.CollectionConverters._
 import org.apache.spark.{SparkException, SparkIllegalArgumentException}
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.CurrentUserContext
-import org.apache.spark.sql.catalyst.analysis.{AsOfTimestamp, AsOfVersion, NamedRelation, NoSuchDatabaseException, NoSuchFunctionException, NoSuchTableException, TimeTravelSpec}
+import org.apache.spark.sql.catalyst.analysis.{AsOfTimestamp, AsOfVersion, NamedRelation, NoSuchDatabaseException, NoSuchFunctionException, NoSuchTableException, RelationCache, TimeTravelSpec}
 import org.apache.spark.sql.catalyst.catalog.ClusterBySpec
 import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, V2ExpressionUtils}
 import org.apache.spark.sql.catalyst.plans.logical.{SerdeInfo, TableSpec}
 import org.apache.spark.sql.catalyst.util.{GeneratedColumn, IdentityColumn}
+import org.apache.spark.sql.catalyst.util.FieldMetadataUtils.FIELD_ID_METADATA_KEY
 import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns._
 import org.apache.spark.sql.connector.catalog.TableChange._
 import org.apache.spark.sql.connector.catalog.constraints.Constraint
 import org.apache.spark.sql.connector.catalog.functions.UnboundFunction
 import org.apache.spark.sql.connector.expressions.{ClusterByTransform, LiteralValue, Transform}
+import org.apache.spark.sql.errors.DataTypeErrors.toSQLId
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, MapType, Metadata, MetadataBuilder, StructField, StructType}
-import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.sql.util.{CaseInsensitiveStringMap, SchemaUtils}
 import org.apache.spark.util.ArrayImplicits._
 
 private[sql] object CatalogV2Util {
@@ -76,6 +80,20 @@ private[sql] object CatalogV2Util {
       SupportsNamespaces.PROP_COLLATION,
       SupportsNamespaces.PROP_LOCATION,
       SupportsNamespaces.PROP_OWNER)
+
+  private val COMMON_COL_METADATA_KEYS = Seq("comment", FIELD_ID_METADATA_KEY)
+
+  private val DEFAULT_COL_METADATA_KEYS = Seq(
+    CURRENT_DEFAULT_COLUMN_METADATA_KEY,
+    EXISTS_DEFAULT_COLUMN_METADATA_KEY)
+
+  private val GENERATED_COL_METADATA_KEYS = Seq(
+    GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY)
+
+  private val IDENTITY_COL_METADATA_KEYS = Seq(
+    IdentityColumn.IDENTITY_INFO_START,
+    IdentityColumn.IDENTITY_INFO_STEP,
+    IdentityColumn.IDENTITY_INFO_ALLOW_EXPLICIT_INSERT)
 
   /**
    * Apply properties changes to a map and return the result.
@@ -249,7 +267,11 @@ private[sql] object CatalogV2Util {
 
         case update: UpdateColumnComment =>
           replace(schema, update.fieldNames.toImmutableArraySeq, field =>
-            Some(field.withComment(update.newComment)))
+            if (update.newComment != null) {
+              Some(field.withComment(update.newComment))
+            } else {
+              Some(field.clearComment())
+            })
 
         case update: UpdateColumnPosition =>
           def updateFieldPos(struct: StructType, name: String): StructType = {
@@ -364,7 +386,7 @@ private[sql] object CatalogV2Util {
     }
     validateTableProviderForDefaultValue(
       newSchema, tableProvider, statementType, addNewColumnToExistingTable)
-    constantFoldCurrentDefaultsToExistDefaults(newSchema, statementType)
+    newSchema
   }
 
   private def replace(
@@ -452,36 +474,121 @@ private[sql] object CatalogV2Util {
       catalog: CatalogPlugin,
       ident: Identifier,
       timeTravelSpec: Option[TimeTravelSpec] = None,
-      writePrivilegesString: Option[String] = None): Option[Table] =
+      writePrivilegesString: Option[String] = None,
+      options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty()): Option[Table] =
     try {
-      Option(getTable(catalog, ident, timeTravelSpec, writePrivilegesString))
+      Option(getTable(catalog, ident, timeTravelSpec, writePrivilegesString, options))
     } catch {
       case _: NoSuchTableException => None
       case _: NoSuchDatabaseException => None
     }
 
+  /**
+   * Extracts the options that may select table state from a complete option map. These are the
+   * only options passed to `loadTable` and used to identify a pinned table state.
+   */
+  def extractTableStateOptions(
+      catalog: CatalogPlugin,
+      options: CaseInsensitiveStringMap): CaseInsensitiveStringMap = {
+    val stateKeys = catalog.asTableCatalog.tableStateOptionKeys.asScala
+      .map(_.toLowerCase(Locale.ROOT))
+      .toSet
+    val projected = options.asCaseSensitiveMap().asScala.collect {
+      case (key, value) if stateKeys.contains(key.toLowerCase(Locale.ROOT)) => key -> value
+    }.toMap
+    new CaseInsensitiveStringMap(projected.asJava)
+  }
+
+  /**
+   * Loads a table from the catalog. Callers may pass the complete option map, but only the keys the
+   * catalog declares via `tableStateOptionKeys()` are forwarded to `loadTable`, so the loaded table
+   * state stays independent of non-state options and of how many times the table is referenced.
+   */
   def getTable(
       catalog: CatalogPlugin,
       ident: Identifier,
       timeTravelSpec: Option[TimeTravelSpec] = None,
-      writePrivilegesString: Option[String] = None): Table = {
-    if (timeTravelSpec.nonEmpty) {
-      assert(writePrivilegesString.isEmpty, "Should not write to a table with time travel")
-      timeTravelSpec.get match {
-        case v: AsOfVersion =>
-          catalog.asTableCatalog.loadTable(ident, v.version)
-        case ts: AsOfTimestamp =>
-          catalog.asTableCatalog.loadTable(ident, ts.timestamp)
-      }
-    } else {
-      if (writePrivilegesString.isDefined) {
-        val writePrivileges = writePrivilegesString.get.split(",").map(_.trim)
-          .map(TableWritePrivilege.valueOf).toSet.asJava
-        catalog.asTableCatalog.loadTable(ident, writePrivileges)
-      } else {
-        catalog.asTableCatalog.loadTable(ident)
-      }
+      writePrivilegesString: Option[String] = None,
+      options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty()): Table = {
+    val timeTravel: TimeTravel = timeTravelSpec match {
+      case Some(v: AsOfVersion) => new TimeTravel.AsOfVersion(v.version)
+      case Some(ts: AsOfTimestamp) => new TimeTravel.AsOfTimestamp(ts.timestamp)
+      case None => null
     }
+    val context = new TableContext(timeTravel, parseWritePrivileges(writePrivilegesString))
+    val stateOptions = extractTableStateOptions(catalog, options)
+    catalog.asTableCatalog.loadTable(ident, context, stateOptions)
+  }
+
+  /**
+   * Loads a table for a write, forwarding the required privileges and only the write options that
+   * the catalog declares may affect table state. The complete option map remains on the write
+   * relation for write planning.
+   */
+  def loadTableForV2Write(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      writePrivileges: Set[TableWritePrivilege],
+      options: CaseInsensitiveStringMap): Table = {
+    rejectTimeTravelOptionsForWrite(catalog, ident, options)
+    loadTableForWrite(catalog, ident, writePrivileges, options)
+  }
+
+  /**
+   * Loads a table for a write without validating the complete write option map. This is used by
+   * callers that must inspect whether the loaded table falls back to V1 before applying V2-only
+   * option validation.
+   */
+  def loadTableForWrite(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      writePrivileges: Set[TableWritePrivilege],
+      options: CaseInsensitiveStringMap): Table = {
+    val context = new TableContext(null, writePrivileges.asJava)
+    val stateOptions = extractTableStateOptions(catalog, options)
+    catalog.asTableCatalog.loadTable(ident, context, stateOptions)
+  }
+
+  def rejectTimeTravelOptionsForWrite(
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      options: CaseInsensitiveStringMap): Unit = {
+    if (containsTimeTravelOptions(options)) {
+      throw QueryCompilationErrors.timeTravelUnsupportedError(
+        toSQLId(ident.toQualifiedNameParts(catalog)))
+    }
+  }
+
+  def containsTimeTravelOptions(options: CaseInsensitiveStringMap): Boolean = {
+    val conf = SQLConf.get
+    Seq(
+      conf.getConf(SQLConf.TIME_TRAVEL_TIMESTAMP_KEY),
+      conf.getConf(SQLConf.TIME_TRAVEL_VERSION_KEY)).exists(options.containsKey)
+  }
+
+  /**
+   * Parses the comma-separated write-privileges string (as carried in the internal
+   * [[org.apache.spark.sql.catalyst.analysis.UnresolvedRelation.REQUIRED_WRITE_PRIVILEGES]]
+   * option) into a set of [[TableWritePrivilege]]. Returns an empty set when absent (a read).
+   */
+  private def parseWritePrivileges(
+      writePrivilegesString: Option[String]): util.Set[TableWritePrivilege] = {
+    writePrivilegesString match {
+      case Some(str) =>
+        str.split(",").map(_.trim).map(TableWritePrivilege.valueOf).toSet.asJava
+      case None =>
+        util.Set.of()
+    }
+  }
+
+  /**
+   * Search path for analysis errors for a V2 table identifier: catalog name, then either the
+   * identifier's namespace (if non-empty) or the catalog's default namespace.
+   */
+  def searchPathForTableIdentifier(catalog: TableCatalog, ident: Identifier): Seq[String] = {
+    catalog.name() +: (
+      if (ident.namespace().nonEmpty) ident.namespace().toSeq
+      else catalog.defaultNamespace().toSeq)
   }
 
   def loadFunction(catalog: CatalogPlugin, ident: Identifier): Option[UnboundFunction] = {
@@ -497,8 +604,45 @@ private[sql] object CatalogV2Util {
     loadTable(catalog, ident).map(DataSourceV2Relation.create(_, Some(catalog), Some(ident)))
   }
 
+  def lookupCachedRelation(
+      cache: RelationCache,
+      catalog: CatalogPlugin,
+      ident: Identifier,
+      table: Table,
+      options: CaseInsensitiveStringMap,
+      conf: SQLConf): Option[DataSourceV2Relation] = {
+    cache.lookup(
+      catalog,
+      ident,
+      Some(table.id),
+      extractTableStateOptions(catalog, options),
+      conf.resolver).collect { case r: DataSourceV2Relation => r }
+  }
+
   def isSessionCatalog(catalog: CatalogPlugin): Boolean = {
     catalog.name().equalsIgnoreCase(CatalogManager.SESSION_CATALOG_NAME)
+  }
+
+  /**
+   * Construct a [[View.Builder]] seeded from an existing view's metadata. Used by ALTER
+   * VIEW execs (SET / UNSET TBLPROPERTIES, ALTER VIEW ... WITH SCHEMA BINDING) -- override
+   * the one field that changes, then `build` to produce the replacement payload for
+   * [[ViewCatalog#replaceView]]. Every other field flows through unchanged so a metadata-only
+   * mutation does not perturb the view body.
+   */
+  def viewInfoBuilderFrom(existing: View): View.Builder = {
+    val builder = new View.Builder()
+    builder
+      .withSchema(existing.schema)
+      .withProperties(existing.properties)
+      .withQueryText(existing.queryText)
+      .withSqlConfigs(existing.sqlConfigs)
+      .withCurrentNamespace(existing.currentNamespace)
+      .withQueryColumnNames(existing.queryColumnNames)
+    Option(existing.currentCatalog).foreach(builder.withCurrentCatalog)
+    Option(existing.schemaMode).foreach(builder.withSchemaMode)
+    Option(existing.viewDependencies).foreach(builder.withViewDependencies)
+    builder
   }
 
   def convertTableProperties(t: TableSpec): Map[String, String] = {
@@ -535,7 +679,7 @@ private[sql] object CatalogV2Util {
    *  - ROW FORMAT SERDE: hive.serde
    *  - SERDEPROPERTIES: add "option." prefix
    */
-  private def convertToProperties(serdeInfo: Option[SerdeInfo]): Map[String, String] = {
+  def convertToProperties(serdeInfo: Option[SerdeInfo]): Map[String, String] = {
     serdeInfo match {
       case Some(s) =>
         s.formatClasses.map { f =>
@@ -565,12 +709,29 @@ private[sql] object CatalogV2Util {
       .asTableCatalog
   }
 
-  /**
-   * Converts DS v2 columns to StructType, which encodes column comment and default value to
-   * StructField metadata. This is mainly used to define the schema of v2 scan, w.r.t. the columns
-   * of the v2 table.
-   */
+  def toStructType(cols: Seq[MetadataColumn]): StructType = {
+    StructType(cols.map(toStructField))
+  }
+
+  private def toStructField(col: MetadataColumn): StructField = {
+    val metadata = Option(col.metadataInJSON).map(Metadata.fromJson).getOrElse(Metadata.empty)
+    var f = StructField(col.name, col.dataType, col.isNullable, metadata)
+    if (col.comment != null) {
+      f = f.withComment(col.comment)
+    }
+    f
+  }
+
   def v2ColumnsToStructType(columns: Array[Column]): StructType = {
+    v2ColumnsToStructType(columns.toImmutableArraySeq)
+  }
+
+  /**
+   * Converts DS v2 columns to StructType, which encodes column comment, default value, and
+   * column ID to StructField metadata. This is mainly used to define the schema of v2 scan,
+   * w.r.t. the columns of the v2 table.
+   */
+  def v2ColumnsToStructType(columns: Seq[Column]): StructType = {
     StructType(columns.map(v2ColumnToStructField))
   }
 
@@ -583,6 +744,15 @@ private[sql] object CatalogV2Util {
     Option(col.defaultValue()).foreach { default =>
       f = encodeDefaultValue(default, f)
     }
+    Option(col.id()).foreach { id =>
+      f = f.withId(id)
+    }
+    Option(col.generationExpression()).foreach { genExpr =>
+      f = f.copy(metadata = new MetadataBuilder()
+        .withMetadata(f.metadata)
+        .putString(GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY, genExpr)
+        .build())
+    }
     f
   }
 
@@ -590,26 +760,31 @@ private[sql] object CatalogV2Util {
   // rule will check the special metadata and change the DML input plan to fill the default value.
   private def encodeDefaultValue(defaultValue: ColumnDefaultValue, f: StructField): StructField = {
     Option(defaultValue).map { default =>
-      // The "exist default" is used to back-fill the existing data when new columns are added, and
+      // The "exists default" is used to back-fill the existing data when new columns are added, and
       // should be a fixed value which was evaluated at the definition time. For example, if the
-      // default value is `current_date()`, the "exist default" should be the value of
+      // default value is `current_date()`, the "exists default" should be the value of
       // `current_date()` when the column was defined/altered, instead of when back-fall happens.
       // Note: the back-fill here is a logical concept. The data source can keep the existing
-      //       data unchanged and let the data reader to return "exist default" for missing
+      //       data unchanged and let the data reader to return "exists default" for missing
       //       columns.
+      // The "exists default" may not be present if the data source has its own way for back-fill.
       val existsDefault = extractExistsDefault(default)
       val (sql, expr) = extractCurrentDefault(default)
-      val newMetadata = new MetadataBuilder()
-        .withMetadata(f.metadata)
-        .putString(EXISTS_DEFAULT_COLUMN_METADATA_KEY, existsDefault)
+      var metadataBuilder = new MetadataBuilder().withMetadata(f.metadata)
+      existsDefault.foreach { ed =>
+        metadataBuilder = metadataBuilder.putString(EXISTS_DEFAULT_COLUMN_METADATA_KEY, ed)
+      }
+      val metadata = metadataBuilder
         .putExpression(CURRENT_DEFAULT_COLUMN_METADATA_KEY, sql, expr)
         .build()
-      f.copy(metadata = newMetadata)
+      f.copy(metadata = metadata)
     }.getOrElse(f)
   }
 
-  private def extractExistsDefault(default: ColumnDefaultValue): String = {
-    Literal(default.getValue.value, default.getValue.dataType).sql
+  private def extractExistsDefault(default: ColumnDefaultValue): Option[String] = {
+    Option(default.getValue).map { literal =>
+      Literal(literal.value, literal.dataType).sql
+    }
   }
 
   private def extractCurrentDefault(default: ColumnDefaultValue): (String, Option[Expression]) = {
@@ -624,15 +799,21 @@ private[sql] object CatalogV2Util {
 
   /**
    * Converts a StructType to DS v2 columns, which decodes the StructField metadata to v2 column
-   * comment and default value or generation expression. This is mainly used to generate DS v2
-   * columns from table schema in DDL commands, so that Spark can pass DS v2 columns to DS v2
-   * createTable and related APIs.
+   * comment, default value or generation expression, and column ID. This is mainly used to
+   * generate DS v2 columns from table schema in DDL commands, so that Spark can pass DS v2
+   * columns to DS v2 createTable and related APIs.
    */
-  def structTypeToV2Columns(schema: StructType): Array[Column] = {
-    schema.fields.map(structFieldToV2Column)
+  def structTypeToV2Columns(
+      schema: StructType,
+      keepIds: Boolean = true): Array[Column] = {
+    schema.fields.map(structFieldToV2Column(_, keepIds))
   }
 
-  private def structFieldToV2Column(f: StructField): Column = {
+  def clearIds(columns: Array[Column]): Array[Column] = {
+    columns.map(col => Column.builderFrom(col).clearIds().build())
+  }
+
+  private def structFieldToV2Column(f: StructField, keepIds: Boolean): Column = {
     def metadataAsJson(metadata: Metadata): String = {
       if (metadata == Metadata.empty) {
         null
@@ -646,45 +827,63 @@ private[sql] object CatalogV2Util {
       }.build()
     }
 
-    val isDefaultColumn = f.getCurrentDefaultValue().isDefined &&
-      f.getExistenceDefaultValue().isDefined
+    val id = if (keepIds) f.id.orNull else null
+    val dataType = if (keepIds) f.dataType else SchemaUtils.clearFieldIds(f.dataType)
+    val comment = f.getComment().orNull
+
+    val isDefaultColumn = f.getCurrentDefaultValue().isDefined
     val isGeneratedColumn = GeneratedColumn.isGeneratedColumn(f)
     val isIdentityColumn = IdentityColumn.isIdentityColumn(f)
     if (isDefaultColumn) {
       checkDefaultColumnConflicts(f)
 
-      val e = analyze(
-        f,
-        statementType = "Column analysis",
-        metadataKey = EXISTS_DEFAULT_COLUMN_METADATA_KEY)
+      val existsDefault = if (f.getExistenceDefaultValue().isDefined) {
+        val e = analyze(
+          f,
+          statementType = "Column analysis",
+          metadataKey = EXISTS_DEFAULT_COLUMN_METADATA_KEY)
 
-      assert(e.resolved && e.foldable,
-        "The existence default value must be a simple SQL string that is resolved and foldable, " +
-          "but got: " + f.getExistenceDefaultValue().get)
-
-      val defaultValue = new ColumnDefaultValue(
-        f.getCurrentDefaultValue().get, LiteralValue(e.eval(), f.dataType))
-      val cleanedMetadata = metadataWithKeysRemoved(
-        Seq("comment", CURRENT_DEFAULT_COLUMN_METADATA_KEY, EXISTS_DEFAULT_COLUMN_METADATA_KEY))
-      Column.create(f.name, f.dataType, f.nullable, f.getComment().orNull, defaultValue,
-        metadataAsJson(cleanedMetadata))
+        assert(e.resolved && e.foldable,
+          "The existence default value must be a simple SQL string that is resolved and " +
+            "foldable, but got: " + f.getExistenceDefaultValue().get)
+        LiteralValue(e.eval(), dataType)
+      } else {
+        null
+      }
+      val defaultValue = new ColumnDefaultValue(f.getCurrentDefaultValue().get, existsDefault)
+      val removedMetaKeys = COMMON_COL_METADATA_KEYS ++ DEFAULT_COL_METADATA_KEYS
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .defaultValue(defaultValue)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(removedMetaKeys)))
+        .id(id)
+        .build()
     } else if (isGeneratedColumn) {
-      val cleanedMetadata = metadataWithKeysRemoved(
-        Seq("comment", GeneratedColumn.GENERATION_EXPRESSION_METADATA_KEY))
-      Column.create(f.name, f.dataType, f.nullable, f.getComment().orNull,
-        GeneratedColumn.getGenerationExpression(f).get, metadataAsJson(cleanedMetadata))
+      val removedMetaKeys = COMMON_COL_METADATA_KEYS ++ GENERATED_COL_METADATA_KEYS
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .generationExpression(GeneratedColumn.getGenerationExpression(f).get)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(removedMetaKeys)))
+        .id(id)
+        .build()
     } else if (isIdentityColumn) {
-      val cleanedMetadata = metadataWithKeysRemoved(
-        Seq("comment",
-          IdentityColumn.IDENTITY_INFO_START,
-          IdentityColumn.IDENTITY_INFO_STEP,
-          IdentityColumn.IDENTITY_INFO_ALLOW_EXPLICIT_INSERT))
-        Column.create(f.name, f.dataType, f.nullable, f.getComment().orNull,
-          IdentityColumn.getIdentityInfo(f).get, metadataAsJson(cleanedMetadata))
+      val removedMetaKeys = COMMON_COL_METADATA_KEYS ++ IDENTITY_COL_METADATA_KEYS
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .identityColumnSpec(IdentityColumn.getIdentityInfo(f).get)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(removedMetaKeys)))
+        .id(id)
+        .build()
     } else {
-      val cleanedMetadata = metadataWithKeysRemoved(Seq("comment"))
-      Column.create(f.name, f.dataType, f.nullable, f.getComment().orNull,
-        metadataAsJson(cleanedMetadata))
+      Column.builderFor(f.name, dataType)
+        .nullable(f.nullable)
+        .comment(comment)
+        .metadata(metadataAsJson(metadataWithKeysRemoved(COMMON_COL_METADATA_KEYS)))
+        .id(id)
+        .build()
     }
   }
 

@@ -22,6 +22,7 @@ import org.scalatest.funsuite.AnyFunSuite
 
 import org.apache.spark.SparkContext
 import org.apache.spark.sql.functions.{max, sum}
+import org.apache.spark.sql.types.{IntegerType, StringType, StructField, StructType}
 
 /**
  * Test suite for SparkSession implementation binding.
@@ -34,6 +35,13 @@ trait SparkSessionBuilderImplementationBindingSuite
 
   protected def sparkContext: SparkContext
   protected def implementationPackageName: String = getClass.getPackageName
+
+  /**
+   * A builder whose implementation mode is pinned via the mode selector (`classic()` /
+   * `connect()`). Each concrete suite overrides this so we verify the selector binds to the
+   * matching implementation.
+   */
+  protected def implementationSpecificBuilder: SparkSession.Builder
 
   private def assertInCorrectPackage[T](obj: T): Unit = {
     assert(obj.getClass.getPackageName == implementationPackageName)
@@ -69,5 +77,23 @@ trait SparkSessionBuilderImplementationBindingSuite
     import ctx.implicits._
     val df = ctx.createDataset(1 to 11).select(max("value").as[Long])
     assert(df.head() == 11)
+  }
+
+  test("SPARK-58223: mode selector binds to the correct implementation") {
+    val session = implementationSpecificBuilder.getOrCreate()
+    assertInCorrectPackage(session)
+  }
+
+  test("emptyDataFrame with Schema") {
+    val session = SparkSession.builder().getOrCreate()
+    val schema =
+      new StructType(Array(StructField("a", IntegerType), StructField("b", StringType)))
+    val df = session.emptyDataFrame(schema)
+    assert(df.schema == schema)
+    assert(df.isEmpty)
+    val derivedSchema = new StructType(Array(StructField("a", IntegerType)))
+    val derivedDf = df.select("a")
+    assert(derivedDf.schema == derivedSchema)
+    assert(derivedDf.isEmpty)
   }
 }

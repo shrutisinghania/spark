@@ -23,6 +23,7 @@ import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.{JobArtifactSet, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.api.python.{ChainedPythonFunctions, PythonEvalType}
+import org.apache.spark.internal.config.Python.PYTHON_UDF_PIPELINED_EXECUTION
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -40,7 +41,9 @@ import org.apache.spark.util.Utils
  *
  * <ul>
  *   <li> SQL_GROUPED_AGG_ARROW_UDF for Arrow UDF
+ *   <li> SQL_GROUPED_AGG_ARROW_ITER_UDF for Arrow UDF with iterator API
  *   <li> SQL_GROUPED_AGG_PANDAS_UDF for Pandas UDF
+ *   <li> SQL_GROUPED_AGG_PANDAS_ITER_UDF for Pandas UDF with iterator API
  * </ul>
  *
  * This plan works by sending the necessary (projected) input grouped data as Arrow record batches
@@ -144,6 +147,12 @@ case class ArrowAggregatePythonExec(
 
 
     val jobArtifactUUID = JobArtifactSet.getCurrentJobArtifactState.map(_.uuid)
+    val sessionUUID = {
+      Option(session).collect {
+        case session if session.sessionState.conf.pythonWorkerLoggingEnabled =>
+          session.sessionUUID
+      }
+    }
 
     // Map grouped rows to ArrowPythonRunner results, Only execute if partition is not empty
     inputRDD.mapPartitionsInternal { iter => if (iter.isEmpty) iter else {
@@ -168,8 +177,12 @@ case class ArrowAggregatePythonExec(
 
       // The queue used to buffer input rows so we can drain it to
       // combine input with output from Python.
+      // In pipelined mode the queue's add() runs in the writer thread and remove() runs in
+      // the task thread; use lock-free mode to skip per-row synchronization.
+      val pipelined = SparkEnv.get.conf.get(PYTHON_UDF_PIPELINED_EXECUTION)
       val queue = HybridRowQueue(context.taskMemoryManager(),
-        new File(Utils.getLocalDir(SparkEnv.get.conf)), groupingExpressions.length)
+        new File(Utils.getLocalDir(SparkEnv.get.conf)), groupingExpressions.length,
+        lockFree = pipelined)
       context.addTaskCompletionListener[Unit] { _ =>
         queue.close()
       }
@@ -180,7 +193,7 @@ case class ArrowAggregatePythonExec(
         rows
       }
 
-      val columnarBatchIter = new ArrowPythonWithNamedArgumentRunner(
+      val runner = new ArrowPythonWithNamedArgumentRunner(
         pyFuncs,
         evalType,
         argMetas,
@@ -190,7 +203,9 @@ case class ArrowAggregatePythonExec(
         pythonRunnerConf,
         pythonMetrics,
         jobArtifactUUID,
-        conf.pythonUDFProfiler).compute(projectedRowIter, context.partitionId(), context)
+        sessionUUID) with GroupedPythonArrowInput
+
+      val columnarBatchIter = runner.compute(projectedRowIter, context.partitionId(), context)
 
       val joinedAttributes =
         groupingExpressions.map(_.toAttribute) ++ aggExpressions.map(_.resultAttribute)
@@ -215,10 +230,10 @@ case class ArrowAggregatePythonExec(
       case Some(sessionExpression) =>
         val inMemoryThreshold = conf.windowExecBufferInMemoryThreshold
         val spillThreshold = conf.windowExecBufferSpillThreshold
-        val spillSizeThreshold = conf.windowExecBufferSpillSizeThreshold
+        val sizeInBytesSpillThreshold = conf.windowExecBufferSpillSizeThreshold
 
         new UpdatingSessionsIterator(iter, groupingWithoutSessionExpressions, sessionExpression,
-          child.output, inMemoryThreshold, spillThreshold, spillSizeThreshold)
+          child.output, inMemoryThreshold, spillThreshold, sizeInBytesSpillThreshold)
 
       case None => iter
     }
@@ -229,7 +244,9 @@ case class ArrowAggregatePythonExec(
   private def supportedPythonEvalTypes: Array[Int] =
     Array(
       PythonEvalType.SQL_GROUPED_AGG_ARROW_UDF,
-      PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF)
+      PythonEvalType.SQL_GROUPED_AGG_ARROW_ITER_UDF,
+      PythonEvalType.SQL_GROUPED_AGG_PANDAS_UDF,
+      PythonEvalType.SQL_GROUPED_AGG_PANDAS_ITER_UDF)
 }
 
 object ArrowAggregatePythonExec {

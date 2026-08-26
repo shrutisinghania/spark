@@ -25,6 +25,7 @@ import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 import org.json4s.jackson.JsonMethods._
 import org.scalatest.BeforeAndAfter
+import org.scalatest.concurrent.Eventually._
 import org.scalatest.time.SpanSugar._
 
 import org.apache.spark._
@@ -344,7 +345,7 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
       val listener = new SparkListener {
         override def onOtherEvent(event: SparkListenerEvent): Unit = {
           event match {
-            case SparkListenerSQLExecutionStart(_, _, _, _, planDescription, _, _, _, _, _) =>
+            case SparkListenerSQLExecutionStart(_, _, _, _, planDescription, _, _, _, _, _, _) =>
               assert(expected.forall(planDescription.contains))
               checkDone = true
             case _ => // ignore other events
@@ -610,8 +611,7 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
 
   test("roundtripping SparkListenerDriverAccumUpdates through JsonProtocol (SPARK-18462)") {
     val event = SparkListenerDriverAccumUpdates(1L, Seq((2L, 3L)))
-    val jsonProtocol = new JsonProtocol(new SparkConf())
-    val json = jsonProtocol.sparkEventToJsonString(event)
+    val json = JsonProtocol.sparkEventToJsonString(event)
     assertValidDataInJson(parse(json),
       parse("""
         |{
@@ -620,7 +620,7 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
         |  "accumUpdates": [[2,3]]
         |}
       """.stripMargin))
-    jsonProtocol.sparkEventFromJson(json) match {
+    JsonProtocol.sparkEventFromJson(json) match {
       case SparkListenerDriverAccumUpdates(executionId, accums) =>
         assert(executionId == 1L)
         accums.foreach { case (a, b) =>
@@ -638,7 +638,7 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
         |  "accumUpdates": [[4294967294,3]]
         |}
       """.stripMargin
-    jsonProtocol.sparkEventFromJson(longJson) match {
+    JsonProtocol.sparkEventFromJson(longJson) match {
       case SparkListenerDriverAccumUpdates(executionId, accums) =>
         assert(executionId == 4294967294L)
         accums.foreach { case (a, b) =>
@@ -994,7 +994,7 @@ abstract class SQLAppStatusListenerSuite extends SharedSparkSession with JsonTes
     spark.sparkContext.addSparkListener(new SparkListener {
       override def onOtherEvent(event: SparkListenerEvent): Unit = {
         event match {
-          case SparkListenerSQLExecutionEnd(_, _, Some(errorMessage)) =>
+          case SparkListenerSQLExecutionEnd(_, _, Some(errorMessage), _) =>
             received = errorMessage == Utils.exceptionString(e)
           case _ =>
         }
@@ -1120,8 +1120,19 @@ class SQLAppStatusListenerMemoryLeakSuite extends SparkFunSuite {
         val statusStore = spark.sharedState.statusStore
         assert(statusStore.executionsCount() <= 50)
         assert(statusStore.planGraphCount() <= 50)
-        // No live data should be left behind after all executions end.
-        assert(statusStore.listener.get.noLiveData())
+        // No live data should be left behind after all executions end. A SQL execution's live
+        // entries are removed only once its end-event count reaches jobs.size + 1 (the
+        // SparkListenerJobEnd(s) plus SparkListenerSQLExecutionEnd). For a failed job the
+        // DAGScheduler notifies the job waiter -- unblocking the failing action on this thread --
+        // *before* it posts SparkListenerJobEnd to the listener bus (see
+        // DAGScheduler.failJobAndIndependentStages). That trailing JobEnd can therefore still be in
+        // flight when this thread calls waitUntilEmpty() above; if it is enqueued just after the
+        // bus is drained, the failed execution never reaches the cleanup threshold and lingers in
+        // liveExecutions. Poll with eventually() so the trailing end event is delivered and the
+        // live entries drain, rather than asserting once immediately.
+        eventually(timeout(5.seconds), interval(10.milliseconds)) {
+          assert(statusStore.listener.get.noLiveData())
+        }
       }
     }
   }

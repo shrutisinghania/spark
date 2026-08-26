@@ -18,6 +18,7 @@
 package org.apache.spark.memory;
 
 import java.io.IOException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.apache.spark.errors.SparkCoreErrors;
 import org.apache.spark.unsafe.array.LongArray;
@@ -33,7 +34,7 @@ public abstract class MemoryConsumer {
   protected final TaskMemoryManager taskMemoryManager;
   private final long pageSize;
   private final MemoryMode mode;
-  protected long used;
+  protected final AtomicLong used = new AtomicLong(0L);
 
   protected MemoryConsumer(TaskMemoryManager taskMemoryManager, long pageSize, MemoryMode mode) {
     this.taskMemoryManager = taskMemoryManager;
@@ -56,7 +57,7 @@ public abstract class MemoryConsumer {
    * Returns the size of used memory in bytes.
    */
   public long getUsed() {
-    return used;
+    return used.get();
   }
 
   /**
@@ -72,7 +73,9 @@ public abstract class MemoryConsumer {
    *
    * This should be implemented by subclass.
    *
-   * Note: In order to avoid possible deadlock, should not call acquireMemory() from spill().
+   * Note: In order to avoid possible deadlock, implementations must release memory synchronously
+   * on the calling thread and must not acquire task memory from spill(), either directly or from
+   * another thread.
    *
    * Note: today, this only frees Tungsten-managed pages.
    *
@@ -97,7 +100,7 @@ public abstract class MemoryConsumer {
     if (page == null || page.size() < required) {
       throwOom(page, required);
     }
-    used += required;
+    used.getAndAdd(required);
     return new LongArray(page);
   }
 
@@ -114,11 +117,12 @@ public abstract class MemoryConsumer {
    * @throws SparkOutOfMemoryError
    */
   protected MemoryBlock allocatePage(long required) {
-    MemoryBlock page = taskMemoryManager.allocatePage(Math.max(pageSize, required), this);
+    MemoryBlock page =
+      taskMemoryManager.allocatePageWithMinimum(Math.max(pageSize, required), required, this);
     if (page == null || page.size() < required) {
       throwOom(page, required);
     }
-    used += page.size();
+    used.getAndAdd(page.size());
     return page;
   }
 
@@ -126,8 +130,13 @@ public abstract class MemoryConsumer {
    * Free a memory block.
    */
   protected void freePage(MemoryBlock page) {
-    used -= page.size();
+    used.getAndAdd(-page.size());
     taskMemoryManager.freePage(page, this);
+  }
+
+  /** Returns whether this page came from a minimum retry after a partial allocation failed. */
+  protected boolean isPageAllocationFromMinimumRetry(MemoryBlock page) {
+    return taskMemoryManager.isPageAllocationFromMinimumRetry(page);
   }
 
   /**
@@ -135,7 +144,7 @@ public abstract class MemoryConsumer {
    */
   public long acquireMemory(long size) {
     long granted = taskMemoryManager.acquireExecutionMemory(size, this);
-    used += granted;
+    used.getAndAdd(granted);
     return granted;
   }
 
@@ -144,7 +153,7 @@ public abstract class MemoryConsumer {
    */
   public void freeMemory(long size) {
     taskMemoryManager.releaseExecutionMemory(size, this);
-    used -= size;
+    used.getAndAdd(-size);
   }
 
   private void throwOom(final MemoryBlock page, final long required) {
@@ -153,7 +162,9 @@ public abstract class MemoryConsumer {
       got = page.size();
       taskMemoryManager.freePage(page, this);
     }
-    taskMemoryManager.showMemoryUsage();
-    throw SparkCoreErrors.outOfMemoryError(required, got);
+    // Log the full breakdown and attach the bounded one to the error from a single snapshot, so the
+    // executor logs and the driver/UI error message describe the same instant and cannot disagree.
+    String consumerBreakdown = taskMemoryManager.logMemoryUsageAndGetBreakdown();
+    throw SparkCoreErrors.outOfMemoryError(required, got, consumerBreakdown);
   }
 }

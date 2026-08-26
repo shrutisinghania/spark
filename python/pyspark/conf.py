@@ -18,13 +18,13 @@
 __all__ = ["SparkConf"]
 
 import sys
-from typing import Dict, List, Optional, Tuple, cast, overload, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, cast, overload
 
-from pyspark.util import is_remote_only
 from pyspark.errors import PySparkRuntimeError
+from pyspark.util import is_remote_only
 
 if TYPE_CHECKING:
-    from py4j.java_gateway import JVMView, JavaObject
+    from py4j.java_gateway import JavaObject, JVMView
 
 
 class SparkConf:
@@ -172,12 +172,10 @@ class SparkConf:
         return self
 
     @overload
-    def setExecutorEnv(self, key: str, value: str) -> "SparkConf":
-        ...
+    def setExecutorEnv(self, key: str, value: str) -> "SparkConf": ...
 
     @overload
-    def setExecutorEnv(self, *, pairs: List[Tuple[str, str]]) -> "SparkConf":
-        ...
+    def setExecutorEnv(self, *, pairs: List[Tuple[str, str]]) -> "SparkConf": ...
 
     def setExecutorEnv(
         self,
@@ -212,16 +210,13 @@ class SparkConf:
         return self
 
     @overload
-    def get(self, key: str) -> Optional[str]:
-        ...
+    def get(self, key: str) -> Optional[str]: ...
 
     @overload
-    def get(self, key: str, defaultValue: None) -> Optional[str]:
-        ...
+    def get(self, key: str, defaultValue: None) -> Optional[str]: ...
 
     @overload
-    def get(self, key: str, defaultValue: str) -> str:
-        ...
+    def get(self, key: str, defaultValue: str) -> str: ...
 
     def get(self, key: str, defaultValue: Optional[str] = None) -> Optional[str]:
         """Get the configured value for some key, or return a default otherwise."""
@@ -273,7 +268,7 @@ class SparkConf:
 def _test() -> None:
     import doctest
 
-    (failure_count, test_count) = doctest.testmod(optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(optionflags=doctest.ELLIPSIS)
     if failure_count:
         sys.exit(-1)
 

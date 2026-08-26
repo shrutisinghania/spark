@@ -1,4 +1,3 @@
-# -*- encoding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -19,7 +18,7 @@
 import json
 import unittest
 
-from pyspark.errors import PySparkValueError
+from pyspark.errors import PySparkRuntimeError, PySparkValueError
 from pyspark.errors.error_classes import ERROR_CLASSES_JSON
 from pyspark.errors.utils import ErrorClassesReader
 
@@ -54,15 +53,102 @@ class ErrorsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Cannot find main error class"):
             PySparkValueError(errorClass="invalid", messageParameters={})
 
+    def test_error_class_without_message_parameters(self):
+        # Error classes with no parameters in their template should work
+        # without explicitly passing messageParameters.
+        e = PySparkValueError(errorClass="MALFORMED_VARIANT")
+        self.assertIn("MALFORMED_VARIANT", e.getCondition())
+        self.assertIn("malformed", str(e))
+
+    def test_breaking_change_info(self):
+        # Test retrieving the breaking change info for an error.
+        error_reader = ErrorClassesReader()
+        error_reader.error_info_map = {
+            "TEST_ERROR": {
+                "message": ["Error message 1 with <param>."],
+                "breaking_change_info": {
+                    "migration_message": ["Migration message with <param2>."],
+                    "mitigation_config": {"key": "config.key1", "value": "config.value1"},
+                    "needsAudit": False,
+                },
+            },
+            "TEST_ERROR_WITH_SUB_CLASS": {
+                "message": ["Error message 2 with <param>."],
+                "sub_class": {
+                    "SUBCLASS": {
+                        "message": ["Subclass message with <param2>."],
+                        "breaking_change_info": {
+                            "migration_message": ["Subclass migration message with <param3>."],
+                            "mitigation_config": {
+                                "key": "config.key2",
+                                "value": "config.value2",
+                            },
+                            "needsAudit": True,
+                        },
+                    }
+                },
+            },
+        }
+        error_message1 = error_reader.get_error_message(
+            "TEST_ERROR", {"param": "value1", "param2": "value2"}
+        )
+        self.assertEqual(
+            error_message1, "Error message 1 with value1. Migration message with value2."
+        )
+        error_message2 = error_reader.get_error_message(
+            "TEST_ERROR_WITH_SUB_CLASS.SUBCLASS",
+            {"param": "value1", "param2": "value2", "param3": "value3"},
+        )
+        self.assertEqual(
+            error_message2,
+            "Error message 2 with value1. Subclass message with value2."
+            " Subclass migration message with value3.",
+        )
+        breaking_change_info1 = error_reader.get_breaking_change_info("TEST_ERROR")
+        self.assertEqual(
+            breaking_change_info1, error_reader.error_info_map["TEST_ERROR"]["breaking_change_info"]
+        )
+        breaking_change_info2 = error_reader.get_breaking_change_info(
+            "TEST_ERROR_WITH_SUB_CLASS.SUBCLASS"
+        )
+        subclass_map = error_reader.error_info_map["TEST_ERROR_WITH_SUB_CLASS"]["sub_class"]
+        self.assertEqual(breaking_change_info2, subclass_map["SUBCLASS"]["breaking_change_info"])
+
+    def test_sqlstate(self):
+        error = PySparkRuntimeError(errorClass="APPLICATION_NAME_NOT_SET", messageParameters={})
+        self.assertIsNone(error.getSqlState())
+
+        # Neither the sub-class nor the main class declares a sqlState.
+        error = PySparkRuntimeError(
+            errorClass="SESSION_MUTATION_IN_DECLARATIVE_PIPELINE.SET_RUNTIME_CONF",
+            messageParameters={"method": "set"},
+        )
+        self.assertIsNone(error.getSqlState())
+
+        # A sub-class inherits the main class's sqlState.
+        error = PySparkRuntimeError(
+            errorClass="NEAREST_BY_JOIN.UNSUPPORTED_MODE",
+            messageParameters={"mode": "invalid", "supported": "nearest"},
+        )
+        self.assertEqual(error.getSqlState(), "42604")
+
+    def test_sqlstate_is_taken_from_the_main_class(self):
+        # The sqlState is looked up on the main class only, so a sub-class entry never
+        # takes precedence and an unknown sub-class name still resolves.
+        error_reader = ErrorClassesReader()
+        error_reader.error_info_map = {
+            "TEST_ERROR": {
+                "message": ["Error message."],
+                "sqlState": "42604",
+                "sub_class": {"SUBCLASS": {"message": ["Subclass message."], "sqlState": "08003"}},
+            },
+        }
+        self.assertEqual(error_reader.get_sqlstate("TEST_ERROR.SUBCLASS"), "42604")
+        self.assertEqual(error_reader.get_sqlstate("TEST_ERROR.NON_EXISTENT_SUB"), "42604")
+        self.assertIsNone(error_reader.get_sqlstate("NON_EXISTENT_ERROR.SUBCLASS"))
+
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.errors.tests.test_errors import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

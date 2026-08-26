@@ -83,6 +83,7 @@ trait MetadataMapSupport {
           case JLong(value) => Some(new Date(value).toString)
           case _ => Some(jValue.values.toString)
         }
+      case "SQL Path" => SqlPathFormat.formatForDisplay(jValue)
       case _ => None
     }
     reformattedValue.map(value => key -> value)
@@ -146,7 +147,8 @@ case class CatalogStorageFormat(
     outputFormat: Option[String],
     serde: Option[String],
     compressed: Boolean,
-    properties: Map[String, String]) extends MetadataMapSupport {
+    properties: Map[String, String],
+    serdeName: Option[String] = None) extends MetadataMapSupport {
 
   override def toString: String = {
     toLinkedHashMap.map { case (key, value) =>
@@ -158,6 +160,7 @@ case class CatalogStorageFormat(
     val map = mutable.LinkedHashMap[String, JValue]()
 
     locationUri.foreach(l => map += ("Location" -> JString(CatalogUtils.URIToString(l))))
+    serdeName.foreach(s => map += ("Serde Name" -> JString(s)))
     serde.foreach(s => map += ("Serde Library" -> JString(s)))
     inputFormat.foreach(format => map += ("InputFormat" -> JString(format)))
     outputFormat.foreach(format => map += ("OutputFormat" -> JString(format)))
@@ -178,8 +181,8 @@ case class CatalogStorageFormat(
 
 object CatalogStorageFormat {
   /** Empty storage format for default values and copies. */
-  val empty = CatalogStorageFormat(locationUri = None, inputFormat = None,
-    outputFormat = None, serde = None, compressed = false, properties = Map.empty)
+  val empty = CatalogStorageFormat(locationUri = None, inputFormat = None, outputFormat = None,
+    serde = None, compressed = false, properties = Map.empty)
 }
 
 /**
@@ -278,7 +281,7 @@ case class ClusterBySpec(columnNames: Seq[NamedReference]) {
 object ClusterBySpec {
   private val mapper = {
     val ret = new ObjectMapper() with ClassTagExtensions
-    ret.setSerializationInclusion(Include.NON_ABSENT)
+    ret.setDefaultPropertyInclusion(Include.NON_ABSENT)
     ret.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
     ret.registerModule(DefaultScalaModule)
     ret
@@ -442,16 +445,44 @@ case class CatalogTable(
     tracksPartitionsInCatalog: Boolean = false,
     schemaPreservesCase: Boolean = true,
     ignoredProperties: Map[String, String] = Map.empty,
-    viewOriginalText: Option[String] = None) extends MetadataMapSupport {
+    viewOriginalText: Option[String] = None,
+    // Multi-part identifier [catalog, namespace..., name] for tables synthesized from a v2
+    // `DelegatingTable` whose namespace has more than one part -- the v1 `identifier:
+    // TableIdentifier` (single-string database) cannot carry that losslessly. `None` for
+    // v1-native tables; callers should use `fullIdent` which falls back to `identifier.nameParts`.
+    multipartIdentifier: Option[Seq[String]] = None)
+  extends MetadataMapSupport {
 
   import CatalogTable._
+
+  /**
+   * The fully-qualified multi-part identifier. Prefers `multipartIdentifier` when set (v2-sourced
+   * tables with multi-level namespaces); otherwise reconstructs from `identifier.nameParts`.
+   */
+  def fullIdent: Seq[String] = multipartIdentifier.getOrElse(identifier.nameParts)
+
+  /**
+   * Returns whether this table behaves like a view at resolution / DDL time. Today: VIEW or
+   * METRIC_VIEW. Forks may extend this set with additional view-like types, so call sites
+   * that need a uniform "is this view-like?" check should prefer this helper over inline
+   * disjunctions on `tableType`.
+   */
+  def isViewLike: Boolean = CatalogTable.isViewLike(tableType)
 
   /**
    * schema of this table's partition columns
    */
   def partitionSchema: StructType = {
     val partitionFields = schema.takeRight(partitionColumnNames.length)
-    assert(partitionFields.map(_.name) == partitionColumnNames)
+    val actualPartitionColumnNames = partitionFields.map(_.name)
+
+    assert(actualPartitionColumnNames == partitionColumnNames,
+      "Corrupted table metadata detected for table " + identifier.quotedString + ". " +
+      "The partition column names in the table schema " +
+      "do not match the declared partition columns. " +
+      "Table schema columns: [" + schema.fieldNames.mkString(", ") + "] " +
+      "Declared partition columns: [" + partitionColumnNames.mkString(", ") + "]. " +
+      "This indicates corrupted table metadata that needs to be repaired.")
 
     StructType(partitionFields)
   }
@@ -532,20 +563,7 @@ case class CatalogTable(
    * Return the schema binding mode. Defaults to SchemaBinding if not a view or an older
    * version, unless the viewSchemaBindingMode config is set to false
    */
-  def viewSchemaMode: ViewSchemaMode = {
-    if (!SQLConf.get.viewSchemaBindingEnabled) {
-      SchemaUnsupported
-    } else {
-      val schemaMode = properties.getOrElse(VIEW_SCHEMA_MODE, SchemaBinding.toString)
-      schemaMode match {
-        case SchemaBinding.toString => SchemaBinding
-        case SchemaEvolution.toString => SchemaEvolution
-        case SchemaTypeEvolution.toString => SchemaTypeEvolution
-        case SchemaCompensation.toString => SchemaCompensation
-        case other => throw SparkException.internalError("Unexpected ViewSchemaMode")
-      }
-    }
-  }
+  def viewSchemaMode: ViewSchemaMode = CatalogTable.viewSchemaModeFromProperties(properties)
 
   /**
    * Return temporary view names the current view was referred. should be empty if the
@@ -599,6 +617,15 @@ case class CatalogTable(
     }
   }
 
+  /**
+   * Frozen SQL PATH stored when the view was created with [[SQLConf.PATH_ENABLED]].
+   * Serialized as a JSON array of path entries (each entry an array of identifier parts);
+   * virtual markers (e.g. `system.current_schema`) are materialized and, for persisted
+   * views, `system.session` is omitted.
+   */
+  def viewStoredResolutionPath: Option[String] =
+    properties.get(CatalogTable.VIEW_RESOLUTION_PATH)
+
   /** Syntactic sugar to update a field in `storage`. */
   def withNewStorage(
       locationUri: Option[URI] = storage.locationUri,
@@ -606,9 +633,10 @@ case class CatalogTable(
       outputFormat: Option[String] = storage.outputFormat,
       compressed: Boolean = false,
       serde: Option[String] = storage.serde,
-      properties: Map[String, String] = storage.properties): CatalogTable = {
+      properties: Map[String, String] = storage.properties,
+      serdeName: Option[String] = storage.serdeName): CatalogTable = {
     copy(storage = CatalogStorageFormat(
-      locationUri, inputFormat, outputFormat, serde, compressed, properties))
+      locationUri, inputFormat, outputFormat, serde, compressed, properties, serdeName))
   }
 
   def toJsonLinkedHashMap: mutable.LinkedHashMap[String, JValue] = {
@@ -663,6 +691,13 @@ case class CatalogTable(
         import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
         map += "View Catalog and Namespace" -> JString(viewCatalogAndNamespaceInfos.quoted)
       }
+      if (SQLConf.get.pathEnabled) {
+        viewStoredResolutionPath.foreach { pathStr =>
+          SqlPathFormat.toDescribeJson(pathStr).foreach { json =>
+            map += "SQL Path" -> json
+          }
+        }
+      }
       val viewQueryOutputColumns: JValue = Try {
         if (viewSchemaMode == SchemaEvolution) {
           JArray(schema.map(_.name).map(JString).toList)
@@ -675,6 +710,15 @@ case class CatalogTable(
       if (viewQueryOutputColumns != JNull) {
         map += "View Query Output Columns" -> viewQueryOutputColumns
       }
+    } else if (tableType == CatalogTableType.METRIC_VIEW) {
+      // METRIC_VIEW stores a YAML body in `viewText`, not a SQL query. The schema-binding
+      // fields used by plain VIEW (View Schema Mode, View Catalog and Namespace, SQL Path,
+      // View Query Output Columns) do not apply, so emit only `View Text` plus a `Language`
+      // tag so consumers can dispatch on the view_text format.
+      if (viewText.isDefined) {
+        map += "View Text" -> JString(viewText.get)
+      }
+      map += "Language" -> JString("YAML")
     }
     if (tableProperties != JNull) map += "Table Properties" -> tableProperties
     stats.foreach { s =>
@@ -714,6 +758,33 @@ object CatalogTable {
 
   val VIEW_CATALOG_AND_NAMESPACE = VIEW_PREFIX + "catalogAndNamespace.numParts"
   val VIEW_CATALOG_AND_NAMESPACE_PART_PREFIX = VIEW_PREFIX + "catalogAndNamespace.part."
+
+  /**
+   * View sub-type marker persisted in `properties` so the metric-view distinction survives a
+   * round-trip through external catalogs whose enum can't carry it (e.g. the Hive Metastore,
+   * which only knows `VIRTUAL_VIEW`). When this property is set, the in-memory `tableType`
+   * upgrades from [[CatalogTableType.VIEW]] back to [[CatalogTableType.METRIC_VIEW]] on read.
+   */
+  val VIEW_SUB_TYPE = VIEW_PREFIX + "subType"
+  val VIEW_SUB_TYPE_METRIC_VIEW = "METRIC_VIEW"
+
+  /**
+   * Check if a CatalogTable is a metric view.
+   */
+  def isMetricView(table: CatalogTable): Boolean = {
+    table.tableType == CatalogTableType.METRIC_VIEW
+  }
+
+  /**
+   * Type-only form of [[CatalogTable.isViewLike]]; returns whether the given table type
+   * behaves like a view at resolution / DDL time. Use this overload when you have a
+   * [[CatalogTableType]] but no surrounding [[CatalogTable]] (e.g. inside `match`/`case`
+   * patterns or [[org.apache.spark.sql.catalyst.catalog.SessionCatalog.isView]]).
+   */
+  def isViewLike(tableType: CatalogTableType): Boolean = {
+    tableType == CatalogTableType.VIEW || tableType == CatalogTableType.METRIC_VIEW
+  }
+
   // Convert the current catalog and namespace to properties.
   def catalogAndNamespaceToProps(
       currentCatalog: String,
@@ -741,9 +812,32 @@ object CatalogTable {
 
   val VIEW_SCHEMA_MODE = VIEW_PREFIX + "schemaMode"
 
+  /** Frozen expanded PATH at view creation (PATH feature); not a SQL config property. */
+  val VIEW_RESOLUTION_PATH = VIEW_PREFIX + "resolutionPath"
+
   val VIEW_STORING_ANALYZED_PLAN = VIEW_PREFIX + "storingAnalyzedPlan"
 
   val PROP_CLUSTERING_COLUMNS: String = "clusteringColumns"
+
+  /**
+   * Decode the view schema binding mode from a properties map. Shared between
+   * [[CatalogTable.viewSchemaMode]] and the v2 ALTER VIEW path which reads the mode directly
+   * from the existing view's [[TableInfo]] properties without materializing a full CatalogTable.
+   */
+  def viewSchemaModeFromProperties(properties: Map[String, String]): ViewSchemaMode = {
+    if (!SQLConf.get.viewSchemaBindingEnabled) {
+      SchemaUnsupported
+    } else {
+      val schemaMode = properties.getOrElse(VIEW_SCHEMA_MODE, SchemaBinding.toString)
+      schemaMode match {
+        case SchemaBinding.toString => SchemaBinding
+        case SchemaEvolution.toString => SchemaEvolution
+        case SchemaTypeEvolution.toString => SchemaTypeEvolution
+        case SchemaCompensation.toString => SchemaCompensation
+        case _ => throw SparkException.internalError("Unexpected ViewSchemaMode")
+      }
+    }
+  }
 
   def splitLargeTableProp(
       key: String,
@@ -765,20 +859,15 @@ object CatalogTable {
 
   def readLargeTableProp(props: Map[String, String], key: String): Option[String] = {
     props.get(key).orElse {
-      if (props.exists { case (mapKey, _) => mapKey.startsWith(key) }) {
-        props.get(s"$key.numParts") match {
-          case None => throw QueryCompilationErrors.insufficientTablePropertyError(key)
-          case Some(numParts) =>
-            val parts = (0 until numParts.toInt).map { index =>
-              val keyPart = s"$key.part.$index"
-              props.getOrElse(keyPart, {
-                throw QueryCompilationErrors.insufficientTablePropertyPartError(keyPart, numParts)
-              })
-            }
-            Some(parts.mkString)
+      // only construct the property from parts if numParts exist,
+      props.get(s"$key.numParts").map { numParts =>
+        val parts = (0 until numParts.toInt).map { index =>
+          val keyPart = s"$key.part.$index"
+          props.getOrElse(keyPart, {
+            throw QueryCompilationErrors.insufficientTablePropertyPartError(keyPart, numParts)
+          })
         }
-      } else {
-        None
+        parts.mkString
       }
     }
   }
@@ -883,17 +972,17 @@ case class CatalogColumnStat(
    */
   def toMap(colName: String): Map[String, String] = {
     val map = new scala.collection.mutable.HashMap[String, String]
-    map.put(s"${colName}.${CatalogColumnStat.KEY_VERSION}", CatalogColumnStat.VERSION.toString)
+    map.put(s"$colName.${CatalogColumnStat.KEY_VERSION}", CatalogColumnStat.VERSION.toString)
     distinctCount.foreach { v =>
-      map.put(s"${colName}.${CatalogColumnStat.KEY_DISTINCT_COUNT}", v.toString)
+      map.put(s"$colName.${CatalogColumnStat.KEY_DISTINCT_COUNT}", v.toString)
     }
     nullCount.foreach { v =>
-      map.put(s"${colName}.${CatalogColumnStat.KEY_NULL_COUNT}", v.toString)
+      map.put(s"$colName.${CatalogColumnStat.KEY_NULL_COUNT}", v.toString)
     }
-    avgLen.foreach { v => map.put(s"${colName}.${CatalogColumnStat.KEY_AVG_LEN}", v.toString) }
-    maxLen.foreach { v => map.put(s"${colName}.${CatalogColumnStat.KEY_MAX_LEN}", v.toString) }
-    min.foreach { v => map.put(s"${colName}.${CatalogColumnStat.KEY_MIN_VALUE}", v) }
-    max.foreach { v => map.put(s"${colName}.${CatalogColumnStat.KEY_MAX_VALUE}", v) }
+    avgLen.foreach { v => map.put(s"$colName.${CatalogColumnStat.KEY_AVG_LEN}", v.toString) }
+    maxLen.foreach { v => map.put(s"$colName.${CatalogColumnStat.KEY_MAX_LEN}", v.toString) }
+    min.foreach { v => map.put(s"$colName.${CatalogColumnStat.KEY_MIN_VALUE}", v) }
+    max.foreach { v => map.put(s"$colName.${CatalogColumnStat.KEY_MAX_VALUE}", v) }
     histogram.foreach { h =>
       CatalogTable.splitLargeTableProp(
         s"$colName.${CatalogColumnStat.KEY_HISTOGRAM}",
@@ -1007,15 +1096,15 @@ object CatalogColumnStat extends Logging {
 
     try {
       Some(CatalogColumnStat(
-        distinctCount = map.get(s"${colName}.${KEY_DISTINCT_COUNT}").map(v => BigInt(v.toLong)),
-        min = map.get(s"${colName}.${KEY_MIN_VALUE}"),
-        max = map.get(s"${colName}.${KEY_MAX_VALUE}"),
-        nullCount = map.get(s"${colName}.${KEY_NULL_COUNT}").map(v => BigInt(v.toLong)),
-        avgLen = map.get(s"${colName}.${KEY_AVG_LEN}").map(_.toLong),
-        maxLen = map.get(s"${colName}.${KEY_MAX_LEN}").map(_.toLong),
+        distinctCount = map.get(s"$colName.${KEY_DISTINCT_COUNT}").map(v => BigInt(v.toLong)),
+        min = map.get(s"$colName.${KEY_MIN_VALUE}"),
+        max = map.get(s"$colName.${KEY_MAX_VALUE}"),
+        nullCount = map.get(s"$colName.${KEY_NULL_COUNT}").map(v => BigInt(v.toLong)),
+        avgLen = map.get(s"$colName.${KEY_AVG_LEN}").map(_.toLong),
+        maxLen = map.get(s"$colName.${KEY_MAX_LEN}").map(_.toLong),
         histogram = CatalogTable.readLargeTableProp(map, s"$colName.$KEY_HISTOGRAM")
           .map(HistogramSerializer.deserialize),
-        version = map(s"${colName}.${KEY_VERSION}").toInt
+        version = map(s"$colName.${KEY_VERSION}").toInt
       ))
     } catch {
       case NonFatal(e) =>
@@ -1032,8 +1121,9 @@ object CatalogTableType {
   val EXTERNAL = new CatalogTableType("EXTERNAL")
   val MANAGED = new CatalogTableType("MANAGED")
   val VIEW = new CatalogTableType("VIEW")
+  val METRIC_VIEW = new CatalogTableType("METRIC_VIEW")
 
-  val tableTypes = Seq(EXTERNAL, MANAGED, VIEW)
+  val tableTypes = Seq(EXTERNAL, MANAGED, VIEW, METRIC_VIEW)
 }
 
 
@@ -1067,7 +1157,9 @@ case class UnresolvedCatalogRelation(
     tableMeta: CatalogTable,
     options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty(),
     override val isStreaming: Boolean = false) extends UnresolvedLeafNode {
-  assert(tableMeta.identifier.database.isDefined)
+  assert(tableMeta.identifier.database.isDefined,
+    "Table identifier " + tableMeta.identifier.quotedString + " is missing database name. " +
+    "UnresolvedCatalogRelation requires a fully qualified table identifier with database.")
 }
 
 /**
@@ -1094,7 +1186,9 @@ case class HiveTableRelation(
     tableStats: Option[Statistics] = None,
     @transient prunedPartitions: Option[Seq[CatalogTablePartition]] = None)
   extends LeafNode with MultiInstanceRelation with NormalizeableRelation {
-  assert(tableMeta.identifier.database.isDefined)
+  assert(tableMeta.identifier.database.isDefined,
+    "Table identifier " + tableMeta.identifier.quotedString + " is missing database name. " +
+    "HiveTableRelation requires a fully qualified table identifier with database.")
   assert(DataTypeUtils.sameType(tableMeta.partitionSchema, partitionCols.toStructType))
   assert(DataTypeUtils.sameType(tableMeta.dataSchema, dataCols.toStructType))
 

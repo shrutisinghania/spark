@@ -412,6 +412,11 @@ This file is divided into 3 sections:
     <customMessage>Use contentEquals of SparkFileUtils or Utils instead.</customMessage>
   </check>
 
+  <check customId="commonscompresscompressors" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
+    <parameters><parameter name="regex">org\.apache\.commons\.compress\.compressors\b</parameter></parameters>
+    <customMessage>Use Java API instead</customMessage>
+  </check>
+
   <check customId="commonslang2" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
     <parameters><parameter name="regex">org\.apache\.commons\.lang\.</parameter></parameters>
     <customMessage>Use Commons Lang 3 classes (package org.apache.commons.lang3.*) instead
@@ -534,6 +539,11 @@ This file is divided into 3 sections:
     <customMessage>Use Java String.substring instead.</customMessage>
   </check>
 
+  <check customId="hadoopstringifyexception" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
+    <parameters><parameter name="regex">\bStringUtils\.stringifyException\b</parameter></parameters>
+    <customMessage>Use org.apache.spark.util.Utils.stringifyException instead.</customMessage>
+  </check>
+
   <check customId="uribuilder" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
     <parameters><parameter name="regex">\bUriBuilder\.fromUri\b</parameter></parameters>
     <customMessage>Use Utils.getUriBuilder instead.</customMessage>
@@ -617,6 +627,11 @@ This file is divided into 3 sections:
   <check level="error" class="org.scalastyle.scalariform.IllegalImportsChecker" enabled="true">
     <parameters><parameter name="illegalImports"><![CDATA[org.apache.log4j]]></parameter></parameters>
     <customMessage>Please use Apache Log4j 2 instead.</customMessage>
+  </check>
+
+  <check level="error" class="org.scalastyle.scalariform.IllegalImportsChecker" enabled="true">
+    <parameters><parameter name="illegalImports"><![CDATA[org.apache.commons.codec.digest]]></parameter></parameters>
+    <customMessage>Please use org.apache.spark.network.util.JavaUtils.digestToHexString instead.</customMessage>
   </check>
 
 
@@ -797,6 +812,11 @@ This file is divided into 3 sections:
     <customMessage>Use java.util.Set.of instead.</customMessage>
   </check>
 
+  <check customId="emptySet" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
+    <parameters><parameter name="regex">\bCollections\.emptySet\b</parameter></parameters>
+    <customMessage>Use java.util.Set.of() instead.</customMessage>
+  </check>
+
   <check customId="maputils" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
     <parameters><parameter name="regex">org\.apache\.commons\.collections4\.MapUtils\b</parameter></parameters>
     <customMessage>Use org.apache.spark.util.collection.Utils instead.</customMessage>
@@ -827,6 +847,11 @@ This file is divided into 3 sections:
     <customMessage>Use stackTraceToString of JavaUtils/SparkFileUtils/Utils instead.</customMessage>
   </check>
 
+  <check customId="googleThrowablesGetRootCause" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
+    <parameters><parameter name="regex">\bThrowables\.getRootCause\b</parameter></parameters>
+    <customMessage>Use getRootCause of SparkErrorUtils or Utils instead</customMessage>
+  </check>
+
   <check customId="preconditionschecknotnull" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
     <parameters><parameter name="regex">\bPreconditions\.checkNotNull\b</parameter></parameters>
     <customMessage>Use requireNonNull of java.util.Objects instead.</customMessage>
@@ -835,5 +860,10 @@ This file is divided into 3 sections:
   <check customId="intscheckedcast" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
     <parameters><parameter name="regex">\bInts\.checkedCast\b</parameter></parameters>
     <customMessage>Use JavaUtils.checkedCast instead.</customMessage>
+  </check>
+
+  <check customId="startsWithK8s" level="error" class="org.scalastyle.file.RegexChecker" enabled="true">
+    <parameters><parameter name="regex">\bstartsWith\("k8s\b</parameter></parameters>
+    <customMessage>Use SparkMasterRegex.isK8s instead.</customMessage>
   </check>
 </scalastyle>

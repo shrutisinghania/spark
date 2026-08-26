@@ -18,10 +18,13 @@
 package org.apache.spark.sql
 
 import java.time.{Duration, LocalDateTime, LocalTime, Period}
+import java.util.Locale
 
 import scala.util.Random
 
+import org.scalacheck.Gen
 import org.scalatest.matchers.must.Matchers.the
+import org.scalatestplus.scalacheck.ScalaCheckDrivenPropertyChecks
 
 import org.apache.spark.{SparkArithmeticException, SparkRuntimeException}
 import org.apache.spark.sql.catalyst.plans.logical.Expand
@@ -45,9 +48,9 @@ import org.apache.spark.unsafe.types.CalendarInterval
 case class Fact(date: Int, hour: Int, minute: Int, room_name: String, temp: Double)
 
 @SlowSQLTest
-class DataFrameAggregateSuite extends QueryTest
-  with SharedSparkSession
-  with AdaptiveSparkPlanHelper {
+class DataFrameAggregateSuite extends SharedSparkSession
+  with AdaptiveSparkPlanHelper
+  with ScalaCheckDrivenPropertyChecks {
   import testImplicits._
 
   val absTol = 1e-8
@@ -127,6 +130,17 @@ class DataFrameAggregateSuite extends QueryTest
       df.groupBy(regexp_extract($"key", "([a-z]+)\\[", 1)).count(),
       Row("some", 1) :: Nil
     )
+  }
+
+  test("cube()/rollup() with no grouping columns return one grand-total row over empty input") {
+    // With no grouping columns, cube()/rollup() lower to a global aggregate (the grand total),
+    // which returns one row even over empty input -- like an aggregation with no GROUP BY clause.
+    // This is the DataFrame-API surface for the empty CUBE/ROLLUP case (not expressible in SQL).
+    checkAnswer(spark.range(0).cube().count(), Row(0L))
+    checkAnswer(spark.range(0).rollup().count(), Row(0L))
+    // Non-empty input still collapses to the single grand-total row.
+    checkAnswer(spark.range(3).cube().count(), Row(3L))
+    checkAnswer(spark.range(3).rollup().count(), Row(3L))
   }
 
   test("rollup") {
@@ -559,6 +573,56 @@ class DataFrameAggregateSuite extends QueryTest
     }
   }
 
+  testWithWholeStageCodegenOnAndOff("SPARK-58213: corr returns NULL for zero variance") { _ =>
+    val input = Seq(
+      ("both-constant", Some(1.0), Some(1.0)),
+      ("both-constant", Some(1.0), Some(1.0)),
+      ("empty", None, None),
+      ("normal", Some(1.0), Some(1.0)),
+      ("normal", Some(2.0), Some(2.0)),
+      ("normal", Some(3.0), Some(3.0)),
+      ("partial-null", None, Some(0.0)),
+      ("partial-null", Some(1.0), Some(1.0)),
+      ("partial-null", Some(2.0), None),
+      ("partial-null", Some(3.0), Some(3.0)),
+      ("single", Some(1.0), Some(2.0)),
+      ("x-constant", Some(1.0), Some(1.0)),
+      ("x-constant", Some(1.0), Some(2.0)),
+      ("x-constant", Some(1.0), Some(3.0)),
+      ("y-constant", Some(1.0), Some(1.0)),
+      ("y-constant", Some(2.0), Some(1.0)),
+      ("y-constant", Some(3.0), Some(1.0)),
+      ("zero-correlation", Some(0.0), Some(1.0)),
+      ("zero-correlation", Some(1.0), Some(-2.0)),
+      ("zero-correlation", Some(2.0), Some(1.0))).toDF("case", "x", "y")
+
+    Seq(true, false).foreach { ansiEnabled =>
+      Seq(true, false).foreach { legacyStatisticalAggregate =>
+        withSQLConf(
+            SQLConf.ANSI_ENABLED.key -> ansiEnabled.toString,
+            SQLConf.LEGACY_STATISTICAL_AGGREGATE.key ->
+              legacyStatisticalAggregate.toString) {
+          val singleRow = if (legacyStatisticalAggregate) {
+            Row("single", Double.NaN)
+          } else {
+            Row("single", null)
+          }
+          checkAnswer(
+            input.groupBy($"case").agg(corr($"x", $"y")).orderBy($"case"),
+            Seq(
+              Row("both-constant", null),
+              Row("empty", null),
+              Row("normal", 1.0),
+              Row("partial-null", 1.0),
+              singleRow,
+              Row("x-constant", null),
+              Row("y-constant", null),
+              Row("zero-correlation", 0.0)))
+        }
+      }
+    }
+  }
+
   test("null moments") {
     val emptyTableData = Seq.empty[(Int, Int)].toDF("a", "b")
     checkAnswer(emptyTableData.agg(
@@ -573,6 +637,59 @@ class DataFrameAggregateSuite extends QueryTest
         expr("skewness(a)"),
         expr("kurtosis(a)")),
       Row(null, null, null, null, null))
+  }
+
+  test("SPARK-58291: empty-buffer merge must not overflow to NaN for statistical aggregates") {
+    // A single-partition group with two equal, very large finite values has zero variance, so
+    // var_pop / covar_pop / regr_sxy must be 0.0. Previously, when adjacent Partial/Final
+    // aggregates were NOT combined (the old default), the Final merge of the non-empty Partial
+    // buffer into the empty Final buffer computed `delta * deltaN * n1 * n2` where `n1 == 0`;
+    // `delta * deltaN` overflowed to Infinity and `Infinity * 0 = NaN`, corrupting the moments.
+    // CombineAdjacentAggregation (Complete mode) sidesteps the merge and returned 0.0, so the two
+    // configurations disagreed. The merge fix makes both paths return 0.0.
+    // This must hold with and without AQE, and with combining on and off.
+    Seq(true, false).foreach { aqe =>
+      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> aqe.toString) {
+        val df = Seq(1e155, 1e155).toDF("a").repartition(1)
+        Seq(true, false).foreach { combine =>
+          withSQLConf(SQLConf.COMBINE_ADJACENT_AGGREGATION_ENABLED.key -> combine.toString) {
+            checkAnswer(
+              df.selectExpr("var_pop(a)", "covar_pop(a, a)", "regr_sxy(a, a)"),
+              Row(0.0, 0.0, 0.0))
+          }
+        }
+      }
+    }
+  }
+
+  test("SPARK-58291: empty-buffer merge must not overflow to NaN for Pearson correlation") {
+    // Two finite points are perfectly linearly correlated, so corr / regr_r2 are finite. The
+    // Pearson merge computes `dx * dxN * n1 * n2` (and the dy variant) for xMk / yMk. When one
+    // side is an empty buffer (n1 == 0 or n2 == 0) and the other has a large average, `dx * dxN`
+    // overflows to Infinity before being multiplied by the zero count, and `Infinity * 0 = NaN`
+    // corrupts the merged moments. The old default (no combining) hit this Final-merge path and
+    // returned NaN, while CombineAdjacentAggregation (Complete mode) sidestepped the merge, so the
+    // two configurations disagreed. The merge fix makes both paths return the same finite result.
+    // This must hold with and without AQE, and with combining on and off.
+    val data = Seq((1.0e155, 1.0e-150), (1.000000000000001e155, 2.0e-150))
+    Seq(true, false).foreach { aqe =>
+      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> aqe.toString) {
+        val df = data.toDF("x", "y").repartition(1)
+        // Reference result from the combined (Complete-mode) path, which never runs the merge.
+        val expected = withSQLConf(
+            SQLConf.COMBINE_ADJACENT_AGGREGATION_ENABLED.key -> "true") {
+          df.selectExpr("corr(x, y)", "regr_r2(y, x)").collect()
+        }
+        expected.head.toSeq.foreach { v =>
+          assert(!v.asInstanceOf[Double].isNaN, "corr / regr_r2 must be finite, not NaN")
+        }
+        Seq(true, false).foreach { combine =>
+          withSQLConf(SQLConf.COMBINE_ADJACENT_AGGREGATION_ENABLED.key -> combine.toString) {
+            checkAnswer(df.selectExpr("corr(x, y)", "regr_r2(y, x)"), expected.toSeq)
+          }
+        }
+      }
+    }
   }
 
   test("collect functions") {
@@ -607,6 +724,164 @@ class DataFrameAggregateSuite extends QueryTest
       df.select(array_agg($"a"), array_agg($"b")),
       Seq(Row(Seq(1, 2, 3), Seq(2, 2, 4)))
     )
+  }
+
+  test("collect_union function") {
+    // Distinct union of array elements across rows.
+    val df = Seq(Seq(1, 2), Seq(2, 3), Seq(1)).toDF("arr")
+    checkDataset(
+      df.select(collect_union($"arr").as("u")).as[Set[Int]],
+      Set(1, 2, 3))
+    checkAnswer(
+      df.select(sort_array(collect_union($"arr"))),
+      Seq(Row(Seq(1, 2, 3))))
+    checkAnswer(
+      df.selectExpr("sort_array(collect_union(arr))"),
+      Seq(Row(Seq(1, 2, 3))))
+
+    // NULL array inputs are always skipped.
+    val dfNulls = Seq(Seq(1, 2), null, Seq(2, 3)).toDF("arr")
+    checkAnswer(
+      dfNulls.select(sort_array(collect_union($"arr"))),
+      Seq(Row(Seq(1, 2, 3))))
+
+    // NULL elements: dropped by default (IGNORE NULLS, matching collect_set) ...
+    val dfNullElem = Seq(Seq(Integer.valueOf(1), null), Seq(Integer.valueOf(2))).toDF("arr")
+    checkAnswer(
+      dfNullElem.select(sort_array(collect_union($"arr"))),
+      Seq(Row(Seq(1, 2))))
+    // ... and kept (a single null) with RESPECT NULLS, matching
+    // array_distinct(flatten(collect_list(...))). sort_array puts null first in asc order.
+    checkAnswer(
+      dfNullElem.selectExpr("sort_array(collect_union(arr) RESPECT NULLS)"),
+      Seq(Row(Seq(null, 1, 2))))
+    // Equivalent to array_distinct(flatten(collect_list(...))) under RESPECT NULLS. Compare
+    // order-insensitively via sort_array, since element order in either result is unspecified.
+    checkAnswer(
+      dfNullElem.selectExpr("sort_array(collect_union(arr) RESPECT NULLS)"),
+      dfNullElem.selectExpr("sort_array(array_distinct(flatten(collect_list(arr))))"))
+
+    // Per-group union.
+    val g = Seq(("a", Seq(1, 2)), ("a", Seq(2, 3)), ("b", Seq(4))).toDF("k", "arr")
+    checkAnswer(
+      g.groupBy("k").agg(sort_array(collect_union($"arr"))).orderBy("k"),
+      Seq(Row("a", Seq(1, 2, 3)), Row("b", Seq(4))))
+
+    // Empty result: only-NULL arrays produce an empty array, not null.
+    val dfEmpty = Seq[Seq[Int]](null, null).toDF("arr")
+    checkAnswer(
+      dfEmpty.select(collect_union($"arr")),
+      Seq(Row(Seq.empty[Int])))
+  }
+
+  test("collect_union requires an array input") {
+    // A non-array (scalar) input is rejected at analysis time.
+    val df = Seq(1, 2, 3).toDF("a")
+    checkError(
+      exception = intercept[AnalysisException] {
+        df.select(collect_union($"a")).collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"collect_union(a)\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"a\"",
+        "inputType" -> "\"INT\"",
+        "requiredType" -> "\"ARRAY\""),
+      context = ExpectedContext(
+        fragment = "collect_union", callSitePattern = getCurrentClassCallSitePattern))
+  }
+
+  test("SPARK-55256: array_agg and collect_list skip nulls by default") {
+    val df = Seq((1, Some(2)), (2, None), (3, Some(4))).toDF("a", "b")
+
+    // Both functions skip nulls by default
+    checkAnswer(df.selectExpr("array_agg(b)"), Seq(Row(Seq(2, 4))))
+    checkAnswer(df.select(array_agg($"b")), Seq(Row(Seq(2, 4))))
+    checkAnswer(df.selectExpr("collect_list(b)"), Seq(Row(Seq(2, 4))))
+    checkAnswer(df.select(collect_list($"b")), Seq(Row(Seq(2, 4))))
+  }
+
+  test("SPARK-55256: array_agg with IGNORE NULLS explicitly skips nulls") {
+    val df = Seq((1, Some(2)), (2, None), (3, Some(4))).toDF("a", "b")
+
+    checkAnswer(df.selectExpr("array_agg(b) IGNORE NULLS"), Seq(Row(Seq(2, 4))))
+    checkAnswer(df.selectExpr("collect_list(b) IGNORE NULLS"), Seq(Row(Seq(2, 4))))
+  }
+
+  test("SPARK-55256: array_agg with RESPECT NULLS preserves nulls") {
+    val df = Seq((1, Some(2)), (2, None), (3, Some(4))).toDF("a", "b")
+
+    // RESPECT NULLS preserves null values in the result
+    checkAnswer(df.selectExpr("array_agg(b) RESPECT NULLS"), Seq(Row(Seq(2, null, 4))))
+    checkAnswer(df.selectExpr("collect_list(b) RESPECT NULLS"), Seq(Row(Seq(2, null, 4))))
+  }
+
+  test("collect_set skips nulls by default") {
+    val df = Seq((1, Some(2)), (2, None), (3, Some(2))).toDF("a", "b")
+
+    checkAnswer(df.selectExpr("sort_array(collect_set(b))"), Seq(Row(Seq(2))))
+    checkAnswer(df.select(sort_array(collect_set($"b"))), Seq(Row(Seq(2))))
+  }
+
+  test("collect_set with IGNORE NULLS explicitly skips nulls") {
+    val df = Seq((1, Some(2)), (2, None), (3, Some(4))).toDF("a", "b")
+
+    checkAnswer(
+      df.selectExpr("sort_array(collect_set(b) IGNORE NULLS)"), Seq(Row(Seq(2, 4))))
+  }
+
+  test("collect_set with RESPECT NULLS preserves null in set") {
+    val df = Seq((1, Some(2)), (2, None), (3, Some(2))).toDF("a", "b")
+
+    // RESPECT NULLS preserves null value in the set
+    checkAnswer(
+      df.selectExpr("sort_array(collect_set(b) RESPECT NULLS)"), Seq(Row(Seq(null, 2))))
+  }
+
+  test("SPARK-57298: collect_set normalizes NaN and -0.0 for floating-point types") {
+    checkAnswer(
+      sql("SELECT collect_set(v) FROM VALUES (double('NaN')), (double('NaN')) AS t(v)"),
+      Row(Seq(Double.NaN)))
+    checkAnswer(
+      sql("SELECT collect_set(v) FROM VALUES (float('NaN')), (float('NaN')) AS t(v)"),
+      Row(Seq(Float.NaN)))
+
+    checkAnswer(
+      sql("SELECT collect_set(v) FROM VALUES (-0.0D), (0.0D) AS t(v)"),
+      Row(Seq(0.0d)))
+    checkAnswer(
+      sql("SELECT collect_set(v) FROM VALUES (float(-0.0)), (float(0.0)) AS t(v)"),
+      Row(Seq(0.0f)))
+
+    val df = Seq(Double.NaN, Double.NaN, 0.0d, -0.0d, 1.0d).toDF("v").repartition(3)
+    checkAnswer(df.selectExpr("sort_array(collect_set(v))"), Row(Seq(0.0d, 1.0d, Double.NaN)))
+  }
+
+  test("SPARK-57298: collect_set normalizes NaN and -0.0 nested in complex types") {
+    checkAnswer(
+      sql("SELECT collect_set(named_struct('a', v)) FROM VALUES (-0.0D), (0.0D) AS t(v)"),
+      Row(Seq(Row(0.0d))))
+    checkAnswer(
+      sql("SELECT collect_set(a) FROM VALUES (array(-0.0D)), (array(0.0D)) AS t(a)"),
+      Row(Seq(Seq(0.0d))))
+    checkAnswer(
+      sql("SELECT collect_set(a) FROM VALUES (array(float(-0.0))), (array(float(0.0))) AS t(a)"),
+      Row(Seq(Seq(0.0f))))
+
+    // Nested NaN already deduplicates today, included as a guardrail against regressions.
+    checkAnswer(
+      sql("SELECT collect_set(named_struct('a', v)) FROM " +
+        "VALUES (double('NaN')), (double('NaN')) AS t(v)"),
+      Row(Seq(Row(Double.NaN))))
+    checkAnswer(
+      sql("SELECT collect_set(a) FROM " +
+        "VALUES (array(double('NaN'))), (array(double('NaN'))) AS t(a)"),
+      Row(Seq(Seq(Double.NaN))))
+    checkAnswer(
+      sql("SELECT collect_set(a) FROM " +
+        "VALUES (array(float('NaN'))), (array(float('NaN'))) AS t(a)"),
+      Row(Seq(Seq(Float.NaN))))
   }
 
   test("collect functions structs") {
@@ -659,6 +934,31 @@ class DataFrameAggregateSuite extends QueryTest
       df4.selectExpr("listagg(col1, '|')", "listagg(col2, '|')"),
       Seq(Row("a|b|c", "b|c|d"))
     )
+  }
+
+  test("SPARK-55501: listagg with DISTINCT and ORDER BY") {
+    val df = Seq(1, 2, 10, 1, 9).toDF("a")
+
+    withSQLConf(SQLConf.LISTAGG_ALLOW_DISTINCT_CAST_WITH_ORDER.key -> "true") {
+      checkAnswer(
+        df.selectExpr("listagg(distinct a, ', ') within group (order by a)"),
+        Seq(Row("1, 2, 9, 10"))
+      )
+    }
+
+    withSQLConf(SQLConf.LISTAGG_ALLOW_DISTINCT_CAST_WITH_ORDER.key -> "false") {
+      checkError(
+        exception = intercept[AnalysisException] {
+          df.selectExpr("listagg(distinct a) within group (order by a)")
+        },
+        condition = "INVALID_WITHIN_GROUP_EXPRESSION.MISMATCH_WITH_DISTINCT_INPUT",
+        parameters = Map(
+          "funcName" -> "`listagg`",
+          "funcArg" -> "\"a\"",
+          "orderingExpr" -> "\"a\""
+        )
+      )
+    }
   }
 
   test("SPARK-31500: collect_set() of BinaryType returns duplicate elements") {
@@ -716,6 +1016,19 @@ class DataFrameAggregateSuite extends QueryTest
       Seq(Row(Seq(1, 2))))
     checkAnswer(df.select(collect_set("a") cast ArrayType(FloatType, false)),
       Seq(Row(Seq(1.0, 2.0))))
+  }
+
+  test("SPARK-56155: collect functions sql() display RESPECT NULLS") {
+    val df = Seq((1, Some(2)), (1, None), (1, Some(4))).toDF("a", "b")
+    val collect_list_result = df.selectExpr("collect_list(b) RESPECT NULLS")
+    val collect_list_result2 = df.selectExpr("collect_list(b)")
+    assert(collect_list_result.columns.head == "collect_list(b) RESPECT NULLS")
+    assert(collect_list_result2.columns.head == "collect_list(b)")
+
+    val collect_set_result = df.selectExpr("collect_set(b) RESPECT NULLS")
+    val collect_set_result2 = df.selectExpr("collect_set(b)")
+    assert(collect_set_result.columns.head == "collect_set(b) RESPECT NULLS")
+    assert(collect_set_result2.columns.head == "collect_set(b)")
   }
 
   test("SPARK-14664: Decimal sum/avg over window should work.") {
@@ -958,6 +1271,56 @@ class DataFrameAggregateSuite extends QueryTest
     )
   }
 
+  test("SPARK-57329: mode normalizes -0.0/0.0 in the frequency buffer") {
+    checkAnswer(
+      Seq(0.0d, 0.0d, -0.0d, -0.0d, 9.0d, 9.0d, 9.0d).toDF("d").select(expr("mode(d)")),
+      Row(0.0d))
+    checkAnswer(
+      Seq(0.0f, 0.0f, -0.0f, -0.0f, 9.0f, 9.0f, 9.0f).toDF("f").select(expr("mode(f)")),
+      Row(0.0f))
+
+    checkAnswer(
+      Seq(Array(-0.0d), Array(-0.0d), Array(0.0d), Array(0.0d),
+          Array(9.0d), Array(9.0d), Array(9.0d)).toDF("a").select(expr("mode(a)")),
+      Row(Seq(0.0d)))
+
+    // pandas_mode shares the same normalization path; cover it explicitly. It is an
+    // internal expression, so invoke it via Column.internalFn rather than SQL.
+    checkAnswer(
+      Seq(0.0d, 0.0d, -0.0d, -0.0d, 9.0d).toDF("d")
+        .select(Column.internalFn("pandas_mode", col("d"), lit(true))),
+      Row(Seq(0.0d)))
+    checkAnswer(
+      Seq(0.0f, 0.0f, -0.0f, -0.0f, 9.0f).toDF("f")
+        .select(Column.internalFn("pandas_mode", col("f"), lit(true))),
+      Row(Seq(0.0f)))
+    checkAnswer(
+      Seq(Array(-0.0d), Array(-0.0d), Array(0.0d), Array(0.0d), Array(9.0d)).toDF("a")
+        .select(Column.internalFn("pandas_mode", col("a"), lit(true))),
+      Row(Seq(Seq(0.0d))))
+
+    // Struct complex type: same recursive NormalizeFloatingNumbers path as the array case
+    // above, but a different shape. -0.0/0.0 collapse to 4 occurrences, outvoting 9.0's 3.
+    checkAnswer(
+      sql("SELECT mode(named_struct('a', v)) FROM " +
+        "VALUES (-0.0D), (-0.0D), (0.0D), (0.0D), (9.0D), (9.0D), (9.0D) AS t(v)"),
+      Row(Row(0.0d)))
+
+    // NaN with differing bit patterns nested in a complex type. The normalization lambda
+    // canonicalizes the NaN bits so the two patterns collapse to 4 occurrences, outvoting
+    // 9.0's 3. Without normalization each pattern forms its own group of 2 and 9.0 (3) wins,
+    // so the expected NaN result genuinely distinguishes fixed from buggy behavior.
+    val nan1 = java.lang.Double.longBitsToDouble(0x7ff8000000000000L)
+    val nan2 = java.lang.Double.longBitsToDouble(0x7ff8000000000001L)
+    assert(nan1.isNaN && nan2.isNaN &&
+      java.lang.Double.doubleToRawLongBits(nan1) !=
+        java.lang.Double.doubleToRawLongBits(nan2))
+    checkAnswer(
+      Seq(nan1, nan1, nan2, nan2, 9.0d, 9.0d, 9.0d).toDF("v")
+        .select(struct(col("v")).as("s")).select(expr("mode(s)")),
+      Row(Row(Double.NaN)))
+  }
+
   test("SPARK-27581: DataFrame count_distinct(\"*\") shouldn't fail with AnalysisException") {
     val df = sql("select id % 100 from range(100000)")
     val distinctCount1 = df.select(expr("count(distinct(*))"))
@@ -1108,6 +1471,311 @@ class DataFrameAggregateSuite extends QueryTest
     }
   }
 
+  test("max_by and min_by with k") {
+    // Basic: string values, integer ordering
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("b", "c"), Seq("a", "c")) :: Nil
+    )
+
+    // DataFrame API
+    checkAnswer(
+      spark.sql("SELECT * FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)")
+        .agg(max_by(col("x"), col("y"), 2), min_by(col("x"), col("y"), 2)),
+      Row(Seq("b", "c"), Seq("a", "c")) :: Nil
+    )
+
+    // k larger than available rows
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 5), min_by(x, y, 5)
+          |FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("b", "c", "a"), Seq("a", "c", "b")) :: Nil
+    )
+
+    // k = 1
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 1), min_by(x, y, 1)
+          |FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("b"), Seq("a")) :: Nil
+    )
+
+    // NULL orderings are skipped
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES (('a', 10)), (('b', null)), (('c', 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("c", "a"), Seq("a", "c")) :: Nil
+    )
+
+    // All NULL orderings yields null
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES (('a', null)), (('b', null)) AS tab(x, y)
+        """.stripMargin),
+      Row(null, null) :: Nil
+    )
+
+    // Empty input yields null
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES (('a', 10)) AS tab(x, y) WHERE false
+        """.stripMargin),
+      Row(null, null) :: Nil
+    )
+
+    // Integer values, integer ordering
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES ((1, 100)), ((2, 200)), ((3, 150)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(2, 3), Seq(1, 3)) :: Nil
+    )
+
+    // 10 elements, k=3 - forces heap replacements
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 3), min_by(x, y, 3)
+          |FROM VALUES ((1, 50)), ((2, 30)), ((3, 80)), ((4, 10)), ((5, 90)),
+          |            ((6, 20)), ((7, 70)), ((8, 40)), ((9, 60)), ((10, 100))
+          |AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(10, 5, 3), Seq(4, 6, 2)) :: Nil
+    )
+
+    // descending input order (worst case for min-heap)
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 3)
+          |FROM VALUES ((1, 100)), ((2, 90)), ((3, 80)), ((4, 70)), ((5, 60)),
+          |            ((6, 50)), ((7, 40)), ((8, 30)), ((9, 20)), ((10, 10))
+          |AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(1, 2, 3)) :: Nil
+    )
+
+    // ascending input order (worst case for max-heap in min_by)
+    checkAnswer(
+      sql(
+        """
+          |SELECT min_by(x, y, 3)
+          |FROM VALUES ((1, 10)), ((2, 20)), ((3, 30)), ((4, 40)), ((5, 50)),
+          |            ((6, 60)), ((7, 70)), ((8, 80)), ((9, 90)), ((10, 100))
+          |AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(1, 2, 3)) :: Nil
+    )
+
+    // Large k with many elements
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 5), min_by(x, y, 5)
+          |FROM VALUES ((1, 15)), ((2, 25)), ((3, 35)), ((4, 45)), ((5, 55)),
+          |            ((6, 65)), ((7, 75)), ((8, 85))
+          |AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(8, 7, 6, 5, 4), Seq(1, 2, 3, 4, 5)) :: Nil
+    )
+
+    // Duplicate ordering values (non-deterministic order within ties, but set should match)
+    val dupsResult = sql(
+      """
+        |SELECT max_by(x, y, 3)
+        |FROM VALUES ((1, 50)), ((2, 50)), ((3, 50)), ((4, 10)), ((5, 90))
+        |AS tab(x, y)
+      """.stripMargin).collect()(0).getSeq[Int](0).toSet
+    assert(dupsResult.contains(5))  // 90 is highest, must be included
+    assert(dupsResult.size == 3)
+
+    // Struct ordering
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES (('a', (10, 20))), (('b', (10, 50))), (('c', (10, 60))) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("c", "b"), Seq("a", "b")) :: Nil
+    )
+
+    // Array ordering
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES (('a', array(10, 20))), (('b', array(10, 50))), (('c', array(10, 60)))
+          |AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("c", "b"), Seq("a", "b")) :: Nil
+    )
+
+    // Struct values
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES ((('a', 1), 10)), ((('b', 2), 50)), ((('c', 3), 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(Row("b", 2), Row("c", 3)), Seq(Row("a", 1), Row("c", 3))) :: Nil
+    )
+
+    // Array values
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES ((array(1, 2), 10)), ((array(3, 4), 50)), ((array(5, 6), 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(Seq(3, 4), Seq(5, 6)), Seq(Seq(1, 2), Seq(5, 6))) :: Nil
+    )
+
+    // Map values
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2), min_by(x, y, 2)
+          |FROM VALUES ((map('a', 1), 10)), ((map('b', 2), 50)), ((map('c', 3), 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq(Map("b" -> 2), Map("c" -> 3)), Seq(Map("a" -> 1), Map("c" -> 3))) :: Nil
+    )
+
+    // GROUP BY
+    checkAnswer(
+      sql(
+        """
+          |SELECT course, max_by(year, earnings, 2), min_by(year, earnings, 2)
+          |FROM VALUES
+          |  (('Java', 2012, 20000)), (('Java', 2013, 30000)),
+          |  (('dotNET', 2012, 15000)), (('dotNET', 2013, 48000))
+          |AS tab(course, year, earnings)
+          |GROUP BY course
+          |ORDER BY course
+        """.stripMargin),
+      Row("Java", Seq(2013, 2012), Seq(2012, 2013)) ::
+        Row("dotNET", Seq(2013, 2012), Seq(2012, 2013)) :: Nil
+    )
+
+    // Error: k must be a constant (not a column reference)
+    Seq("max_by", "min_by").foreach { fn =>
+      val error = intercept[AnalysisException] {
+        sql(s"SELECT $fn(x, y, z) FROM VALUES (('a', 10, 2)) AS tab(x, y, z)").collect()
+      }
+      assert(error.getMessage.contains("NON_FOLDABLE_INPUT") ||
+        error.getMessage.contains("constant integer"))
+    }
+
+    // Float k is implicitly cast to integer (truncated) - 2.5 becomes 2
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 2.5), min_by(x, y, 2.5)
+          |FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("b", "c"), Seq("a", "c")) :: Nil
+    )
+
+    // Error: string k cannot be cast to integer
+    Seq("max_by", "min_by").foreach { fn =>
+      val error = intercept[Exception] {
+        sql(s"SELECT $fn(x, y, 'two') FROM VALUES (('a', 10)) AS tab(x, y)").collect()
+      }
+      if (conf.ansiEnabled) {
+        assert(error.getMessage.contains("CAST_INVALID_INPUT") ||
+          error.getMessage.contains("cannot be cast"))
+      } else {
+        assert(error.getMessage.contains("VALUE_OUT_OF_RANGE"))
+      }
+    }
+
+    // Error: k must be positive
+    Seq("max_by", "min_by").foreach { fn =>
+      val error = intercept[Exception] {
+        sql(s"SELECT $fn(x, y, 0) FROM VALUES (('a', 10)) AS tab(x, y)").collect()
+      }
+      assert(error.getMessage.contains("VALUE_OUT_OF_RANGE") ||
+        error.getMessage.contains("positive"))
+    }
+
+    // Error: non-orderable type (MAP)
+    withTempView("tempView") {
+      Seq((0, "a"), (1, "b"), (2, "c"))
+        .toDF("x", "y")
+        .select($"x", map($"x", $"y").as("y"))
+        .createOrReplaceTempView("tempView")
+      Seq("max_by", "min_by").foreach { fn =>
+        val mapError = intercept[AnalysisException] {
+          sql(s"SELECT $fn(x, y, 2) FROM tempView").collect()
+        }
+        assert(mapError.getMessage.contains("INVALID_ORDERING_TYPE") ||
+          mapError.getMessage.contains("not orderable"))
+      }
+    }
+
+    // Error: non-orderable type (ARRAY<MAP>)
+    withTempView("tempView") {
+      Seq((0, "a"), (1, "b"), (2, "c"))
+        .toDF("x", "y")
+        .select($"x", array(map($"x", $"y")).as("y"))
+        .createOrReplaceTempView("tempView")
+      Seq("max_by", "min_by").foreach { fn =>
+        val error = intercept[AnalysisException] {
+          sql(s"SELECT $fn(x, y, 2) FROM tempView").collect()
+        }
+        assert(error.getMessage.contains("INVALID_ORDERING_TYPE"))
+      }
+    }
+
+    // Error: non-orderable type (VARIANT)
+    withTempView("tempView") {
+      sql("SELECT 'a' as x, parse_json('{\"k\": 1}') as y")
+        .createOrReplaceTempView("tempView")
+      Seq("max_by", "min_by").foreach { fn =>
+        val error = intercept[AnalysisException] {
+          sql(s"SELECT $fn(x, y, 2) FROM tempView").collect()
+        }
+        assert(error.getMessage.contains("INVALID_ORDERING_TYPE"))
+      }
+    }
+
+    // Error: k exceeds maximum limit (100000)
+    Seq("max_by", "min_by").foreach { fn =>
+      val error = intercept[Exception] {
+        sql(s"SELECT $fn(x, y, 100001) FROM VALUES (('a', 10)) AS tab(x, y)").collect()
+      }
+      assert(error.getMessage.contains("VALUE_OUT_OF_RANGE") ||
+        error.getMessage.contains("100000"))
+    }
+
+    // Large k
+    checkAnswer(
+      sql(
+        """
+          |SELECT max_by(x, y, 100000), min_by(x, y, 100000)
+          |FROM VALUES (('a', 10)), (('b', 50)), (('c', 20)) AS tab(x, y)
+        """.stripMargin),
+      Row(Seq("b", "c", "a"), Seq("a", "c", "b")) :: Nil
+    )
+  }
+
   test("percentile_like") {
     // percentile
     checkAnswer(
@@ -1117,7 +1785,7 @@ class DataFrameAggregateSuite extends QueryTest
         percentile(col("year"), lit(0.3), lit(2)),
         percentile(col("year"), lit(Array(0.25, 0.75)), lit(2))
       ),
-      Row("Java", 2012.2999999999997, Seq(2012.25, 2012.75), 2012.0, Seq(2012.0, 2013.0)) ::
+      Row("Java", 2012.3, Seq(2012.25, 2012.75), 2012.0, Seq(2012.0, 2013.0)) ::
         Row("dotNET", 2012.0, Seq(2012.0, 2012.5), 2012.0, Seq(2012.0, 2012.75)) :: Nil
     )
 
@@ -2189,6 +2857,70 @@ class DataFrameAggregateSuite extends QueryTest
     }
   }
 
+  // Byte 3 of the serialized sketch holds lgConfigK, so SUBSTRING(hex(...), 7, 2) reads it as a
+  // hex pair: 0x0F = 15, 0x0C = 12.
+  private val allNullGroupSketches =
+    """
+      |with sketches as (
+      |  select 'has_data' as grp, hll_sketch_agg(cast(id as string), 15) as sketch
+      |  from (select explode(sequence(1, 1000)) as id)
+      |  union all
+      |  select 'all_null' as grp, cast(null as binary) as sketch
+      |)
+      |""".stripMargin
+
+  test("hll_union_agg reports the default lgConfigK for a group with no non-NULL sketch") {
+    // hll_union_agg has no lgConfigK parameter, and the all-NULL group holds no sketch to take one
+    // from, so it cannot report the 15 the other group was built at. The estimate is correct either
+    // way; the mismatched precision is what the next test has to cope with.
+    checkAnswer(
+      sql(allNullGroupSketches +
+        """
+          |select
+          |  grp,
+          |  substring(hex(hll_union_agg(sketch)), 7, 2) as lg_config_k,
+          |  hll_sketch_estimate(hll_union_agg(sketch)) as estimate
+          |from sketches
+          |group by grp
+          |""".stripMargin),
+      Seq(Row("all_null", "0C", 0L), Row("has_data", "0F", 1000L)))
+  }
+
+  test("hll_union_agg and hll_union re-merge the empty sketch produced for an all-NULL group") {
+    // The stored sketches are now an empty lgConfigK=12 one beside a populated lgConfigK=15 one.
+    // Rolling them back up must not fail under default settings, because an empty sketch holds no
+    // coupons and so cannot cost precision at any lgConfigK.
+    val stored = sql(allNullGroupSketches +
+      "select grp, hll_union_agg(sketch) as sketch from sketches group by grp")
+      .collect()
+      .map(row => row.getString(0) -> row.getAs[Array[Byte]]("sketch"))
+      .toMap
+
+    Seq(
+      "empty sketch first" -> Seq(stored("all_null"), stored("has_data")),
+      "empty sketch last" -> Seq(stored("has_data"), stored("all_null"))
+    ).foreach { case (order, sketches) =>
+      // One partition exercises update(); two exercise the partial-to-final merge() as well.
+      Seq(1, 2).foreach { numPartitions =>
+        withClue(s"hll_union_agg, $order, $numPartitions partition(s): ") {
+          checkAnswer(
+            sketches.toDF("sketch").repartition(numPartitions).selectExpr(
+              "substring(hex(hll_union_agg(sketch)), 7, 2) as lg_config_k",
+              "hll_sketch_estimate(hll_union_agg(sketch)) as estimate"),
+            Seq(Row("0F", 1000L)))
+        }
+      }
+
+      withClue(s"hll_union, $order: ") {
+        checkAnswer(
+          Seq((sketches.head, sketches.last)).toDF("left", "right").selectExpr(
+            "substring(hex(hll_union(left, right)), 7, 2) as lg_config_k",
+            "hll_sketch_estimate(hll_union(left, right)) as estimate"),
+          Seq(Row("0F", 1000L)))
+      }
+    }
+  }
+
   test("hll_sketch_agg") {
     val df = Seq(1, 1, 2, 2, 3).toDF("col")
     checkAnswer(
@@ -2217,18 +2949,722 @@ class DataFrameAggregateSuite extends QueryTest
     )
   }
 
+  test("SPARK-52407: theta_sketch_agg + theta_union_agg + theta_sketch_estimate positive tests") {
+    val df1 = Seq((1, "a"), (1, "a"), (1, "a"), (1, "b"), (1, "c"), (1, "c"), (1, "d"))
+      .toDF("id", "value")
+    df1.createOrReplaceTempView("df1")
+
+    val df2 = Seq((1, "a"), (1, "c"), (1, "d"), (1, "d"), (1, "d"), (1, "e"), (1, "e"), (1, "f"))
+      .toDF("id", "value")
+    df2.createOrReplaceTempView("df2")
+
+    // First test theta_sketch_agg, theta_sketch_estimate via dataframe + sql,
+    // with and without configs, via both DF and SQL implementations.
+    val res1 = df1
+      .groupBy("id")
+      .agg(
+        count("value").as("count"),
+        theta_sketch_agg("value").as("sketch_1"),
+        theta_sketch_agg("value", 20).as("sketch_2"))
+      .withColumn("distinct_count_1", theta_sketch_estimate("sketch_1"))
+      .withColumn("distinct_count_2", theta_sketch_estimate("sketch_2"))
+      .drop("sketch_1", "sketch_2")
+    checkAnswer(res1, Row(1, 7, 4, 4))
+
+    val res2 = sql("""with sketches as (
+        |select
+        | id,
+        | count(value) as count,
+        | theta_sketch_agg(value) as sketch_1,
+        | theta_sketch_agg(value, 20) as sketch_2
+        |from df1
+        |group by 1
+        |)
+        |
+        |select
+        | id,
+        | count,
+        | theta_sketch_estimate(sketch_1) as distinct_count_1,
+        | theta_sketch_estimate(sketch_2) as distinct_count_2
+        |from
+        | sketches
+        |""".stripMargin)
+    checkAnswer(res2, Row(1, 7, 4, 4))
+
+    // Now test theta_union_agg via dataframe + sql, with and without configs,
+    // unioning together sketches with default, non-default and different configurations
+    val df3 = df1
+      .groupBy("id")
+      .agg(
+        count("value").as("count"),
+        theta_sketch_agg("value").as("thetasketch_1"),
+        theta_sketch_agg("value", 20).as("thetasketch_2"),
+        theta_sketch_agg("value").as("thetasketch_3"))
+    df3.createOrReplaceTempView("df3")
+
+    val df4 = sql("""select
+        | id,
+        | count(value) as count,
+        | theta_sketch_agg(value) as thetasketch_1,
+        | theta_sketch_agg(value, 20) as thetasketch_2,
+        | theta_sketch_agg(value, 20) as thetasketch_3
+        |from df2
+        |group by 1
+        |""".stripMargin)
+    df4.createOrReplaceTempView("df4")
+
+    val res3 = df3
+      .union(df4)
+      .groupBy("id")
+      .agg(
+        sum("count").as("count"),
+        theta_sketch_estimate(theta_union_agg("thetasketch_1")).as("distinct_count_1"),
+        theta_sketch_estimate(theta_union_agg("thetasketch_2")).as("distinct_count_2"),
+        theta_sketch_estimate(theta_union_agg("thetasketch_3", 15)).as("distinct_count_3"))
+    checkAnswer(res3, Row(1, 15, 6, 6, 6))
+
+    val res4 = sql("""select
+        | id,
+        | sum(count) as count,
+        | theta_sketch_estimate(theta_union_agg(thetasketch_1)) as distinct_count_1,
+        | theta_sketch_estimate(theta_union_agg(thetasketch_2)) as distinct_count_2,
+        | theta_sketch_estimate(theta_union_agg(thetasketch_3, 15)) as distinct_count_3
+        |from (select * from df3 union all select * from df4)
+        |group by 1
+        |""".stripMargin)
+    checkAnswer(res4, Row(1, 15, 6, 6, 6))
+
+    // add tests to ensure theta_union works via both DF and SQL too
+    val df5 = df3.drop("count")
+    df5.createOrReplaceTempView("df5")
+
+    val df6 = df4
+      .drop("count")
+      .withColumnRenamed("thetasketch_1", "thetasketch_4")
+      .withColumnRenamed("thetasketch_2", "thetasketch_5")
+      .withColumnRenamed("thetasketch_3", "thetasketch_6")
+    df6.createOrReplaceTempView("df6")
+
+    val res5 = df5
+      .join(df6, "id")
+      .withColumn(
+        "distinct_count_1",
+        theta_sketch_estimate(theta_union("thetasketch_1", "thetasketch_4")))
+      .withColumn(
+        "distinct_count_2",
+        theta_sketch_estimate(theta_union("thetasketch_2", "thetasketch_5")))
+      .withColumn(
+        "distinct_count_3",
+        theta_sketch_estimate(theta_union("thetasketch_3", "thetasketch_6", 15)))
+      .drop(
+        "thetasketch_1",
+        "thetasketch_2",
+        "thetasketch_3",
+        "thetasketch_4",
+        "thetasketch_5",
+        "thetasketch_6")
+    checkAnswer(res5, Row(1, 6, 6, 6))
+
+    val res6 = sql("""with joined as (
+        |  select
+        |    l.id,
+        |    l.thetasketch_1,
+        |    l.thetasketch_2,
+        |    l.thetasketch_3,
+        |    r.thetasketch_4,
+        |    r.thetasketch_5,
+        |    r.thetasketch_6
+        |  from
+        |    df5 l
+        |    join
+        |    df6 r
+        |     on l.id = r.id
+        | )
+        |
+        |select
+        |  id,
+        |  theta_sketch_estimate(theta_union(thetasketch_1, thetasketch_4)) as distinct_count_1,
+        |  theta_sketch_estimate(theta_union(thetasketch_2, thetasketch_5)) as distinct_count_2,
+        |  theta_sketch_estimate(theta_union(thetasketch_3, thetasketch_6, 20))
+        |  as distinct_count_3
+        |from
+        | joined
+        |""".stripMargin)
+    checkAnswer(res6, Row(1, 6, 6, 6))
+
+    val df7 =
+      Seq((1, "a"), (1, "a"), (1, "a"), (1, "b"), (1, null), (2, null), (2, null), (2, null))
+        .toDF("id", "value")
+
+    // empty column test
+    val res7 = df7
+      .where(expr("id = 2"))
+      .groupBy("id")
+      .agg(theta_sketch_estimate(theta_sketch_agg("value")).as("distinct_count"))
+    checkAnswer(res7, Row(2, 0))
+
+    // partial empty column test
+    val res8 = df7
+      .groupBy("id")
+      .agg(theta_sketch_estimate(theta_sketch_agg("value")).as("distinct_count"))
+    checkAnswer(res8, Seq(Row(1, 2), Row(2, 0)))
+  }
+
+  test("SPARK-52407: theta_sketch_agg + theta_union_agg + theta_union negative tests") {
+    val df1 = Seq((1, "a"), (1, "a"), (1, "a"), (1, "b"), (1, "c"), (1, "c"), (1, "d"))
+      .toDF("id", "value")
+    df1.createOrReplaceTempView("df1")
+
+    val df2 = Seq((1, "a"), (1, "c"), (1, "d"), (1, "d"), (1, "d"), (1, "e"), (1, "e"), (1, "f"))
+      .toDF("id", "value")
+    df2.createOrReplaceTempView("df2")
+
+    // Validate that the functions error out when lgNomEntries < 4 or > 26.
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        df1
+          .groupBy("id")
+          .agg(theta_sketch_agg("value", 1).as("thetasketch"))
+          .collect()
+      },
+      condition = "SKETCH_INVALID_LG_NOM_ENTRIES",
+      parameters = Map(
+        "function" -> "`theta_sketch_agg`",
+        "min" -> "4",
+        "max" -> "26",
+        "value" -> "1"
+      )
+    )
+
+    checkError(
+      exception = intercept[SparkRuntimeException] {
+        df1
+          .groupBy("id")
+          .agg(theta_sketch_agg("value", 28).as("thetasketch"))
+          .collect()
+      },
+      condition = "SKETCH_INVALID_LG_NOM_ENTRIES",
+      parameters = Map(
+        "function" -> "`theta_sketch_agg`",
+        "min" -> "4",
+        "max" -> "26",
+        "value" -> "28"
+      )
+    )
+
+    // Validate that the functions error out when provided unexpected types.
+    checkError(
+      exception = intercept[AnalysisException] {
+        val res = sql("""
+            |select
+            | id,
+            | theta_sketch_agg(value, 'text')
+            |from
+            | df1
+            |group by 1
+            |""".stripMargin)
+        checkAnswer(res, Nil)
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_sketch_agg(value, text)\"",
+        "paramIndex" -> "second",
+        "inputSql" -> "\"text\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"INT\""),
+      context =
+        ExpectedContext(fragment = "theta_sketch_agg(value, 'text')", start = 14, stop = 44))
+
+    checkError(
+      exception = intercept[AnalysisException] {
+        val res = sql("""with sketch_cte as (
+            |select
+            | id,
+            | theta_sketch_agg(value) as sketch
+            |from
+            | df1
+            |group by 1
+            |)
+            |
+            |select theta_union_agg(sketch, 'Theta_4') from sketch_cte
+            |""".stripMargin)
+        checkAnswer(res, Nil)
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_union_agg(sketch, Theta_4)\"",
+        "paramIndex" -> "second",
+        "inputSql" -> "\"Theta_4\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"INT\""),
+      context =
+        ExpectedContext(fragment = "theta_union_agg(sketch, 'Theta_4')", start = 99, stop = 132))
+
+    // Test invalid parameter types for theta_union
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("""with sketches as (
+          |select id, theta_sketch_agg(value) as sketch from df1 group by 1
+          |)
+          |select theta_union(sketch, 'invalid') from sketches
+          |""".stripMargin).collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_union(sketch, invalid, 12)\"",
+        "paramIndex" -> "second",
+        "inputSql" -> "\"invalid\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"BINARY\""),
+      context =
+        ExpectedContext(fragment = "theta_union(sketch, 'invalid')", start = 93, stop = 122))
+
+    // Test theta_union with non-sketch input.
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("select theta_union('not_a_sketch', 'also_not_a_sketch')").collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_union(not_a_sketch, also_not_a_sketch, 12)\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"not_a_sketch\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"BINARY\""),
+      context = ExpectedContext(
+        fragment = "theta_union('not_a_sketch', 'also_not_a_sketch')",
+        start = 7,
+        stop = 54))
+
+  }
+  test(
+    "SPARK-52407: theta_difference + theta_intersection + theta_intersection_agg positive tests") {
+    val df1 = Seq((1, "a"), (1, "a"), (1, "a"), (1, "b"), (1, "c"), (1, "c"), (1, "d"))
+      .toDF("id", "value")
+    df1.createOrReplaceTempView("df1")
+
+    val df2 = Seq((1, "a"), (1, "c"), (1, "d"), (1, "d"), (1, "d"), (1, "e"), (1, "e"), (1, "f"))
+      .toDF("id", "value")
+    df2.createOrReplaceTempView("df2")
+
+    val df3 = Seq((1, "c"), (1, "d"), (1, "g"), (1, "g"), (1, "h")).toDF("id", "value")
+    df3.createOrReplaceTempView("df3")
+
+    // Test theta_difference via DataFrame API.
+    val sketches1 = df1
+      .groupBy("id")
+      .agg(
+        theta_sketch_agg("value").as("sketch1"),
+        theta_sketch_agg("value", 20).as("sketch1_20"))
+
+    val sketches2 = df2
+      .groupBy("id")
+      .agg(
+        theta_sketch_agg("value").as("sketch2"),
+        theta_sketch_agg("value", 20).as("sketch2_20"))
+
+    val res1 = sketches1
+      .join(sketches2, "id")
+      .withColumn(
+        "difference_count_1",
+        theta_sketch_estimate(theta_difference("sketch1", "sketch2")))
+      .withColumn(
+        "difference_count_2",
+        theta_sketch_estimate(theta_difference("sketch1_20", "sketch2_20")))
+      .select("id", "difference_count_1", "difference_count_2")
+
+    // df1 has {a,b,c,d}, df2 has {a,c,d,e,f}, so df1 - df2 should be approximately {b}.
+    checkAnswer(res1, Row(1, 1, 1))
+
+    // Test theta_difference via SQL.
+    val res2 = sql("""with sketches1 as (
+      |select
+      | id,
+      | theta_sketch_agg(value) as sketch1,
+      | theta_sketch_agg(value, 20) as sketch1_20
+      |from df1
+      |group by 1
+      |),
+      |sketches2 as (
+      |select
+      | id,
+      | theta_sketch_agg(value) as sketch2,
+      | theta_sketch_agg(value, 20) as sketch2_20
+      |from df2
+      |group by 1
+      |)
+      |
+      |select
+      | s1.id,
+      | theta_sketch_estimate(theta_difference(s1.sketch1, s2.sketch2)) as difference_count_1,
+      | theta_sketch_estimate(theta_difference(s1.sketch1_20, s2.sketch2_20)) as difference_count_2
+      |from sketches1 s1
+      |join sketches2 s2 on s1.id = s2.id
+      |""".stripMargin)
+    checkAnswer(res2, Row(1, 1, 1))
+
+    // Test theta_intersection via DataFrame API.
+    val res3 = sketches1
+      .join(sketches2, "id")
+      .withColumn(
+        "intersection_count_1",
+        theta_sketch_estimate(theta_intersection("sketch1", "sketch2")))
+      .withColumn(
+        "intersection_count_2",
+        theta_sketch_estimate(theta_intersection("sketch1_20", "sketch2_20")))
+      .select("id", "intersection_count_1", "intersection_count_2")
+
+    // df1 has {a,b,c,d}, df2 has {a,c,d,e,f}, so intersection should be approximately {a,c,d} = 3.
+    checkAnswer(res3, Row(1, 3, 3))
+
+    // Test theta_intersection via SQL.
+    val res4 = sql("""with sketches1 as (
+      |select
+      | id,
+      | theta_sketch_agg(value) as sketch1,
+      | theta_sketch_agg(value, 20) as sketch1_20
+      |from df1
+      |group by 1
+      |),
+      |sketches2 as (
+      |select
+      | id,
+      | theta_sketch_agg(value) as sketch2,
+      | theta_sketch_agg(value, 20) as sketch2_20
+      |from df2
+      |group by 1
+      |)
+      |
+      |select
+      | s1.id,
+      | theta_sketch_estimate(theta_intersection(s1.sketch1, s2.sketch2)) as intersection_count_1,
+      | theta_sketch_estimate(theta_intersection(s1.sketch1_20, s2.sketch2_20))
+      | as intersection_count_2
+      |from sketches1 s1
+      |join sketches2 s2 on s1.id = s2.id
+      |""".stripMargin)
+    checkAnswer(res4, Row(1, 3, 3))
+
+    // Test theta_intersection_agg via DataFrame API.
+    val all_sketches = df1
+      .groupBy("id")
+      .agg(theta_sketch_agg("value").as("sketch"))
+      .withColumn("source", lit("df1"))
+      .union(
+        df2
+          .groupBy("id")
+          .agg(theta_sketch_agg("value").as("sketch"))
+          .withColumn("source", lit("df2")))
+      .union(
+        df3
+          .groupBy("id")
+          .agg(theta_sketch_agg("value").as("sketch"))
+          .withColumn("source", lit("df3")))
+
+    val res5 = all_sketches
+      .groupBy("id")
+      .agg(
+        theta_sketch_estimate(theta_intersection_agg("sketch")).as("intersection_count_1")
+      )
+
+    // df1={a,b,c,d}, df2={a,c,d,e,f}, df3={c,d,g,h}, so intersection should be {c,d} = 2.
+    checkAnswer(res5, Row(1, 2))
+
+    // Test theta_intersection_agg via SQL.
+    val res6 = sql("""with all_sketches as (
+      |select id, theta_sketch_agg(value) as sketch, 'df1' as source from df1 group by 1
+      |union all
+      |select id, theta_sketch_agg(value) as sketch, 'df2' as source from df2 group by 1
+      |union all
+      |select id, theta_sketch_agg(value) as sketch, 'df3' as source from df3 group by 1
+      |)
+      |
+      |select
+      | id,
+      | theta_sketch_estimate(theta_intersection_agg(sketch)) as intersection_count_1
+      |from all_sketches
+      |group by 1
+      |""".stripMargin)
+    checkAnswer(res6, Row(1, 2))
+
+    // Test with different lgNomEntries parameters.
+    val res7 = sql("""with sketches1 as (
+      |select id, theta_sketch_agg(value, 12) as sketch1 from df1 group by 1
+      |),
+      |sketches2 as (
+      |select id, theta_sketch_agg(value, 18) as sketch2 from df2 group by 1
+      |)
+      |
+      |select
+      | s1.id,
+      | theta_sketch_estimate(theta_difference(s1.sketch1, s2.sketch2)) as difference_count,
+      | theta_sketch_estimate(theta_intersection(s1.sketch1, s2.sketch2)) as intersection_count
+      |from sketches1 s1
+      |join sketches2 s2 on s1.id = s2.id
+      |""".stripMargin)
+    checkAnswer(res7, Row(1, 1, 3))
+
+    // Test with null values.
+    val df_with_nulls =
+      Seq((1, "a"), (1, "b"), (1, null), (2, null), (2, null)).toDF("id", "value")
+    df_with_nulls.createOrReplaceTempView("df_with_nulls")
+
+    val res8 = sql("""with sketch1 as (
+      |select id, theta_sketch_agg(value) as sketch from df_with_nulls where id = 1 group by 1
+      |),
+      |sketch2 as (
+      |select id, theta_sketch_agg(value) as sketch from df_with_nulls where id = 2 group by 1
+      |)
+      |
+      |select
+      | s1.id,
+      | theta_sketch_estimate(theta_difference(s1.sketch, s2.sketch)) as difference_count,
+      | theta_sketch_estimate(theta_intersection(s1.sketch, s2.sketch)) as intersection_count
+      |from sketch1 s1
+      |cross join sketch2 s2
+      |""".stripMargin)
+    // sketch1 has {a,b}, sketch2 is empty, so difference = 2 and intersection = 0.
+    checkAnswer(res8, Row(1, 2, 0))
+
+    // Test empty intersection.
+    val df_disjoint1 = Seq((1, "a"), (1, "b")).toDF("id", "value")
+    val df_disjoint2 = Seq((1, "c"), (1, "d")).toDF("id", "value")
+    df_disjoint1.createOrReplaceTempView("df_disjoint1")
+    df_disjoint2.createOrReplaceTempView("df_disjoint2")
+
+    val res9 = sql("""with sketch1 as (
+      |select id, theta_sketch_agg(value) as sketch from df_disjoint1 group by 1
+      |),
+      |sketch2 as (
+      |select id, theta_sketch_agg(value) as sketch from df_disjoint2 group by 1
+      |)
+      |
+      |select
+      | s1.id,
+      | theta_sketch_estimate(theta_intersection(s1.sketch, s2.sketch)) as intersection_count
+      |from sketch1 s1
+      |join sketch2 s2 on s1.id = s2.id
+      |""".stripMargin)
+    checkAnswer(res9, Row(1, 0))
+  }
+
+  test(
+    "SPARK-52407: theta_difference + theta_intersection + theta_intersection_agg negative tests") {
+    val df1 = Seq((1, "a"), (1, "b"), (1, "c"), (1, "d")).toDF("id", "value")
+    df1.createOrReplaceTempView("df1")
+
+    // Test invalid parameter types for theta_difference.
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("""with sketches as (
+          |select id, theta_sketch_agg(value) as sketch from df1 group by 1
+          |)
+          |select theta_difference(sketch, 'invalid') from sketches
+          |""".stripMargin).collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_difference(sketch, invalid)\"",
+        "paramIndex" -> "second",
+        "inputSql" -> "\"invalid\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"BINARY\""),
+      context =
+        ExpectedContext(fragment = "theta_difference(sketch, 'invalid')", start = 93, stop = 127))
+
+    // Test invalid parameter types for theta_intersection.
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("""with sketches as (
+          |select id, theta_sketch_agg(value) as sketch from df1 group by 1
+          |)
+          |select theta_intersection(sketch, 123) from sketches
+          |""".stripMargin).collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_intersection(sketch, 123)\"",
+        "paramIndex" -> "second",
+        "inputSql" -> "\"123\"",
+        "inputType" -> "\"INT\"",
+        "requiredType" -> "\"BINARY\""),
+      context =
+        ExpectedContext(fragment = "theta_intersection(sketch, 123)", start = 93, stop = 123))
+
+    // Test invalid parameter types for theta_intersection_agg.
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("""with sketches as (
+          |select id, theta_sketch_agg(value) as sketch from df1 group by 1
+          |)
+          |select theta_intersection_agg('invalid') from sketches
+          |""".stripMargin).collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_intersection_agg(invalid)\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"invalid\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"BINARY\""),
+      context = ExpectedContext(
+        fragment = "theta_intersection_agg('invalid')",
+        start = 93,
+        stop = 125))
+
+    // Test theta_difference with non-sketch input.
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("select theta_difference('not_a_sketch', 'also_not_a_sketch')").collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_difference(not_a_sketch, also_not_a_sketch)\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"not_a_sketch\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"BINARY\""),
+      context = ExpectedContext(
+        fragment = "theta_difference('not_a_sketch', 'also_not_a_sketch')",
+        start = 7,
+        stop = 59))
+
+    // Test theta_intersection with non-sketch input.
+    checkError(
+      exception = intercept[AnalysisException] {
+        sql("select theta_intersection('not_a_sketch', 'also_not_a_sketch')").collect()
+      },
+      condition = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+      parameters = Map(
+        "sqlExpr" -> "\"theta_intersection(not_a_sketch, also_not_a_sketch)\"",
+        "paramIndex" -> "first",
+        "inputSql" -> "\"not_a_sketch\"",
+        "inputType" -> "\"STRING\"",
+        "requiredType" -> "\"BINARY\""),
+      context = ExpectedContext(
+        fragment = "theta_intersection('not_a_sketch', 'also_not_a_sketch')",
+        start = 7,
+        stop = 61))
+  }
+
+  test("SPARK-52407: theta_union") {
+    val df1 = Seq(1, 1, 2, 3).toDF("col")
+    val df2 = Seq(1, 3, 4, 5).toDF("col")
+
+    val sketch1 = df1.selectExpr("theta_sketch_agg(col, 12) as sketch1")
+    val sketch2 = df2.selectExpr("theta_sketch_agg(col, 12) as sketch2")
+
+    checkAnswer(
+      sketch1
+        .crossJoin(sketch2)
+        .selectExpr("theta_sketch_estimate(theta_union(sketch1, sketch2))"),
+      Seq(Row(5)) // {1,2,3} ∪ {1,3,4,5} = {1,2,3,4,5}
+    )
+    checkAnswer(
+      sketch1
+        .crossJoin(sketch2)
+        .select(theta_sketch_estimate(
+          theta_union(col("sketch1"), col("sketch2")))),
+      Seq(Row(5)))
+  }
+
+  test("SPARK-52407: theta_difference") {
+    val df1 = Seq(1, 1, 2, 3).toDF("col")
+    val df2 = Seq(1, 4, 5).toDF("col")
+
+    val sketch1 = df1.selectExpr("theta_sketch_agg(col, 12) as sketch1")
+    val sketch2 = df2.selectExpr("theta_sketch_agg(col, 12) as sketch2")
+
+    checkAnswer(
+      sketch1
+        .crossJoin(sketch2)
+        .selectExpr("theta_sketch_estimate(theta_difference(sketch1, sketch2))"),
+      Seq(Row(2)) // {1,2,3} - {1,4,5} = {2,3}
+    )
+    checkAnswer(
+      sketch1
+        .crossJoin(sketch2)
+        .select(
+          theta_sketch_estimate(theta_difference(col("sketch1"), col("sketch2")))),
+      Seq(Row(2)))
+  }
+
+  test("SPARK-52407: theta_intersection") {
+    val df1 = Seq(1, 1, 2, 3).toDF("col")
+    val df2 = Seq(1, 3, 4, 5).toDF("col")
+
+    val sketch1 = df1.selectExpr("theta_sketch_agg(col, 12) as sketch1")
+    val sketch2 = df2.selectExpr("theta_sketch_agg(col, 12) as sketch2")
+
+    checkAnswer(
+      sketch1
+        .crossJoin(sketch2)
+        .selectExpr("theta_sketch_estimate(theta_intersection(sketch1, sketch2))"),
+      Seq(Row(2)) // {1,2,3} ∩ {1,3,4,5} = {1,3}
+    )
+    checkAnswer(
+      sketch1
+        .crossJoin(sketch2)
+        .select(theta_sketch_estimate(
+          theta_intersection(col("sketch1"), col("sketch2")))),
+      Seq(Row(2)))
+  }
+
+  test("SPARK-52407: theta_intersection_agg") {
+    val df = Seq(1, 2).toDF("col")
+
+    checkAnswer(
+      df.selectExpr("theta_sketch_agg(col) as sketch")
+        .unionAll(df.selectExpr("theta_sketch_agg(col, 20) as sketch"))
+        .unionAll(df.filter(col("col") === 1).selectExpr("theta_sketch_agg(col) as sketch"))
+        .selectExpr("theta_sketch_estimate(theta_intersection_agg(sketch))"),
+      Seq(Row(1)) // The intersection of {1,2}, {1,2}, {1} = {1}.
+    )
+    checkAnswer(
+      df.select(theta_sketch_agg(col("col")).as("sketch"))
+        .unionAll(df.select(theta_sketch_agg(col("col"), lit(20)).as("sketch")))
+        .unionAll(df.filter(col("col") === 1).select(theta_sketch_agg(col("col")).as("sketch")))
+        .select(theta_sketch_estimate(theta_intersection_agg(col("sketch")))),
+      Seq(Row(1)))
+  }
+
+  test("SPARK-52407: theta_sketch_agg") {
+    val df = Seq(1, 1, 2, 2, 3).toDF("col")
+    checkAnswer(df.selectExpr("theta_sketch_estimate(theta_sketch_agg(col, 12))"), Seq(Row(3)))
+    checkAnswer(
+      df.select(theta_sketch_estimate(theta_sketch_agg(col("col"), lit(12)))),
+      Seq(Row(3)))
+  }
+
+  test("SPARK-52407: theta_union_agg") {
+    val df = Seq(1).toDF("col")
+    checkAnswer(
+      df.selectExpr("theta_sketch_agg(col) as sketch")
+        .unionAll(df.selectExpr("theta_sketch_agg(col, 20) as sketch"))
+        .selectExpr("theta_sketch_estimate(theta_union_agg(sketch, 15))"),
+      Seq(Row(1)))
+    checkAnswer(
+      df.select(theta_sketch_agg(col("col")).as("sketch"))
+        .unionAll(df.select(theta_sketch_agg(col("col"), lit(20)).as("sketch")))
+        .select(theta_sketch_estimate(theta_union_agg(col("sketch"), lit(15)))),
+      Seq(Row(1)))
+  }
+
   private def assertAggregateOnDataframe(
       df: => DataFrame,
       expected: Int): Unit = {
     val configurations = Seq(
-      Seq.empty[(String, String)], // hash aggregate is used by default
+      Seq(SQLConf.USE_HASH_AGG.key -> "true"),
       Seq(SQLConf.CODEGEN_FACTORY_MODE.key -> "NO_CODEGEN",
         "spark.sql.TungstenAggregate.testFallbackStartsAt" -> "1, 10"),
       Seq("spark.sql.test.forceApplyObjectHashAggregate" -> "true"),
       Seq(
         "spark.sql.test.forceApplyObjectHashAggregate" -> "true",
         SQLConf.OBJECT_AGG_SORT_BASED_FALLBACK_THRESHOLD.key -> "1"),
-      Seq("spark.sql.test.forceApplySortAggregate" -> "true")
+      Seq(SQLConf.USE_HASH_AGG.key -> "false"),
+      Seq(
+        SQLConf.USE_HASH_AGG.key -> "false",
+        SQLConf.USE_OBJECT_HASH_AGG.key -> "false")
     )
 
     // Make tests faster
@@ -2600,6 +4036,1308 @@ class DataFrameAggregateSuite extends QueryTest
       .groupBy().agg(lit(1).as("col1"), lit(2).as("col2"), lit(3).as("col3"))
       .groupBy($"col1").agg(max("col1"))
     checkAnswer(df, Seq(Row(1, 1)))
+  }
+
+  test("kll_sketch_agg_bigint basic functionality") {
+    val df = Seq(1, 2, 3, 4, 5).toDF("value")
+
+    // Test with default k
+    val sketch1 = df.agg(kll_sketch_agg_bigint($"value")).collect()(0)(0)
+    assert(sketch1 != null)
+    assert(sketch1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with explicit k
+    val sketch2 = df.agg(kll_sketch_agg_bigint($"value", 400)).collect()(0)(0)
+    assert(sketch2 != null)
+    assert(sketch2.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with column name
+    val sketch3 = df.agg(kll_sketch_agg_bigint("value")).collect()(0)(0)
+    assert(sketch3 != null)
+  }
+
+  test("kll_sketch_agg_float basic functionality") {
+    val df = Seq(1.0f, 2.0f, 3.0f, 4.0f, 5.0f).toDF("value")
+
+    val sketch = df.agg(kll_sketch_agg_float($"value")).collect()(0)(0)
+    assert(sketch != null)
+    assert(sketch.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with k parameter
+    val sketch2 = df.agg(kll_sketch_agg_float($"value", 300)).collect()(0)(0)
+    assert(sketch2 != null)
+  }
+
+  test("kll_sketch_agg_double basic functionality") {
+    val df = Seq(1.0, 2.0, 3.0, 4.0, 5.0).toDF("value")
+
+    val sketch = df.agg(kll_sketch_agg_double($"value")).collect()(0)(0)
+    assert(sketch != null)
+    assert(sketch.asInstanceOf[Array[Byte]].length > 0)
+  }
+
+  test("kll_sketch_to_string functions") {
+    val df = Seq(1, 2, 3, 4, 5).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    val result = sketchDf.select(kll_sketch_to_string_bigint($"sketch")).collect()(0)(0)
+    assert(result != null)
+    assert(result.asInstanceOf[String].length > 0)
+    assert(result.asInstanceOf[String].toLowerCase(Locale.ROOT).contains("kll"))
+  }
+
+  test("kll_sketch_get_n functions") {
+    val df = Seq(1, 2, 3, 4, 5).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    val n = sketchDf.select(kll_sketch_get_n_bigint($"sketch")).collect()(0)(0)
+    assert(n == 5L)
+  }
+
+  test("kll_sketch_merge_bigint") {
+    val df = Seq(1, 2, 3).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    val merged = sketchDf.select(
+      kll_sketch_merge_bigint($"sketch", $"sketch").alias("merged")
+    ).collect()(0)(0)
+    assert(merged != null)
+    assert(merged.asInstanceOf[Array[Byte]].length > 0)
+  }
+
+  test("kll_sketch_get_quantile_bigint") {
+    val df = Seq(1, 2, 3, 4, 5).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    val quantile = sketchDf.select(
+      kll_sketch_get_quantile_bigint($"sketch", lit(0.5))
+    ).collect()(0)(0)
+    assert(quantile.asInstanceOf[Long] >= 1 && quantile.asInstanceOf[Long] <= 5)
+
+    // Test with array of ranks
+    val quantiles = sketchDf.select(
+      kll_sketch_get_quantile_bigint($"sketch", array(lit(0.25), lit(0.5), lit(0.75)))
+    ).collect()(0)(0)
+    assert(quantiles != null)
+  }
+
+  test("kll_sketch_get_rank_bigint") {
+    val df = Seq(1, 2, 3, 4, 5).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    val rank = sketchDf.select(
+      kll_sketch_get_rank_bigint($"sketch", lit(3))
+    ).collect()(0)(0)
+    assert(rank.asInstanceOf[Double] >= 0.0 && rank.asInstanceOf[Double] <= 1.0)
+  }
+
+  test("kll_sketch float variants") {
+    val df = Seq(1.0f, 2.0f, 3.0f, 4.0f, 5.0f).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_float($"value").alias("sketch"))
+
+    // Test to_string
+    val str = sketchDf.select(kll_sketch_to_string_float($"sketch")).collect()(0)(0)
+    assert(str.asInstanceOf[String].toLowerCase(Locale.ROOT).contains("kll"))
+
+    // Test get_n
+    val n = sketchDf.select(kll_sketch_get_n_float($"sketch")).collect()(0)(0)
+    assert(n == 5L)
+
+    // Test merge
+    val merged = sketchDf.select(
+      kll_sketch_merge_float($"sketch", $"sketch")
+    ).collect()(0)(0)
+    assert(merged != null)
+
+    // Test get_quantile
+    val quantile = sketchDf.select(
+      kll_sketch_get_quantile_float($"sketch", lit(0.5))
+    ).collect()(0)(0)
+    assert(quantile != null)
+
+    // Test get_rank
+    val rank = sketchDf.select(
+      kll_sketch_get_rank_float($"sketch", lit(3.0f))
+    ).collect()(0)(0)
+    assert(rank.asInstanceOf[Double] >= 0.0 && rank.asInstanceOf[Double] <= 1.0)
+  }
+
+  test("kll_sketch double variants") {
+    val df = Seq(1.0, 2.0, 3.0, 4.0, 5.0).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_double($"value").alias("sketch"))
+
+    // Test to_string
+    val str = sketchDf.select(kll_sketch_to_string_double($"sketch")).collect()(0)(0)
+    assert(str.asInstanceOf[String].toLowerCase(Locale.ROOT).contains("kll"))
+
+    // Test get_n
+    val n = sketchDf.select(kll_sketch_get_n_double($"sketch")).collect()(0)(0)
+    assert(n == 5L)
+
+    // Test merge
+    val merged = sketchDf.select(
+      kll_sketch_merge_double($"sketch", $"sketch")
+    ).collect()(0)(0)
+    assert(merged != null)
+
+    // Test get_quantile
+    val quantile = sketchDf.select(
+      kll_sketch_get_quantile_double($"sketch", lit(0.5))
+    ).collect()(0)(0)
+    assert(quantile != null)
+
+    // Test get_rank
+    val rank = sketchDf.select(
+      kll_sketch_get_rank_double($"sketch", lit(3.0))
+    ).collect()(0)(0)
+    assert(rank.asInstanceOf[Double] >= 0.0 && rank.asInstanceOf[Double] <= 1.0)
+  }
+
+  test("kll_sketch with null values") {
+    val df = Seq(Some(1), None, Some(3), Some(4), None).toDF("value")
+    val sketchDf = df.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    val n = sketchDf.select(kll_sketch_get_n_bigint($"sketch")).collect()(0)(0)
+    // Should only count non-null values
+    assert(n == 3L)
+  }
+
+  test("kll_merge_agg_bigint basic functionality") {
+    // Create two separate sketches
+    val df1 = Seq(1, 2, 3).toDF("value")
+    val df2 = Seq(4, 5, 6).toDF("value")
+
+    val sketch1 = df1.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+    val sketch2 = df2.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    // Union the sketches and merge them
+    val merged = sketch1.union(sketch2)
+      .agg(kll_merge_agg_bigint($"sketch").alias("merged_sketch"))
+
+    // Verify the merged sketch contains all values
+    val n = merged.select(kll_sketch_get_n_bigint($"merged_sketch")).collect()(0)(0)
+    assert(n == 6L)
+
+    // Test with explicit k parameter
+    val mergedWithK = sketch1.union(sketch2)
+      .agg(kll_merge_agg_bigint($"sketch", 400).alias("merged_sketch"))
+    assert(mergedWithK.collect()(0)(0) != null)
+
+    // Test with column name
+    val mergedWithName = sketch1.union(sketch2)
+      .agg(kll_merge_agg_bigint("sketch").alias("merged_sketch"))
+    val n2 = mergedWithName.select(kll_sketch_get_n_bigint($"merged_sketch")).collect()(0)(0)
+    assert(n2 == 6L)
+  }
+
+  test("kll_merge_agg_float basic functionality") {
+    // Create two separate sketches
+    val df1 = Seq(1.0f, 2.0f, 3.0f).toDF("value")
+    val df2 = Seq(4.0f, 5.0f, 6.0f).toDF("value")
+
+    val sketch1 = df1.agg(kll_sketch_agg_float($"value").alias("sketch"))
+    val sketch2 = df2.agg(kll_sketch_agg_float($"value").alias("sketch"))
+
+    // Union the sketches and merge them
+    val merged = sketch1.union(sketch2)
+      .agg(kll_merge_agg_float($"sketch").alias("merged_sketch"))
+
+    // Verify the merged sketch contains all values
+    val n = merged.select(kll_sketch_get_n_float($"merged_sketch")).collect()(0)(0)
+    assert(n == 6L)
+
+    // Test with explicit k parameter
+    val mergedWithK = sketch1.union(sketch2)
+      .agg(kll_merge_agg_float($"sketch", 300).alias("merged_sketch"))
+    assert(mergedWithK.collect()(0)(0) != null)
+  }
+
+  test("kll_merge_agg_double basic functionality") {
+    // Create two separate sketches
+    val df1 = Seq(1.0, 2.0, 3.0).toDF("value")
+    val df2 = Seq(4.0, 5.0, 6.0).toDF("value")
+
+    val sketch1 = df1.agg(kll_sketch_agg_double($"value").alias("sketch"))
+    val sketch2 = df2.agg(kll_sketch_agg_double($"value").alias("sketch"))
+
+    // Union the sketches and merge them
+    val merged = sketch1.union(sketch2)
+      .agg(kll_merge_agg_double($"sketch").alias("merged_sketch"))
+
+    // Verify the merged sketch contains all values
+    val n = merged.select(kll_sketch_get_n_double($"merged_sketch")).collect()(0)(0)
+    assert(n == 6L)
+
+    // Test quantile on merged sketch
+    val quantile = merged.select(
+      kll_sketch_get_quantile_double($"merged_sketch", lit(0.5))
+    ).collect()(0)(0)
+    assert(quantile != null)
+  }
+
+  test("kll_merge_agg with different k values") {
+    // Create sketches with different k values
+    val df1 = Seq(1, 2, 3).toDF("value")
+    val df2 = Seq(4, 5, 6).toDF("value")
+
+    val sketch1 = df1.agg(kll_sketch_agg_bigint($"value", 200).alias("sketch"))
+    val sketch2 = df2.agg(kll_sketch_agg_bigint($"value", 400).alias("sketch"))
+
+    // Merge sketches with different k values (should adopt from first sketch)
+    val merged = sketch1.union(sketch2)
+      .agg(kll_merge_agg_bigint($"sketch").alias("merged_sketch"))
+
+    val n = merged.select(kll_sketch_get_n_bigint($"merged_sketch")).collect()(0)(0)
+    assert(n == 6L)
+  }
+
+  test("kll_merge_agg with null values") {
+    val df1 = Seq(1, 2, 3).toDF("value")
+    val dfNull = Seq(Some(4), None, Some(6)).toDF("value")
+
+    val sketch1 = df1.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+    val sketchNull = dfNull.agg(kll_sketch_agg_bigint($"value").alias("sketch"))
+
+    // Merge sketch with null - null should be ignored
+    val merged = sketch1.union(sketchNull)
+      .agg(kll_merge_agg_bigint($"sketch").alias("merged_sketch"))
+
+    val n = merged.select(kll_sketch_get_n_bigint($"merged_sketch")).collect()(0)(0)
+    assert(n == 5L)
+  }
+
+  test("SPARK-54179: tuple_sketch_agg_double basic functionality") {
+    val df = Seq((1, 1.5), (2, 2.5), (3, 3.5), (1, 0.5), (2, 1.0)).toDF("key", "summary")
+
+    // Test with default parameters
+    val sketch1 = df.agg(tuple_sketch_agg_double($"key", $"summary")).collect()(0)(0)
+    assert(sketch1 != null)
+    assert(sketch1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with explicit lgNomEntries
+    val sketch2 = df.agg(tuple_sketch_agg_double($"key", $"summary", 10)).collect()(0)(0)
+    assert(sketch2 != null)
+    assert(sketch2.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with lgNomEntries and mode
+    val sketch3 = df.agg(tuple_sketch_agg_double($"key", $"summary", 10, "sum")).collect()(0)(0)
+    assert(sketch3 != null)
+
+    // Test with column names
+    val sketch4 = df.agg(tuple_sketch_agg_double("key", "summary")).collect()(0)(0)
+    assert(sketch4 != null)
+  }
+
+  test("SPARK-54179: tuple_sketch_agg_integer basic functionality") {
+    val df = Seq((1, 10), (2, 20), (3, 30), (1, 5), (2, 15)).toDF("key", "summary")
+
+    // Test with default parameters
+    val sketch1 = df.agg(tuple_sketch_agg_integer($"key", $"summary")).collect()(0)(0)
+    assert(sketch1 != null)
+    assert(sketch1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with explicit lgNomEntries
+    val sketch2 = df.agg(tuple_sketch_agg_integer($"key", $"summary", 10)).collect()(0)(0)
+    assert(sketch2 != null)
+
+    // Test with lgNomEntries and mode
+    val sketch3 = df.agg(tuple_sketch_agg_integer($"key", $"summary", 10, "max")).collect()(0)(0)
+    assert(sketch3 != null)
+
+    // Test with column names
+    val sketch4 = df.agg(tuple_sketch_agg_integer("key", "summary", 10, "min")).collect()(0)(0)
+    assert(sketch4 != null)
+  }
+
+  test("SPARK-54179: tuple_sketch_estimate and summary functions - double") {
+    val df = Seq((1, 1.5), (2, 2.5), (3, 3.5), (1, 0.5), (2, 1.0)).toDF("key", "summary")
+    val sketchDf = df.agg(tuple_sketch_agg_double($"key", $"summary").alias("sketch"))
+
+    // Test estimate
+    val estimate = sketchDf.select(tuple_sketch_estimate_double($"sketch")).collect()(0)(0)
+    assert(estimate == 3.0)
+
+    // Test summary with default mode (sum)
+    val summary1 = sketchDf.select(tuple_sketch_summary_double($"sketch")).collect()(0)(0)
+    assert(summary1 == 9.0)
+
+    // Test summary with explicit mode
+    val summary2 = sketchDf.select(tuple_sketch_summary_double($"sketch", "min")).collect()(0)(0)
+    assert(summary2 == 2.0)
+
+    // Test theta
+    val theta = sketchDf.select(tuple_sketch_theta_double($"sketch")).collect()(0)(0)
+    assert(theta != null)
+    assert(theta.asInstanceOf[Double] > 0.0 && theta.asInstanceOf[Double] <= 1.0)
+
+    // Test with column names
+    val estimate2 = sketchDf.select(tuple_sketch_estimate_double("sketch")).collect()(0)(0)
+    assert(estimate2 != null)
+  }
+
+  test("SPARK-54179: tuple_sketch_estimate and summary functions - integer") {
+    val df = Seq((1, 10), (2, 20), (3, 30), (1, 5), (2, 15)).toDF("key", "summary")
+    val sketchDf = df.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+
+    // Test estimate
+    val estimate = sketchDf.select(tuple_sketch_estimate_integer($"sketch")).collect()(0)(0)
+    assert(estimate == 3.0)
+
+    // Test summary with default mode (sum)
+    val summary1 = sketchDf.select(tuple_sketch_summary_integer($"sketch")).collect()(0)(0)
+    assert(summary1 == 80)
+
+    // Test summary with explicit mode
+    val summary2 = sketchDf.select(tuple_sketch_summary_integer($"sketch", "max")).collect()(0)(0)
+    assert(summary2 == 35)
+
+    // Test theta
+    val theta = sketchDf.select(tuple_sketch_theta_integer($"sketch")).collect()(0)(0)
+    assert(theta != null)
+    assert(theta.asInstanceOf[Double] > 0.0 && theta.asInstanceOf[Double] <= 1.0)
+
+    // Test with column names
+    val summary3 = sketchDf.select(tuple_sketch_summary_integer("sketch", "min")).collect()(0)(0)
+    assert(summary3 == 15)
+  }
+
+  test("SPARK-54179: tuple_union_double basic functionality") {
+    val df1 = Seq((1, 1.5), (2, 2.5)).toDF("key", "summary")
+    val df2 = Seq((3, 3.5), (4, 4.5)).toDF("key", "summary")
+
+    val sketch1Df = df1.agg(tuple_sketch_agg_double($"key", $"summary").alias("sketch"))
+    val sketch2Df = df2.agg(tuple_sketch_agg_double($"key", $"summary").alias("sketch"))
+
+    val joined = sketch1Df.crossJoin(sketch2Df.withColumnRenamed("sketch", "sketch2"))
+
+    // Test union with default parameters
+    val union1 = joined.select(tuple_union_double($"sketch", $"sketch2")).collect()(0)(0)
+    assert(union1 != null)
+    assert(union1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test union with lgNomEntries
+    val union2 = joined.select(tuple_union_double($"sketch", $"sketch2", 10)).collect()(0)(0)
+    assert(union2 != null)
+
+    // Test union with lgNomEntries and mode
+    val union3 =
+      joined.select(tuple_union_double($"sketch", $"sketch2", 10, "sum")).collect()(0)(0)
+    assert(union3 != null)
+
+    // Test with column names
+    val union4 = joined.select(tuple_union_double("sketch", "sketch2")).collect()(0)(0)
+    assert(union4 != null)
+
+    // Verify estimate from union
+    val estimate = joined
+      .select(tuple_sketch_estimate_double(tuple_union_double($"sketch", $"sketch2")))
+      .collect()(0)(0)
+    assert(estimate == 4.0)
+  }
+
+  test("SPARK-54179: tuple_union_integer basic functionality") {
+    val df1 = Seq((1, 10), (2, 20)).toDF("key", "summary")
+    val df2 = Seq((3, 30), (4, 40)).toDF("key", "summary")
+
+    val sketch1Df = df1.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+    val sketch2Df = df2.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+
+    val joined = sketch1Df.crossJoin(sketch2Df.withColumnRenamed("sketch", "sketch2"))
+
+    // Test union with default parameters
+    val union1 = joined.select(tuple_union_integer($"sketch", $"sketch2")).collect()(0)(0)
+    assert(union1 != null)
+
+    // Test union with lgNomEntries and mode
+    val union2 = joined
+      .select(tuple_union_integer($"sketch", $"sketch2", 10, "max"))
+      .collect()(0)(0)
+    assert(union2 != null)
+
+    // Test with column names
+    val union3 = joined.select(tuple_union_integer("sketch", "sketch2", 10)).collect()(0)(0)
+    assert(union3 != null)
+
+    // Verify estimate from union
+    val estimate = joined
+      .select(tuple_sketch_estimate_integer(tuple_union_integer($"sketch", $"sketch2")))
+      .collect()(0)(0)
+    assert(estimate == 4.0)
+  }
+
+  test("SPARK-54179: tuple_intersection_double basic functionality") {
+    val df1 = Seq((1, 1.5), (2, 2.5), (3, 3.5)).toDF("key", "summary")
+    val df2 = Seq((2, 1.0), (3, 2.0), (4, 3.0)).toDF("key", "summary")
+
+    val sketch1Df = df1.agg(tuple_sketch_agg_double($"key", $"summary").alias("sketch"))
+    val sketch2Df = df2.agg(tuple_sketch_agg_double($"key", $"summary").alias("sketch"))
+
+    val joined = sketch1Df.crossJoin(sketch2Df.withColumnRenamed("sketch", "sketch2"))
+
+    // Test intersection with default mode
+    val intersection1 = joined
+      .select(tuple_intersection_double($"sketch", $"sketch2"))
+      .collect()(0)(0)
+    assert(intersection1 != null)
+    assert(intersection1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test intersection with mode
+    val intersection2 = joined
+      .select(tuple_intersection_double($"sketch", $"sketch2", "sum"))
+      .collect()(0)(0)
+    assert(intersection2 != null)
+
+    // Test with column names
+    val intersection3 = joined
+      .select(tuple_intersection_double("sketch", "sketch2", "min"))
+      .collect()(0)(0)
+    assert(intersection3 != null)
+
+    // Verify estimate from intersection (keys 2 and 3 are common)
+    val estimate = joined
+      .select(tuple_sketch_estimate_double(tuple_intersection_double($"sketch", $"sketch2")))
+      .collect()(0)(0)
+    assert(estimate == 2.0)
+  }
+
+  test("SPARK-54179: tuple_intersection_integer basic functionality") {
+    val df1 = Seq((1, 10), (2, 20), (3, 30)).toDF("key", "summary")
+    val df2 = Seq((2, 15), (3, 25), (4, 35)).toDF("key", "summary")
+
+    val sketch1Df = df1.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+    val sketch2Df = df2.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+
+    val joined = sketch1Df.crossJoin(sketch2Df.withColumnRenamed("sketch", "sketch2"))
+
+    // Test intersection with default mode
+    val intersection1 = joined
+      .select(tuple_intersection_integer($"sketch", $"sketch2"))
+      .collect()(0)(0)
+    assert(intersection1 != null)
+
+    // Test intersection with mode
+    val intersection2 = joined
+      .select(tuple_intersection_integer($"sketch", $"sketch2", "max"))
+      .collect()(0)(0)
+    assert(intersection2 != null)
+
+    // Test with column names
+    val intersection3 = joined
+      .select(tuple_intersection_integer("sketch", "sketch2"))
+      .collect()(0)(0)
+    assert(intersection3 != null)
+
+    // Verify estimate from intersection (keys 2 and 3 are common)
+    val estimate = joined
+      .select(tuple_sketch_estimate_integer(tuple_intersection_integer($"sketch", $"sketch2")))
+      .collect()(0)(0)
+    assert(estimate == 2.0)
+  }
+
+  test("SPARK-54179: tuple_difference_double basic functionality") {
+    val df1 = Seq((1, 1.5), (2, 2.5), (3, 3.5)).toDF("key", "summary")
+    val df2 = Seq((2, 1.0), (3, 2.0)).toDF("key", "summary")
+
+    val sketch1Df = df1.agg(tuple_sketch_agg_double($"key", $"summary").alias("sketch"))
+    val sketch2Df = df2.agg(tuple_sketch_agg_double($"key", $"summary").alias("sketch"))
+
+    val joined = sketch1Df.crossJoin(sketch2Df.withColumnRenamed("sketch", "sketch2"))
+
+    // Test difference
+    val difference = joined
+      .select(tuple_difference_double($"sketch", $"sketch2"))
+      .collect()(0)(0)
+    assert(difference != null)
+    assert(difference.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with column names
+    val difference2 = joined
+      .select(tuple_difference_double("sketch", "sketch2"))
+      .collect()(0)(0)
+    assert(difference2 != null)
+
+    // Verify estimate from difference (only key 1 is unique to df1)
+    val estimate = joined
+      .select(tuple_sketch_estimate_double(tuple_difference_double($"sketch", $"sketch2")))
+      .collect()(0)(0)
+    assert(estimate == 1.0)
+  }
+
+  test("SPARK-54179: tuple_difference_integer basic functionality") {
+    val df1 = Seq((1, 10), (2, 20), (3, 30)).toDF("key", "summary")
+    val df2 = Seq((2, 15), (3, 25)).toDF("key", "summary")
+
+    val sketch1Df = df1.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+    val sketch2Df = df2.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+
+    val joined = sketch1Df.crossJoin(sketch2Df.withColumnRenamed("sketch", "sketch2"))
+
+    // Test difference
+    val difference = joined
+      .select(tuple_difference_integer($"sketch", $"sketch2"))
+      .collect()(0)(0)
+    assert(difference != null)
+
+    // Test with column names
+    val difference2 = joined
+      .select(tuple_difference_integer("sketch", "sketch2"))
+      .collect()(0)(0)
+    assert(difference2 != null)
+
+    // Verify estimate from difference (only key 1 is unique to df1)
+    val estimate = joined
+      .select(tuple_sketch_estimate_integer(tuple_difference_integer($"sketch", $"sketch2")))
+      .collect()(0)(0)
+    assert(estimate == 1.0)
+  }
+
+  test("SPARK-55558: tuple_difference_theta_double basic functionality") {
+    val df1 = Seq((1, 1.5), (2, 2.5), (3, 3.5), (5, 5.5)).toDF("key", "summary")
+    val df2 = Seq(1, 2, 4).toDF("value")
+
+    val tupleSketchDf = df1.agg(tuple_sketch_agg_double($"key", $"summary").alias("tuple_sketch"))
+    val thetaSketchDf = df2.agg(theta_sketch_agg($"value").alias("theta_sketch"))
+
+    val joined = tupleSketchDf.crossJoin(thetaSketchDf)
+
+    // Test difference (keys in tuple_sketch but not in theta_sketch: 3 and 5)
+    val difference = joined
+      .select(tuple_difference_theta_double($"tuple_sketch", $"theta_sketch"))
+      .collect()(0)(0)
+    assert(difference != null)
+    assert(difference.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test with column names
+    val difference2 = joined
+      .select(tuple_difference_theta_double("tuple_sketch", "theta_sketch"))
+      .collect()(0)(0)
+    assert(difference2 != null)
+
+    // Verify estimate from difference (keys 3 and 5 remain)
+    val estimate = joined
+      .select(tuple_sketch_estimate_double(
+        tuple_difference_theta_double($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(estimate == 2.0)
+
+    // Verify summary value from difference (3.5 + 5.5 = 9.0)
+    val summary = joined
+      .select(tuple_sketch_summary_double(
+        tuple_difference_theta_double($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(summary == 9.0)
+  }
+
+  test("SPARK-55558: tuple_difference_theta_integer basic functionality") {
+    val df1 = Seq((1, 10), (2, 20), (3, 30), (5, 50)).toDF("key", "summary")
+    val df2 = Seq(1, 2, 4).toDF("value")
+
+    val tupleSketchDf = df1.agg(tuple_sketch_agg_integer($"key", $"summary").alias("tuple_sketch"))
+    val thetaSketchDf = df2.agg(theta_sketch_agg($"value").alias("theta_sketch"))
+
+    val joined = tupleSketchDf.crossJoin(thetaSketchDf)
+
+    // Test difference (keys in tuple_sketch but not in theta_sketch: 3 and 5)
+    val difference = joined
+      .select(tuple_difference_theta_integer($"tuple_sketch", $"theta_sketch"))
+      .collect()(0)(0)
+    assert(difference != null)
+
+    // Test with column names
+    val difference2 = joined
+      .select(tuple_difference_theta_integer("tuple_sketch", "theta_sketch"))
+      .collect()(0)(0)
+    assert(difference2 != null)
+
+    // Verify estimate from difference (keys 3 and 5 remain)
+    val estimate = joined
+      .select(tuple_sketch_estimate_integer(
+        tuple_difference_theta_integer($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(estimate == 2.0)
+
+    // Verify summary value from difference (30 + 50 = 80)
+    val summary = joined
+      .select(tuple_sketch_summary_integer(
+        tuple_difference_theta_integer($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(summary == 80)
+  }
+
+  test("SPARK-55558: tuple_intersection_theta_double basic functionality") {
+    val df1 = Seq((1, 1.5), (2, 2.5), (3, 3.5)).toDF("key", "summary")
+    val df2 = Seq(2, 3, 4).toDF("value")
+
+    val tupleSketchDf = df1.agg(tuple_sketch_agg_double($"key", $"summary").alias("tuple_sketch"))
+    val thetaSketchDf = df2.agg(theta_sketch_agg($"value").alias("theta_sketch"))
+
+    val joined = tupleSketchDf.crossJoin(thetaSketchDf)
+
+    // Test intersection with default mode
+    val intersection1 = joined
+      .select(tuple_intersection_theta_double($"tuple_sketch", $"theta_sketch"))
+      .collect()(0)(0)
+    assert(intersection1 != null)
+    assert(intersection1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test intersection with mode
+    val intersection2 = joined
+      .select(tuple_intersection_theta_double($"tuple_sketch", $"theta_sketch", "sum"))
+      .collect()(0)(0)
+    assert(intersection2 != null)
+
+    // Test with column names and min mode
+    val intersection3 = joined
+      .select(tuple_intersection_theta_double("tuple_sketch", "theta_sketch", "min"))
+      .collect()(0)(0)
+    assert(intersection3 != null)
+
+    // Verify estimate from intersection (keys 2 and 3 are common)
+    val estimate = joined
+      .select(tuple_sketch_estimate_double(
+        tuple_intersection_theta_double($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(estimate == 2.0)
+
+    // Verify summary value from intersection (2.5 + 3.5 = 6.0)
+    val summary = joined
+      .select(tuple_sketch_summary_double(
+        tuple_intersection_theta_double($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(summary == 6.0)
+  }
+
+  test("SPARK-55558: tuple_intersection_theta_integer basic functionality") {
+    val df1 = Seq((1, 10), (2, 20), (3, 30)).toDF("key", "summary")
+    val df2 = Seq(2, 3, 4).toDF("value")
+
+    val tupleSketchDf = df1.agg(tuple_sketch_agg_integer($"key", $"summary").alias("tuple_sketch"))
+    val thetaSketchDf = df2.agg(theta_sketch_agg($"value").alias("theta_sketch"))
+
+    val joined = tupleSketchDf.crossJoin(thetaSketchDf)
+
+    // Test intersection with default mode
+    val intersection1 = joined
+      .select(tuple_intersection_theta_integer($"tuple_sketch", $"theta_sketch"))
+      .collect()(0)(0)
+    assert(intersection1 != null)
+
+    // Test intersection with mode
+    val intersection2 = joined
+      .select(tuple_intersection_theta_integer($"tuple_sketch", $"theta_sketch", "max"))
+      .collect()(0)(0)
+    assert(intersection2 != null)
+
+    // Test with column names
+    val intersection3 = joined
+      .select(tuple_intersection_theta_integer("tuple_sketch", "theta_sketch"))
+      .collect()(0)(0)
+    assert(intersection3 != null)
+
+    // Verify estimate from intersection (keys 2 and 3 are common)
+    val estimate = joined
+      .select(tuple_sketch_estimate_integer(
+        tuple_intersection_theta_integer($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(estimate == 2.0)
+
+    // Verify summary value from intersection (20 + 30 = 50)
+    val summary = joined
+      .select(tuple_sketch_summary_integer(
+        tuple_intersection_theta_integer($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(summary == 50)
+  }
+
+  test("SPARK-55558: tuple_union_theta_double basic functionality") {
+    val df1 = Seq((1, 1.5), (2, 2.5)).toDF("key", "summary")
+    val df2 = Seq(3, 4).toDF("value")
+
+    val tupleSketchDf = df1.agg(tuple_sketch_agg_double($"key", $"summary").alias("tuple_sketch"))
+    val thetaSketchDf = df2.agg(theta_sketch_agg($"value").alias("theta_sketch"))
+
+    val joined = tupleSketchDf.crossJoin(thetaSketchDf)
+
+    // Test union with default parameters
+    val union1 = joined
+      .select(tuple_union_theta_double($"tuple_sketch", $"theta_sketch"))
+      .collect()(0)(0)
+    assert(union1 != null)
+    assert(union1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test union with lgNomEntries
+    val union2 = joined
+      .select(tuple_union_theta_double($"tuple_sketch", $"theta_sketch", 10))
+      .collect()(0)(0)
+    assert(union2 != null)
+
+    // Test union with lgNomEntries and mode
+    val union3 = joined
+      .select(tuple_union_theta_double($"tuple_sketch", $"theta_sketch", 10, "sum"))
+      .collect()(0)(0)
+    assert(union3 != null)
+
+    // Test with column names
+    val union4 = joined
+      .select(tuple_union_theta_double("tuple_sketch", "theta_sketch"))
+      .collect()(0)(0)
+    assert(union4 != null)
+
+    // Verify estimate from union (all 4 keys: 1, 2, 3, 4)
+    val estimate = joined
+      .select(tuple_sketch_estimate_double(
+        tuple_union_theta_double($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(estimate == 4.0)
+
+    // Verify summary value from union (1.5 + 2.5 + 0.0 + 0.0 = 4.0)
+    // Theta sketch entries (3, 4) get default value 0.0 for sum mode
+    val summary = joined
+      .select(tuple_sketch_summary_double(
+        tuple_union_theta_double($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(summary == 4.0)
+  }
+
+  test("SPARK-55558: tuple_union_theta_integer basic functionality") {
+    val df1 = Seq((1, 10), (2, 20)).toDF("key", "summary")
+    val df2 = Seq(3, 4).toDF("value")
+
+    val tupleSketchDf = df1.agg(tuple_sketch_agg_integer($"key", $"summary").alias("tuple_sketch"))
+    val thetaSketchDf = df2.agg(theta_sketch_agg($"value").alias("theta_sketch"))
+
+    val joined = tupleSketchDf.crossJoin(thetaSketchDf)
+
+    // Test union with default parameters
+    val union1 = joined
+      .select(tuple_union_theta_integer($"tuple_sketch", $"theta_sketch"))
+      .collect()(0)(0)
+    assert(union1 != null)
+
+    // Test union with lgNomEntries and mode
+    val union2 = joined
+      .select(tuple_union_theta_integer($"tuple_sketch", $"theta_sketch", 10, "max"))
+      .collect()(0)(0)
+    assert(union2 != null)
+
+    // Test with column names and lgNomEntries
+    val union3 = joined
+      .select(tuple_union_theta_integer("tuple_sketch", "theta_sketch", 10))
+      .collect()(0)(0)
+    assert(union3 != null)
+
+    // Verify estimate from union (all 4 keys: 1, 2, 3, 4)
+    val estimate = joined
+      .select(tuple_sketch_estimate_integer(
+        tuple_union_theta_integer($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(estimate == 4.0)
+
+    // Verify summary value from union (10 + 20 + 0 + 0 = 30)
+    // Theta sketch entries (3, 4) get default value 0 for sum mode
+    val summary = joined
+      .select(tuple_sketch_summary_integer(
+        tuple_union_theta_integer($"tuple_sketch", $"theta_sketch")))
+      .collect()(0)(0)
+    assert(summary == 30)
+  }
+
+  test("SPARK-54179: tuple_union_agg_double basic functionality") {
+    val df1 = Seq((1, 1, 1.5), (1, 2, 2.5)).toDF("id", "key", "summary")
+    val df2 = Seq((1, 3, 3.5), (1, 4, 4.5)).toDF("id", "key", "summary")
+
+    val sketch1Df = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_double($"key", $"summary")
+        .alias("sketch"))
+    val sketch2Df = df2
+      .groupBy("id")
+      .agg(tuple_sketch_agg_double($"key", $"summary")
+        .alias("sketch"))
+
+    val combined = sketch1Df.union(sketch2Df)
+
+    // Test union_agg with default parameters
+    val union1 = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_double($"sketch"))
+      .collect()(0)(1)
+    assert(union1 != null)
+    assert(union1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test union_agg with lgNomEntries
+    val union2 = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_double($"sketch", 10))
+      .collect()(0)(1)
+    assert(union2 != null)
+
+    // Test union_agg with lgNomEntries and mode
+    val union3 = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_double($"sketch", 10, "sum"))
+      .collect()(0)(1)
+    assert(union3 != null)
+
+    // Test with column name
+    val union4 = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_double("sketch"))
+      .collect()(0)(1)
+    assert(union4 != null)
+
+    // Verify estimate from union_agg (keys 1, 2, 3, 4 should all be present)
+    val estimateResult = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_double($"sketch").alias("union_sketch"))
+      .select(tuple_sketch_estimate_double($"union_sketch"))
+      .collect()(0)(0)
+    assert(estimateResult == 4.0)
+  }
+
+  test("SPARK-54179: tuple_union_agg_integer basic functionality") {
+    val df1 = Seq((1, 1, 10), (1, 2, 20)).toDF("id", "key", "summary")
+    val df2 = Seq((1, 3, 30), (1, 4, 40)).toDF("id", "key", "summary")
+
+    val sketch1Df = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary")
+        .alias("sketch"))
+    val sketch2Df = df2
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary")
+        .alias("sketch"))
+
+    val combined = sketch1Df.union(sketch2Df)
+
+    // Test union_agg with default parameters
+    val union1 = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_integer($"sketch"))
+      .collect()(0)(1)
+    assert(union1 != null)
+
+    // Test union_agg with lgNomEntries and mode
+    val union2 = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_integer($"sketch", 10, "max"))
+      .collect()(0)(1)
+    assert(union2 != null)
+
+    // Test with column name
+    val union3 = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_integer("sketch", 10))
+      .collect()(0)(1)
+    assert(union3 != null)
+
+    // Verify estimate from union_agg (keys 1, 2, 3, 4 should all be present)
+    val estimateResult = combined
+      .groupBy("id")
+      .agg(tuple_union_agg_integer($"sketch").alias("union_sketch"))
+      .select(tuple_sketch_estimate_integer($"union_sketch"))
+      .collect()(0)(0)
+    assert(estimateResult == 4.0)
+  }
+
+  test("SPARK-54179: tuple_intersection_agg_double basic functionality") {
+    val df1 = Seq((1, 1, 1.5), (1, 2, 2.5), (1, 3, 3.5)).toDF("id", "key", "summary")
+    val df2 = Seq((1, 2, 1.0), (1, 3, 2.0), (1, 4, 3.0)).toDF("id", "key", "summary")
+
+    val sketch1Df = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_double($"key", $"summary")
+        .alias("sketch"))
+    val sketch2Df = df2
+      .groupBy("id")
+      .agg(tuple_sketch_agg_double($"key", $"summary")
+        .alias("sketch"))
+
+    val combined = sketch1Df.union(sketch2Df)
+
+    // Test intersection_agg with default mode
+    val intersection1 = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_double($"sketch"))
+      .collect()(0)(1)
+    assert(intersection1 != null)
+    assert(intersection1.asInstanceOf[Array[Byte]].length > 0)
+
+    // Test intersection_agg with mode
+    val intersection2 = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_double($"sketch", "sum"))
+      .collect()(0)(1)
+    assert(intersection2 != null)
+
+    // Test with column name
+    val intersection3 = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_double("sketch", "min"))
+      .collect()(0)(1)
+    assert(intersection3 != null)
+
+    // Verify estimate from intersection_agg (keys 2 and 3 are common)
+    val estimateResult = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_double($"sketch").alias("intersection_sketch"))
+      .select(tuple_sketch_estimate_double($"intersection_sketch"))
+      .collect()(0)(0)
+    assert(estimateResult == 2.0)
+  }
+
+  test("SPARK-54179: tuple_intersection_agg_integer basic functionality") {
+    val df1 = Seq((1, 1, 10), (1, 2, 20), (1, 3, 30)).toDF("id", "key", "summary")
+    val df2 = Seq((1, 2, 15), (1, 3, 25), (1, 4, 35)).toDF("id", "key", "summary")
+
+    val sketch1Df = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary")
+        .alias("sketch"))
+    val sketch2Df = df2
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary")
+        .alias("sketch"))
+
+    val combined = sketch1Df.union(sketch2Df)
+
+    // Test intersection_agg with default mode
+    val intersection1 = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_integer($"sketch"))
+      .collect()(0)(1)
+    assert(intersection1 != null)
+
+    // Test intersection_agg with mode
+    val intersection2 = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_integer($"sketch", "max"))
+      .collect()(0)(1)
+    assert(intersection2 != null)
+
+    // Test with column name
+    val intersection3 = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_integer("sketch"))
+      .collect()(0)(1)
+    assert(intersection3 != null)
+
+    // Verify estimate from intersection_agg (keys 2 and 3 are common)
+    val estimateResult = combined
+      .groupBy("id")
+      .agg(tuple_intersection_agg_integer($"sketch").alias("intersection_sketch"))
+      .select(tuple_sketch_estimate_integer($"intersection_sketch"))
+      .collect()(0)(0)
+    assert(estimateResult == 2.0)
+  }
+
+  test("SPARK-54179: tuple_sketch_agg + operations + estimate comprehensive test - double") {
+    val df1 = Seq((1, "a", 1.0), (1, "a", 2.0), (1, "b", 3.0), (1, "c", 4.0))
+      .toDF("id", "key", "summary")
+    df1.createOrReplaceTempView("tuple_df1")
+
+    val df2 = Seq((1, "a", 0.5), (1, "c", 1.5), (1, "d", 2.5), (1, "e", 3.5))
+      .toDF("id", "key", "summary")
+    df2.createOrReplaceTempView("tuple_df2")
+
+    // Test tuple_sketch_agg and estimate via DataFrame
+    val res1 = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_double($"key", $"summary").as("sketch"))
+      .withColumn("estimate", tuple_sketch_estimate_double($"sketch"))
+      .withColumn("summary_total", tuple_sketch_summary_double($"sketch"))
+
+    val row1 = res1.collect()(0)
+    assert(row1.getAs[Double]("estimate") >= 3.0) // at least 3 distinct keys
+    assert(row1.getAs[Double]("summary_total") > 0.0)
+
+    // Test via SQL
+    val res2 = sql("""
+      SELECT
+        id,
+        tuple_sketch_agg_double(key, summary) as sketch,
+        tuple_sketch_estimate_double(tuple_sketch_agg_double(key, summary)) as estimate,
+        tuple_sketch_summary_double(tuple_sketch_agg_double(key, summary)) as summary_total
+      FROM tuple_df1
+      GROUP BY id
+    """)
+
+    val row2 = res2.collect()(0)
+    assert(row2.getAs[Double]("estimate") >= 3.0)
+    assert(row2.getAs[Double]("summary_total") > 0.0)
+
+    // Test union operations
+    val sketch1 = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_double($"key", $"summary")
+        .as("sketch"))
+    val sketch2 = df2
+      .groupBy("id")
+      .agg(tuple_sketch_agg_double($"key", $"summary")
+        .as("sketch"))
+
+    val unionResult = sketch1
+      .union(sketch2)
+      .groupBy("id")
+      .agg(tuple_union_agg_double($"sketch").as("union_sketch"))
+      .withColumn("union_estimate", tuple_sketch_estimate_double($"union_sketch"))
+
+    val unionRow = unionResult.collect()(0)
+    assert(unionRow.getAs[Double]("union_estimate") >= 5.0) // union should have 5 distinct keys
+
+    // Test intersection
+    val joined = sketch1.crossJoin(sketch2.withColumnRenamed("sketch", "sketch2"))
+    val intersectionResult = joined
+      .withColumn("intersection_sketch", tuple_intersection_double($"sketch", $"sketch2"))
+      .withColumn("intersection_estimate", tuple_sketch_estimate_double($"intersection_sketch"))
+
+    val intersectionRow = intersectionResult.collect()(0)
+    assert(intersectionRow.getAs[Double]("intersection_estimate") >= 2.0) // a and c are common
+
+    // Test difference
+    val differenceResult = joined
+      .withColumn("difference_sketch", tuple_difference_double($"sketch", $"sketch2"))
+      .withColumn("difference_estimate", tuple_sketch_estimate_double($"difference_sketch"))
+
+    val differenceRow = differenceResult.collect()(0)
+    assert(differenceRow.getAs[Double]("difference_estimate") >= 1.0) // b is unique to df1
+  }
+
+  test("SPARK-54179: tuple_sketch_agg + operations + estimate comprehensive test - integer") {
+    val df1 = Seq((1, "a", 10), (1, "a", 20), (1, "b", 30), (1, "c", 40))
+      .toDF("id", "key", "summary")
+
+    val df2 = Seq((1, "a", 5), (1, "c", 15), (1, "d", 25), (1, "e", 35))
+      .toDF("id", "key", "summary")
+
+    // Test tuple_sketch_agg and estimate
+    val res1 = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary").as("sketch"))
+      .withColumn("estimate", tuple_sketch_estimate_integer($"sketch"))
+      .withColumn("summary_total", tuple_sketch_summary_integer($"sketch"))
+
+    val row1 = res1.collect()(0)
+    assert(row1.getAs[Double]("estimate") >= 3.0)
+    assert(row1.getAs[Long]("summary_total") > 0)
+
+    // Test with different modes
+    val resMax = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary", 12, "max").as("sketch"))
+      .withColumn("summary_max", tuple_sketch_summary_integer($"sketch", "max"))
+
+    val rowMax = resMax.collect()(0)
+    assert(rowMax.getAs[Long]("summary_max") > 0)
+
+    // Test union with mode
+    val sketch1 = df1
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary")
+        .as("sketch"))
+    val sketch2 = df2
+      .groupBy("id")
+      .agg(tuple_sketch_agg_integer($"key", $"summary")
+        .as("sketch"))
+
+    val unionResult = sketch1
+      .union(sketch2)
+      .groupBy("id")
+      .agg(tuple_union_agg_integer($"sketch", 12, "sum").as("union_sketch"))
+      .withColumn("union_estimate", tuple_sketch_estimate_integer($"union_sketch"))
+
+    val unionRow = unionResult.collect()(0)
+    assert(unionRow.getAs[Double]("union_estimate") >= 5.0)
+  }
+
+  test("SPARK-54179: tuple_sketch with null values") {
+    val df = Seq((1, Some(10)), (2, Some(20)), (3, None)).toDF("key", "summary")
+
+    // Null summaries should be handled
+    val sketch = df.agg(tuple_sketch_agg_integer($"key", $"summary").alias("sketch"))
+    val estimate = sketch
+      .select(tuple_sketch_estimate_integer($"sketch"))
+      .collect()(0)(0)
+    assert(estimate != null)
+    assert(estimate.asInstanceOf[Double] == 2.0)
+  }
+
+  // Numerical-equivalence property (sql-core layer).
+  //
+  // Sweeps the (p, p', s, n) lattice where the widened-cast SUM peel fires
+  // and asserts that the optimized result matches an external java.math.BigDecimal
+  // reference computed in pure Scala. Domain is restricted to the non-overflow
+  // regime so the peeled LONG accumulator cannot wrap.
+  //
+  // Non-overflow bound: with |unscaled(x)| < 10^p, p <= 8, n <= 1000,
+  // worst-case accumulator is 1000 * (10^8 - 1) < 10^12 << 2^63.
+  //
+  // A wide-target-scale fixed witness (p=8, p'=30, s=2) is exercised below
+  // as a unit case to guarantee a hand-enumerated boundary even if the
+  // property generator shrinks.
+
+  private case class PeelDomain(p: Int, pPrime: Int, s: Int)
+
+  private val peelDomainGen: Gen[PeelDomain] = (for {
+    p <- Gen.choose(1, 8)
+    pPrime <- Gen.choose(math.max(p + 1, 9), 28)
+    s <- Gen.choose(0, p)
+  } yield PeelDomain(p, pPrime, s))
+    .retryUntil(d => d.p + 10 <= 18 && d.p < d.pPrime && d.pPrime + 10 <= 38)
+
+  // Reference SUM via java.math.BigDecimal at the widened target scale.
+  // Inside the non-overflow domain (|sum unscaled| < 10^(p+10)) this is
+  // bit-exact equivalent to both the peeled and the baseline plan, so we
+  // can pin the peeled result against an external oracle without depending
+  // on a baseline plan we no longer exercise.
+  private def referenceSum(
+      unscaledLongs: Seq[Long], d: PeelDomain): java.math.BigDecimal = {
+    if (unscaledLongs.isEmpty) {
+      null
+    } else {
+      val acc = unscaledLongs
+        .map(u => java.math.BigDecimal.valueOf(u, d.s))
+        .foldLeft(java.math.BigDecimal.ZERO)(_.add(_))
+      acc.setScale(d.s)
+    }
+  }
+
+  private def sumCastResult(
+      unscaledLongs: Seq[Long], d: PeelDomain): java.math.BigDecimal = {
+    // Use an explicit DecimalType(p, s) schema rather than Scala-tuple
+    // inference. createDataFrame on Tuple1[java.math.BigDecimal] infers
+    // DecimalType.SYSTEM_DEFAULT (38, 18), which would force the subsequent
+    // CAST to widen from (38, 18) -> (pPrime, s) rather than from the
+    // intended narrow (p, s) -> (pPrime, s) widening, defeating the
+    // WidenedDecimalChild trigger and silently exercising the wrong rule arm.
+    val rows = unscaledLongs.map(u => Row(java.math.BigDecimal.valueOf(u, d.s)))
+    val schema = StructType(StructField("x", DecimalType(d.p, d.s)) :: Nil)
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(rows), schema)
+    assert(df.schema("x").dataType == DecimalType(d.p, d.s),
+      s"expected inner schema DecimalType(${d.p}, ${d.s}), got ${df.schema("x").dataType}")
+    df.select(sum(col("x").cast(DecimalType(d.pPrime, d.s))).as("s"))
+      .collect()(0).getDecimal(0)
+  }
+
+  test("SPARK-56627: DecimalAggregates widened-Cast SUM peel -- numerical " +
+      "equivalence property (sql-core layer)") {
+    val combinedGen: Gen[(PeelDomain, List[Long])] = for {
+      d <- peelDomainGen
+      upper = math.pow(10, d.p).toLong - 1
+      n <- Gen.choose(1, 1000)
+      xs <- Gen.listOfN(n, Gen.choose(-upper, upper))
+    } yield (d, xs)
+    forAll(combinedGen, minSuccessful(20), sizeRange(0)) { case (d, xs) =>
+      val r = sumCastResult(xs, d)
+      val ref = referenceSum(xs, d)
+      assert(r.compareTo(ref) == 0,
+        s"peel result diverges from BigDecimal reference for " +
+          s"PeelDomain(p=${d.p}, pPrime=${d.pPrime}, s=${d.s}), n=${xs.size}, " +
+          s"sample=${xs.take(3)}, got=$r ref=$ref")
+    }
+  }
+
+  // Wide target-scale fixed witness: (p=8, p'=30, s=2). Hand-enumerated so a
+  // wide target scale case is always exercised even if property shrinks.
+  test("SPARK-56627: SUM(CAST(dec(8,2) AS dec(30,2))) matches BigDecimal " +
+      "reference (wide-target-scale fixed witness, sql-core)") {
+    val d = PeelDomain(8, 30, 2)
+    val xs = Seq(0L, 1L, -1L, 99999999L, -99999999L, 12345678L, -87654321L)
+    val r = sumCastResult(xs, d)
+    val ref = referenceSum(xs, d)
+    assert(r.compareTo(ref) == 0, s"got=$r ref=$ref")
+  }
+
+  // AVG widened-Cast peel: equivalence property (sql-core layer).
+  //
+  // Oracle: peel(AVG(CAST(x AS dec(pPrime, s)))) must be observationally
+  // identical to the existing fast path on AVG(x) directly. Both arms in
+  // Optimizer.DecimalAggregates produce
+  //   Cast(Divide(Avg(UnscaledValue(<inner>)), Lit(10^s, Double)),
+  //        DecimalType(<outerP>, s + 4))
+  // and the peel arm makes <inner> equal to the user's column, so the
+  // Double-divide dividends are bit-identical between the two paths; only
+  // the outer Cast target precision differs (pPrime+4 vs p+4), a widening
+  // precision Cast that preserves numerical value. We therefore assert
+  // BigDecimal.compareTo == 0 (value equality across differing precisions).
+  //
+  // Domain: pPrime in [p+1, 11] -- the band where pPrime + 4 <= MAX_DOUBLE_DIGITS
+  // so the new arm fires and the existing un-widened arm would also have
+  // matched the outer Cast (allowing comparison against AVG(x) as oracle).
+  // The inner DataFrame schema is constructed as DecimalType(p, s) explicitly
+  // (NOT via tuple-inference, which would infer DecimalType.SYSTEM_DEFAULT and
+  // silently route through a DIFFERENT rule arm than intended).
+  private case class AvgDomain(p: Int, pPrime: Int, s: Int)
+
+  private val avgDomainGen: Gen[AvgDomain] = (for {
+    p <- Gen.choose(1, 10)
+    pPrime <- Gen.choose(p + 1, 11)
+    s <- Gen.choose(0, p)
+  } yield AvgDomain(p, pPrime, s))
+
+  private def avgInputDf(unscaledLongs: Seq[Long], d: AvgDomain) = {
+    val rows = unscaledLongs.map(u => Row(java.math.BigDecimal.valueOf(u, d.s)))
+    val schema = StructType(StructField("x", DecimalType(d.p, d.s)) :: Nil)
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(rows), schema)
+    assert(df.schema("x").dataType == DecimalType(d.p, d.s),
+      s"expected inner schema DecimalType(${d.p}, ${d.s}), got ${df.schema("x").dataType}")
+    df
+  }
+
+  private def avgCastResult(
+      unscaledLongs: Seq[Long], d: AvgDomain): java.math.BigDecimal = {
+    avgInputDf(unscaledLongs, d)
+      .select(avg(col("x").cast(DecimalType(d.pPrime, d.s))).as("a"))
+      .collect()(0).getDecimal(0)
+  }
+
+  private def avgDirectResult(
+      unscaledLongs: Seq[Long], d: AvgDomain): java.math.BigDecimal = {
+    avgInputDf(unscaledLongs, d)
+      .select(avg(col("x")).as("a"))
+      .collect()(0).getDecimal(0)
+  }
+
+  test("SPARK-56627: DecimalAggregates widened-Cast AVG peel -- " +
+      "equivalence vs unpeeled AVG (sql-core)") {
+    val combinedGen: Gen[(AvgDomain, List[Long])] = for {
+      d <- avgDomainGen
+      upper = math.pow(10, d.p).toLong - 1
+      n <- Gen.choose(1, 1000)
+      xs <- Gen.listOfN(n, Gen.choose(-upper, upper))
+    } yield (d, xs)
+    forAll(combinedGen, minSuccessful(20), sizeRange(0)) { case (d, xs) =>
+      val peeled = avgCastResult(xs, d)
+      val direct = avgDirectResult(xs, d)
+      // BigDecimal.compareTo ignores trailing-zero precision differences:
+      // peeled has output DecimalType(pPrime+4, s+4), direct has
+      // DecimalType(p+4, s+4). Both wrap the same Double-divide bit pattern
+      // so the underlying value is identical.
+      assert(peeled.compareTo(direct) == 0,
+        s"peeled AVG diverges from unpeeled AVG for " +
+          s"AvgDomain(p=${d.p}, pPrime=${d.pPrime}, s=${d.s}), n=${xs.size}, " +
+          s"sample=${xs.take(3)}, peeled=$peeled direct=$direct")
+    }
+  }
+
+  // Wider-pPrime regime: when pPrime + 4 > MAX_DOUBLE_DIGITS the AVG peel arm
+  // is intentionally NOT fired so the un-rewritten Decimal-exact path is
+  // preserved. Witness: (p=4, p'=20, s=2) -- pPrime + 4 = 24 > 15. Asserts
+  // non-null result and the expected widened output schema; rule shape is
+  // covered by the catalyst-layer suite.
+  test("SPARK-56627: AVG(CAST(dec(4,2) AS dec(20,2))) yields " +
+      "widened output schema (Decimal-exact path preserved)") {
+    val rows = Seq(123L, -456L, 789L, 0L)
+      .map(u => Row(java.math.BigDecimal.valueOf(u, 2)))
+    val schema = StructType(StructField("x", DecimalType(4, 2)) :: Nil)
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(rows), schema)
+      .select(avg(col("x").cast(DecimalType(20, 2))).as("a"))
+    val row = df.collect()(0)
+    assert(!row.isNullAt(0), s"expected non-null AVG, got null; df schema = ${df.schema}")
+    val outType = df.schema("a").dataType.asInstanceOf[DecimalType]
+    // Un-rewritten Average.dataType = bounded(pPrime + 4, s + 4) = (24, 6).
+    assert(outType.precision == 24 && outType.scale == 6,
+      s"expected DecimalType(24, 6) from un-rewritten AVG, got $outType")
   }
 }
 

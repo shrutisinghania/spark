@@ -40,6 +40,13 @@ import org.apache.spark.util.Utils
   usage = """
     _FUNC_(child, jsonFormatSchema, options) - Converts a binary Avro value into a Catalyst value.
     """,
+  arguments = """
+    Arguments:
+      * child - A binary value containing Avro-encoded data.
+      * jsonFormatSchema - A constant string with the Avro schema in JSON format used to
+          interpret the data.
+      * options - A constant map of string keys and values holding conversion options.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(s, '{"type": "record", "name": "struct", "fields": [{ "name": "u", "type": ["int","string"] }]}', map()) IS NULL AS result FROM (SELECT NAMED_STRUCT('u', NAMED_STRUCT('member0', member0, 'member1', member1)) AS s FROM VALUES (1, NULL), (NULL,  'a') tab(member0, member1));
@@ -51,7 +58,7 @@ import org.apache.spark.util.Utils
     To deserialize the data with a compatible and evolved schema, the expected Avro schema can be
     set via the corresponding option.
   """,
-  group = "misc_funcs",
+  group = "avro_funcs",
   since = "4.0.0"
 )
 // scalastyle:on line.size.limit
@@ -141,6 +148,12 @@ case class FromAvro(child: Expression, jsonFormatSchema: Expression, options: Ex
     _FUNC_(child[, jsonFormatSchema]) - Converts a Catalyst binary input value into its
       corresponding Avro format result.
   """,
+  arguments = """
+    Arguments:
+      * child - A value to encode into Avro binary format.
+      * jsonFormatSchema - An optional constant string with the Avro schema in JSON format
+          used to encode the value. If omitted, the schema is inferred from the input type.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(s, '{"type": "record", "name": "struct", "fields": [{ "name": "u", "type": ["int","string"] }]}') IS NULL FROM (SELECT NULL AS s);
@@ -148,7 +161,7 @@ case class FromAvro(child: Expression, jsonFormatSchema: Expression, options: Ex
       > SELECT _FUNC_(s) IS NULL FROM (SELECT NULL AS s);
        [true]
   """,
-  group = "misc_funcs",
+  group = "avro_funcs",
   since = "4.0.0"
 )
 // scalastyle:on line.size.limit
@@ -215,12 +228,17 @@ case class ToAvro(child: Expression, jsonFormatSchema: Expression)
   usage = """
     _FUNC_(jsonFormatSchema, options) - Returns schema in the DDL format of the avro schema in JSON string format.
     """,
+  arguments = """
+    Arguments:
+      * jsonFormatSchema - A constant string with the Avro schema in JSON format.
+      * options - A constant map of string keys and values holding conversion options.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_('{"type": "record", "name": "struct", "fields": [{"name": "u", "type": ["int", "string"]}]}', map());
        STRUCT<u: STRUCT<member0: INT, member1: STRING> NOT NULL>
   """,
-  group = "misc_funcs",
+  group = "avro_funcs",
   since = "4.0.0"
 )
 // scalastyle:on line.size.limit

@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from pyspark.testing.utils import ReusedPySparkTestCase
 from pyspark.rddsampler import RDDSampler, RDDStratifiedSampler
+from pyspark.testing.utils import ReusedPySparkTestCase
 
 
 class RDDSamplerTests(ReusedPySparkTestCase):
@@ -54,13 +54,6 @@ class RDDSamplerTests(ReusedPySparkTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.tests.test_rddsampler import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

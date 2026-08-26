@@ -14,18 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from pyspark.sql.connect.utils import check_dependencies
-
-check_dependencies(__name__)
-
-from typing import Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Union
 
 from pyspark.errors import PySparkTypeError
 from pyspark.sql import functions as pysparkfuncs
 from pyspark.sql.column import Column
-from pyspark.sql.connect.functions.builtin import _to_col, _invoke_function_over_columns
-from pyspark.sql.connect.functions.builtin import lit, _invoke_function
-
+from pyspark.sql.connect.functions.builtin import (
+    _invoke_function,
+    _invoke_function_over_columns,
+    _to_col,
+    lit,
+)
 
 if TYPE_CHECKING:
     from pyspark.sql.connect._typing import ColumnOrName
@@ -38,8 +37,9 @@ def bucket(numBuckets: Union[Column, int], col: "ColumnOrName") -> Column:
         _numBuckets = numBuckets
     else:
         raise PySparkTypeError(
-            errorClass="NOT_COLUMN_OR_INT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column or int",
                 "arg_name": "numBuckets",
                 "arg_type": type(numBuckets).__name__,
             },
@@ -80,11 +80,12 @@ hours.__doc__ = pysparkfuncs.partitioning.hours.__doc__
 
 
 def _test() -> None:
-    import sys
-    import os
     import doctest
-    from pyspark.sql import SparkSession as PySparkSession
+    import os
+    import sys
+
     import pyspark.sql.connect.functions.partitioning
+    from pyspark.sql import SparkSession as PySparkSession
 
     globs = pyspark.sql.connect.functions.partitioning.__dict__.copy()
 
@@ -94,7 +95,7 @@ def _test() -> None:
         .getOrCreate()
     )
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.connect.functions.partitioning,
         globs=globs,
         optionflags=doctest.ELLIPSIS

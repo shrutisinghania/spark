@@ -16,10 +16,11 @@
 #
 from abc import ABC, abstractmethod
 from collections import UserDict
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Dict,
     Iterable,
     Iterator,
     List,
@@ -28,28 +29,29 @@ from typing import (
     Tuple,
     Type,
     Union,
-    TYPE_CHECKING,
 )
 
-from pyspark.sql import Row
-from pyspark.sql.types import StructType
 from pyspark.errors import PySparkNotImplementedError
+from pyspark.sql import Row
+from pyspark.sql.streaming.datasource import ReadAllAvailable, ReadLimit
+from pyspark.sql.types import StructType
 
 if TYPE_CHECKING:
     from pyarrow import RecordBatch
+
     from pyspark.sql.session import SparkSession
 
 __all__ = [
     "DataSource",
     "DataSourceReader",
     "DataSourceStreamReader",
-    "SimpleDataSourceStreamReader",
     "DataSourceWriter",
     "DataSourceArrowWriter",
     "DataSourceStreamWriter",
+    "DataSourceStreamArrowWriter",
+    "SimpleDataSourceStreamReader",
     "DataSourceRegistration",
     "InputPartition",
-    "SimpleDataSourceStreamReader",
     "WriterCommitMessage",
     "Filter",
     "EqualTo",
@@ -81,10 +83,10 @@ class DataSource(ABC):
     After implementing this interface, you can start to load your data source using
     ``spark.read.format(...).load()`` and save data using ``df.write.format(...).save()``.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
-    def __init__(self, options: Dict[str, str]) -> None:
+    def __init__(self, options: MutableMapping[str, str]) -> None:
         """
         Initializes the data source with user-provided options.
 
@@ -267,7 +269,7 @@ A tuple of strings representing a column reference.
 
 For example, `("a", "b", "c")` represents the column `a.b.c`.
 
-.. versionadded: 4.1.0
+.. versionadded:: 4.1.0
 """
 
 
@@ -276,7 +278,7 @@ class Filter(ABC):
     """
     The base class for filters used for filter pushdown.
 
-    .. versionadded: 4.1.0
+    .. versionadded:: 4.1.0
 
     Notes
     -----
@@ -475,7 +477,7 @@ class InputPartition:
     A base class representing an input partition returned by the `partitions()`
     method of :class:`DataSourceReader`.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
 
     Notes
     -----
@@ -513,7 +515,7 @@ class DataSourceReader(ABC):
     A base class for data source readers. Data source readers are responsible for
     outputting data from a data source.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     def pushFilters(self, filters: List["Filter"]) -> Iterable["Filter"]:
@@ -526,14 +528,23 @@ class DataSourceReader(ABC):
         can improve performance by reducing the amount of data that needs to be
         processed by Spark.
 
-        This method is called once during query planning. By default, it returns
-        all filters, indicating that no filters can be pushed down. Subclasses can
-        override this method to implement filter pushdown.
+        This method may be called more than once during query planning, on separate reader
+        instances (see the note below). By default, it returns all filters, indicating that no
+        filters can be pushed down. Subclasses can override this method to implement filter
+        pushdown.
+
+        .. note::
+            When limit pushdown is enabled (see :meth:`pushLimit`), planning may create
+            additional reader instances and call this method on each with the same filters, so
+            that a reader reaches the same state before a limit is pushed and read planning runs
+            only after the limit is known. Implementations must therefore be deterministic --
+            returning a different set of supported filters across calls fails the query -- and
+            must not rely on side effects outside of `self`.
 
         It's recommended to implement this method only for data sources that natively
         support filtering, such as databases and GraphQL APIs.
 
-        .. versionadded: 4.1.0
+        .. versionadded:: 4.1.0
 
         Parameters
         ----------
@@ -577,6 +588,83 @@ class DataSourceReader(ABC):
         """
         return filters
 
+    def pushLimit(self, limit: int) -> bool:
+        """
+        Called with the maximum number of rows that the query needs from this data source.
+
+        Limit pushdown allows the data source to fetch less data, for example by adding a
+        `LIMIT` clause to a SQL query or a page size parameter to a REST request.
+
+        This method is called once during query planning, before :meth:`partitions` and
+        :meth:`read`. By default, it returns False, indicating that the limit cannot be
+        pushed down. Subclasses can override this method to implement limit pushdown.
+
+        :meth:`pushFilters` is called before this method only when the query has filters that
+        Spark can push down; for a query without them, :meth:`pushFilters` is not called at
+        all. This method may use state that :meth:`pushFilters` set when filters were pushed,
+        but must not assume :meth:`pushFilters` ran: initialize defaults in `__init__` so this
+        method works whether or not it did.
+
+        A limit is only pushed down when every filter was pushed down, because Spark cannot
+        apply a limit before a filter it still has to evaluate itself. To benefit from limit
+        pushdown alongside filters, :meth:`pushFilters` should return an empty iterable.
+
+        Pushing down a limit is only a hint: Spark always applies the limit again after the
+        scan, so it is safe to return True even if `read()` yields more than `limit` rows.
+        Returning True never causes the query to see fewer rows than it requires.
+
+        .. versionadded:: 4.4.0
+
+        Parameters
+        ----------
+        limit : int
+            The maximum number of rows the query needs. Always positive: `LIMIT 0` is
+            optimized into an empty relation and never reaches the data source.
+
+        Returns
+        -------
+        bool
+            True if the data source will use the limit to reduce the amount of data it
+            reads, False otherwise.
+
+        Side effects
+        ------------
+        This method is allowed to modify `self`. The object must remain picklable.
+        Modifications to `self` are visible to the `partitions()` and `read()` methods
+        only when this method returns True. When it returns False, planning proceeds as if
+        `pushLimit` was never called -- `partitions()` and `read()` run on a reader that did
+        not observe these modifications -- so any state they rely on must be initialized in
+        `__init__` instead.
+
+        Notes
+        -----
+        This method is only called when the configuration
+        `spark.sql.python.limitPushdown.enabled` is set to true.
+
+        Examples
+        --------
+        Implement pushLimit to fetch fewer rows from the data source. Initialize the limit in
+        `__init__`, because :meth:`partitions` and :meth:`read` may run even when `pushLimit`
+        was not called -- for a query without a limit, or when this method returned False:
+
+        >>> class MyReader(DataSourceReader):
+        ...     def __init__(self):
+        ...         self.limit = None
+        ...
+        ...     def pushLimit(self, limit):
+        ...         # Save the limit for handling in partitions() and read().
+        ...         self.limit = limit
+        ...         return True
+        ...
+        ...     def partitions(self):
+        ...         # A limit can reduce the number of partitions, since every partition opens
+        ...         # its own connection to the data source.
+        ...         if self.limit is not None:
+        ...             return [InputPartition(None)]
+        ...         return [InputPartition(i) for i in range(16)]
+        """
+        return False
+
     def partitions(self) -> Sequence[InputPartition]:
         """
         Returns an iterator of partitions for this data source.
@@ -587,8 +675,8 @@ class DataSourceReader(ABC):
         partition value to read the data.
 
         This method is called once during query planning. By default, it returns a
-        single partition with the value ``None``. Subclasses can override this method
-        to return multiple partitions.
+        single partition with the value `InputPartition(None)`. Subclasses can override
+        this method to return multiple partitions.
 
         It's recommended to override this method for better performance when reading
         large datasets.
@@ -625,10 +713,7 @@ class DataSourceReader(ABC):
         >>> def partitions(self):
         ...     return [RangeInputPartition(1, 3), RangeInputPartition(5, 10)]
         """
-        raise PySparkNotImplementedError(
-            errorClass="NOT_IMPLEMENTED",
-            messageParameters={"feature": "partitions"},
-        )
+        return [InputPartition(None)]
 
     @abstractmethod
     def read(self, partition: InputPartition) -> Union[Iterator[Tuple], Iterator["RecordBatch"]]:
@@ -642,7 +727,7 @@ class DataSourceReader(ABC):
 
         Parameters
         ----------
-        partition : object
+        partition : InputPartition
             The partition to read. It must be one of the partition values returned by
             :meth:`DataSourceReader.partitions`.
 
@@ -688,7 +773,7 @@ class DataSourceStreamReader(ABC):
     A base class for streaming data source readers. Data source stream readers are responsible
     for outputting data from a streaming data source.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     def initialOffset(self) -> dict:
@@ -714,9 +799,35 @@ class DataSourceStreamReader(ABC):
             messageParameters={"feature": "initialOffset"},
         )
 
-    def latestOffset(self) -> dict:
+    def latestOffset(self, start: dict, limit: ReadLimit) -> dict:
         """
-        Returns the most recent offset available.
+        Returns the most recent offset available given a read limit. The start offset can be used
+        to figure out how much new data should be read given the limit.
+
+        The `start` will be provided from the return value of :meth:`initialOffset()` for
+        the very first micro-batch, and for subsequent micro-batches, the start offset is the
+        ending offset from the previous micro-batch. The source can return the `start` parameter
+        as it is, if there is no data to process.
+
+        :class:`ReadLimit` can be used by the source to limit the amount of data returned in this
+        call. The implementation should implement :meth:`getDefaultReadLimit()` to provide the
+        proper :class:`ReadLimit` if the source can limit the amount of data returned based on the
+        source options.
+
+        The engine can still call :meth:`latestOffset()` with :class:`ReadAllAvailable` even if the
+        source produces the different read limit from :meth:`getDefaultReadLimit()`, to respect the
+        semantic of trigger. The source must always respect the given readLimit provided by the
+        engine; e.g. if the readLimit is :class:`ReadAllAvailable`, the source must ignore the read
+        limit configured through options.
+
+        .. versionadded:: 4.2.0
+
+        Parameters
+        ----------
+        start : dict
+            The start offset of the microbatch to continue reading from.
+        limit : :class:`ReadLimit`
+            The limit on the amount of data to be returned by this call.
 
         Returns
         -------
@@ -726,13 +837,57 @@ class DataSourceStreamReader(ABC):
 
         Examples
         --------
-        >>> def latestOffset(self):
-        ...     return {"parititon-1": {"index": 3, "closed": True}, "partition-2": {"index": 5}}
+        >>> from pyspark.sql.streaming.datasource import ReadAllAvailable, ReadMaxRows
+        >>> def latestOffset(self, start, limit):
+        ...     # Assume the source has 10 new records between start and latest offset
+        ...     if isinstance(limit, ReadAllAvailable):
+        ...        return {"index": start["index"] + 10}
+        ...     else:  # e.g., limit is ReadMaxRows(5)
+        ...        return {"index": start["index"] + min(10, limit.maxRows)}
         """
+        # NOTE: Previous Spark versions didn't have start offset and read limit parameters for this
+        # method. While Spark will ensure the backward compatibility for existing data sources, the
+        # new data sources are strongly encouraged to implement this new method signature.
         raise PySparkNotImplementedError(
             errorClass="NOT_IMPLEMENTED",
             messageParameters={"feature": "latestOffset"},
         )
+
+    def getDefaultReadLimit(self) -> ReadLimit:
+        """
+        Returns the read limits potentially passed to the data source through options when creating
+        the data source. See the built-in implementations of :class:`ReadLimit` for available read
+        limits.
+
+        Implementing this method is optional. By default, it returns :class:`ReadAllAvailable`,
+        which means there is no limit on the amount of data returned by :meth:`latestOffset()`.
+
+        .. versionadded:: 4.2.0
+        """
+        return ReadAllAvailable()
+
+    def reportLatestOffset(self) -> Optional[dict]:
+        """
+        Returns the most recent offset available. The information is used to report the latest
+        offset in the streaming query status.
+        The source can return `None`, if there is no data to process or the source does not support
+        to this method.
+
+        .. versionadded:: 4.2.0
+
+        Returns
+        -------
+        dict or None
+            A dict or recursive dict whose key and value are primitive types, which includes
+            Integer, String and Boolean.
+            Returns `None` if the source does not support reporting latest offset.
+
+        Examples
+        --------
+        >>> def reportLatestOffset(self):
+        ...     return {"partition-1": {"index": 100}, "partition-2": {"index": 200}}
+        """
+        return None
 
     def partitions(self, start: dict, end: dict) -> Sequence[InputPartition]:
         """
@@ -826,7 +981,7 @@ class SimpleDataSourceStreamReader(ABC):
     Use :class:`DataSourceStreamReader` when read throughput is high and can't be handled
     by a single process.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     def initialOffset(self) -> dict:
@@ -914,7 +1069,7 @@ class DataSourceWriter(ABC):
     A base class for data source writers. Data source writers are responsible for saving
     the data to the data source.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     @abstractmethod
@@ -984,7 +1139,7 @@ class DataSourceArrowWriter(DataSourceWriter):
     is optimized for using the Arrow format when writing data. It can offer better performance
     when interfacing with systems or libraries that natively support Arrow.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     @abstractmethod
@@ -1032,7 +1187,7 @@ class DataSourceStreamWriter(ABC):
     A base class for data stream writers. Data stream writers are responsible for writing
     the data to the streaming sink.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     @abstractmethod
@@ -1098,13 +1253,66 @@ class DataSourceStreamWriter(ABC):
         ...
 
 
+class DataSourceStreamArrowWriter(DataSourceStreamWriter):
+    """
+    A base class for data stream writers that process data using PyArrow's `RecordBatch`.
+
+    Unlike :class:`DataSourceStreamWriter`, which works with an iterator of Spark Rows, this class
+    is optimized for using the Arrow format when writing streaming data. It can offer better
+    performance when interfacing with systems or libraries that natively support Arrow for
+    streaming use cases.
+
+    .. versionadded:: 4.1.0
+    """
+
+    @abstractmethod
+    def write(self, iterator: Iterator["RecordBatch"]) -> "WriterCommitMessage":
+        """
+        Writes an iterator of PyArrow `RecordBatch` objects to the streaming sink.
+
+        This method is called on executors to write data to the streaming data sink in
+        each microbatch. It accepts an iterator of PyArrow `RecordBatch` objects and
+        returns a single row representing a commit message, or None if there is no commit message.
+
+        The driver collects commit messages, if any, from all executors and passes them
+        to the :class:`DataSourceStreamArrowWriter.commit` method if all tasks run
+        successfully. If any task fails, the :class:`DataSourceStreamArrowWriter.abort` method
+        will be called with the collected commit messages.
+
+        Parameters
+        ----------
+        iterator : iterator of :class:`RecordBatch`\\s
+            An iterator of PyArrow `RecordBatch` objects representing the input data.
+
+        Returns
+        -------
+        :class:`WriterCommitMessage`
+            a serializable commit message
+
+        Examples
+        --------
+        >>> from dataclasses import dataclass
+        >>> @dataclass
+        ... class MyCommitMessage(WriterCommitMessage):
+        ...     num_rows: int
+        ...     batch_id: int
+        ...
+        >>> def write(self, iterator: Iterator["RecordBatch"]) -> "WriterCommitMessage":
+        ...     total_rows = 0
+        ...     for batch in iterator:
+        ...         total_rows += len(batch)
+        ...     return MyCommitMessage(num_rows=total_rows, batch_id=self.current_batch_id)
+        """
+        ...
+
+
 class WriterCommitMessage:
     """
     A commit message returned by the :meth:`DataSourceWriter.write` and will be
     sent back to the driver side as input parameter of :meth:`DataSourceWriter.commit`
     or :meth:`DataSourceWriter.abort` method.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
 
     Notes
     -----
@@ -1119,7 +1327,7 @@ class DataSourceRegistration:
     Wrapper for data source registration. This instance can be accessed by
     :attr:`spark.dataSource`.
 
-    .. versionadded: 4.0.0
+    .. versionadded:: 4.0.0
     """
 
     def __init__(self, sparkSession: "SparkSession"):
@@ -1158,7 +1366,7 @@ class CaseInsensitiveDict(UserDict):
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.update(*args, **kwargs)
 
     def __setitem__(self, key: str, value: Any) -> None:

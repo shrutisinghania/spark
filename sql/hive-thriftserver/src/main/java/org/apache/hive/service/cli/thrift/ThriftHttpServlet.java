@@ -101,9 +101,10 @@ public class ThriftHttpServlet extends TServlet {
     // Initialize the cookie based authentication related variables.
     if (isCookieAuthEnabled) {
       // Generate the signer with secret.
-      String secret = Long.toString(RAN.nextLong());
-      LOG.debug("Using the random number as the secret for cookie generation " + secret);
-      this.signer = new CookieSigner(secret.getBytes());
+      byte[] secret = new byte[32];
+      RAN.nextBytes(secret);
+      LOG.debug("Using the random bytes as the secret for cookie generation");
+      this.signer = new CookieSigner(secret);
       this.cookieMaxAge = (int) hiveConf.getTimeVar(
         ConfVars.HIVE_SERVER2_THRIFT_HTTP_COOKIE_MAX_AGE, TimeUnit.SECONDS);
       this.cookieDomain = hiveConf.getVar(ConfVars.HIVE_SERVER2_THRIFT_HTTP_COOKIE_DOMAIN);
@@ -157,7 +158,7 @@ public class ThriftHttpServlet extends TServlet {
       SessionManager.setUserName(clientUserName);
 
       // find proxy user if any from query param
-      String doAsQueryParam = getDoAsQueryParam(request.getQueryString());
+      String doAsQueryParam = getDoAsQueryParam(request);
       if (doAsQueryParam != null) {
         SessionManager.setProxyUserName(doAsQueryParam);
       }
@@ -546,14 +547,15 @@ public class ThriftHttpServlet extends TServlet {
     return authType.equalsIgnoreCase(HiveAuthFactory.AuthTypes.KERBEROS.toString());
   }
 
-  private static String getDoAsQueryParam(String queryString) {
+  private static String getDoAsQueryParam(HttpServletRequest request) {
+    String queryString = request.getQueryString();
     if (LOG.isDebugEnabled()) {
       LOG.debug("URL query string:" + queryString);
     }
     if (queryString == null) {
       return null;
     }
-    Map<String, String[]> params = jakarta.servlet.http.HttpUtils.parseQueryString( queryString );
+    Map<String, String[]> params = request.getParameterMap();
     Set<String> keySet = params.keySet();
     for (String key: keySet) {
       if (key.equalsIgnoreCase("doAs")) {

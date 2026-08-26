@@ -16,8 +16,8 @@
 #
 
 import pyspark.pandas as ps
-from pyspark.testing.pandasutils import PandasOnSparkTestCase, TestUtils
 from pyspark.pandas.window import ExponentialMoving
+from pyspark.testing.pandasutils import PandasOnSparkTestCase, TestUtils
 
 
 class EWMErrorMixin:
@@ -85,13 +85,6 @@ class EWMErrorTests(
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.window.test_ewm_error import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

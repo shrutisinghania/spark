@@ -28,7 +28,11 @@ class SourceCodeLocation:
 
 def get_caller_source_code_location(stacklevel: int) -> SourceCodeLocation:
     """
-    Returns a SourceCodeLocation object representing the location code that invokes this function.
+    Returns a SourceCodeLocation object representing the location of the code that invokes
+    this function.
+
+    When called from a decorator (e.g. ``@sdp.table`` or ``@sdp.table()``), the returned
+    line number is the line on which the decorator was applied.
 
     :param stacklevel: The number of stack frames to go up. 0 means the direct caller of this
         function, 1 means the caller of the caller, and so on.

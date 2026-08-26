@@ -14,24 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from pyspark.sql.connect.utils import check_dependencies
-
-check_dependencies(__name__)
-
-from typing import Any, Dict, Optional
 import uuid
+from typing import Any, Dict, Optional
 
+import pyspark.sql.connect.plan as plan
 from pyspark.errors import (
-    PySparkTypeError,
-    PySparkValueError,
     IllegalArgumentException,
     PySparkAssertionError,
+    PySparkTypeError,
+    PySparkValueError,
 )
 from pyspark.sql.column import Column
 from pyspark.sql.connect.dataframe import DataFrame
 from pyspark.sql.observation import Observation as PySparkObservation
-import pyspark.sql.connect.plan as plan
-
 
 __all__ = ["Observation"]
 
@@ -41,8 +36,12 @@ class Observation:
         if name is not None:
             if not isinstance(name, str):
                 raise PySparkTypeError(
-                    errorClass="NOT_STR",
-                    messageParameters={"arg_name": "name", "arg_type": type(name).__name__},
+                    errorClass="NOT_EXPECTED_TYPE",
+                    messageParameters={
+                        "arg_name": "name",
+                        "expected_type": "str",
+                        "arg_type": type(name).__name__,
+                    },
                 )
             if name == "":
                 raise PySparkValueError(
@@ -51,8 +50,13 @@ class Observation:
                 )
         self._name = name
         self._result: Optional[Dict[str, Any]] = None
+        self._error: Optional[BaseException] = None
 
     __init__.__doc__ = PySparkObservation.__init__.__doc__
+
+    def _set_error(self, exc: BaseException) -> None:
+        """Set the error that occurred while collecting observed metrics (used by the client)."""
+        self._error = exc
 
     def _on(self, df: DataFrame, *exprs: Column) -> DataFrame:
         if self._result is not None:
@@ -74,6 +78,8 @@ class Observation:
 
     @property
     def get(self) -> Dict[str, Any]:
+        if self._error is not None:
+            raise self._error
         if self._result is None:
             raise PySparkAssertionError(errorClass="NO_OBSERVE_BEFORE_GET", messageParameters={})
 
@@ -86,11 +92,12 @@ Observation.__doc__ = PySparkObservation.__doc__
 
 
 def _test() -> None:
+    import doctest
     import os
     import sys
-    import doctest
-    from pyspark.sql import SparkSession as PySparkSession
+
     import pyspark.sql.connect.observation
+    from pyspark.sql import SparkSession as PySparkSession
 
     globs = pyspark.sql.connect.observation.__dict__.copy()
     globs["spark"] = (
@@ -99,7 +106,7 @@ def _test() -> None:
         .getOrCreate()
     )
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.connect.observation,
         globs=globs,
         optionflags=doctest.ELLIPSIS

@@ -16,12 +16,47 @@
  */
 package org.apache.spark.sql.execution.streaming
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkRuntimeException}
 
 /**
  * Object for grouping error messages from streaming query exceptions
  */
 object StreamingErrors {
+  /**
+   * Error condition and subclasses for failures writing a streaming checkpoint log entry.
+   * Defined here as the single source of truth so the factory methods below and the tests that
+   * assert on them reuse the same identifiers instead of duplicating the string literals.
+   */
+  val LOG_WRITE_FAILURE_ERROR_CLASS = "STREAMING_CHECKPOINT_LOG_WRITE_FAILURE"
+  val COMMIT_LOG_WRITE_FAILURE = s"$LOG_WRITE_FAILURE_ERROR_CLASS.COMMIT_LOG"
+  val OFFSET_LOG_WRITE_FAILURE = s"$LOG_WRITE_FAILURE_ERROR_CLASS.OFFSET_LOG"
+
+  def commitLogWriteFailure(
+      batchId: Long,
+      checkpointLocation: String,
+      cause: Throwable): Throwable = {
+    new SparkException(
+      errorClass = COMMIT_LOG_WRITE_FAILURE,
+      messageParameters = Map(
+        "batchId" -> batchId.toString,
+        "checkpointLocation" -> checkpointLocation),
+      cause = cause
+    )
+  }
+
+  def offsetLogWriteFailure(
+      batchId: Long,
+      checkpointLocation: String,
+      cause: Throwable): Throwable = {
+    new SparkException(
+      errorClass = OFFSET_LOG_WRITE_FAILURE,
+      messageParameters = Map(
+        "batchId" -> batchId.toString,
+        "checkpointLocation" -> checkpointLocation),
+      cause = cause
+    )
+  }
+
   def cannotLoadCheckpointFileManagerClass(path: String, className: String, err: Throwable):
   Throwable = {
     new SparkException(
@@ -37,6 +72,26 @@ object StreamingErrors {
       errorClass = "CANNOT_LOAD_CHECKPOINT_FILE_MANAGER.UNCATEGORIZED",
       messageParameters = Map("path" -> path),
       cause = err
+    )
+  }
+
+  def statefulOperatorMissingStateDirectory(
+      opsInCurBatch: Map[Long, String]): Throwable = {
+    def formatPairString(pair: (Long, String)): String =
+      s"(OperatorId: ${pair._1} -> OperatorName: ${pair._2})"
+
+    new SparkRuntimeException(
+      errorClass = "STREAMING_STATEFUL_OPERATOR_MISSING_STATE_DIRECTORY",
+      messageParameters = Map(
+        "OpsInCurBatchSeq" -> opsInCurBatch.map(formatPairString).mkString(", ")
+      )
+    )
+  }
+
+  def missingMetadataFile(checkpointLocation: String): Throwable = {
+    new SparkRuntimeException(
+      errorClass = "STREAMING_CHECKPOINT_MISSING_METADATA_FILE",
+      messageParameters = Map("checkpointLocation" -> checkpointLocation)
     )
   }
 }

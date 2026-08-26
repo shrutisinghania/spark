@@ -15,8 +15,8 @@
 # limitations under the License.
 #
 
-from pyspark.testing.pandasutils import PandasOnSparkTestCase
 from pyspark.pandas.tests.indexes.test_datetime import DatetimeIndexTestingFuncMixin
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
 class DatetimeIndexFloorMixin(DatetimeIndexTestingFuncMixin):
@@ -36,13 +36,6 @@ class DatetimeIndexFloorTests(
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.indexes.test_datetime_floor import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

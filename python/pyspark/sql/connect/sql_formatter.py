@@ -17,14 +17,14 @@
 
 import string
 import typing
-from typing import Any, Optional, List, Tuple, Sequence, Mapping
 import uuid
+from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 from pyspark.errors import PySparkValueError
 
 if typing.TYPE_CHECKING:
-    from pyspark.sql.connect.session import SparkSession
     from pyspark.sql.connect.dataframe import DataFrame
+    from pyspark.sql.connect.session import SparkSession
 
 
 class SQLStringFormatter(string.Formatter):
@@ -39,15 +39,15 @@ class SQLStringFormatter(string.Formatter):
         self._temp_views: List[Tuple[DataFrame, str]] = []
 
     def get_field(self, field_name: str, args: Sequence[Any], kwargs: Mapping[str, Any]) -> Any:
-        obj, first = super(SQLStringFormatter, self).get_field(field_name, args, kwargs)
+        obj, first = super().get_field(field_name, args, kwargs)
         return self._convert_value(obj, field_name), first
 
     def _convert_value(self, val: Any, field_name: str) -> Optional[str]:
         """
         Converts the given value into a SQL string.
         """
-        from pyspark.sql.connect.dataframe import DataFrame
         from pyspark.sql.connect.column import Column
+        from pyspark.sql.connect.dataframe import DataFrame
         from pyspark.sql.connect.expressions import ColumnReference
         from pyspark.sql.utils import get_lit_sql_str
 

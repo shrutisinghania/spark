@@ -16,12 +16,12 @@
  */
 package org.apache.spark.sql.connect.config
 
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.sql.connect.common.config.ConnectCommon
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.buildConf
 
 object Connect {
@@ -85,6 +85,49 @@ object Connect {
       .version("3.5.0")
       .intConf
       .createWithDefault(ConnectCommon.CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT)
+
+  val CONNECT_GRPC_KEEPALIVE_ENABLED =
+    buildStaticConf("spark.connect.grpc.keepAlive.enabled")
+      .doc(
+        "Whether the server sends gRPC/HTTP2 keepalive PINGs to detect and terminate " +
+          "silently-dead client connections (see spark.connect.grpc.keepAlive.time / " +
+          ".timeout). Enabled by default; can be turned off as an escape hatch, e.g. if it " +
+          "interacts badly with a particular network path, or a server environment is prone " +
+          "to stalls (long GC pauses, etc.) long enough to trip false-positive disconnects. " +
+          "This only controls the server's own dead-client detection; the server's tolerance " +
+          "of client-initiated keepalive PINGs is " +
+          "independent and always in effect, so that a default-on client is never rejected " +
+          "with too_many_pings regardless of this setting.")
+      .version("4.3.0")
+      .booleanConf
+      .createWithDefault(ConnectCommon.CONNECT_GRPC_KEEPALIVE_ENABLED)
+
+  val CONNECT_GRPC_KEEPALIVE_TIME =
+    buildStaticConf("spark.connect.grpc.keepAlive.time")
+      .doc(
+        "Sets the time the server waits for the connection to be idle before sending a " +
+          "gRPC/HTTP2 keepalive PING, to detect and terminate a silently-dead connection " +
+          "(e.g. after a NAT gateway or load balancer drops an idle connection mapping " +
+          "without closing the socket). The server separately tolerates client-sent keepalive " +
+          "PINGs no more often than every 10s regardless of this setting. Combined with " +
+          "spark.connect.grpc.keepAlive.timeout, this bounds how long a connection can be idle " +
+          "before either side may declare it dead; a stall on either end (e.g. a long JVM GC " +
+          "pause) longer than that combined window can cause an otherwise-healthy connection " +
+          "to be dropped, so raise both values in environments prone to long GC pauses or " +
+          "other event-loop stalls.")
+      .version("4.3.0")
+      .timeConf(TimeUnit.SECONDS)
+      .createWithDefault(ConnectCommon.CONNECT_GRPC_KEEPALIVE_TIME_SECONDS)
+
+  val CONNECT_GRPC_KEEPALIVE_TIMEOUT =
+    buildStaticConf("spark.connect.grpc.keepAlive.timeout")
+      .doc(
+        "Sets how long the server waits for a keepalive PING ack before considering the " +
+          "connection dead. See spark.connect.grpc.keepAlive.time for the combined-window " +
+          "caveat about long GC pauses or other stalls.")
+      .version("4.3.0")
+      .timeConf(TimeUnit.SECONDS)
+      .createWithDefault(ConnectCommon.CONNECT_GRPC_KEEPALIVE_TIMEOUT_SECONDS)
 
   val CONNECT_SESSION_MANAGER_DEFAULT_SESSION_TIMEOUT =
     buildStaticConf("spark.connect.session.manager.defaultSessionTimeout")
@@ -217,6 +260,18 @@ object Connect {
       .toSequence
       .createWithDefault(Nil)
 
+  val CONNECT_EXTENSIONS_GET_STATUS_CLASSES =
+    buildStaticConf("spark.connect.extensions.getStatus.classes")
+      .doc("""
+             |Comma separated list of classes that implement the trait
+             |org.apache.spark.sql.connect.plugin.GetStatusPlugin to support custom
+             |GetStatus extensions in proto.
+             |""".stripMargin)
+      .version("4.1.0")
+      .stringConf
+      .toSequence
+      .createWithDefault(Nil)
+
   val CONNECT_ML_BACKEND_CLASSES =
     buildConf("spark.connect.ml.backend.classes")
       .doc("""
@@ -245,17 +300,6 @@ object Connect {
       .version("3.5.0")
       .intConf
       .createWithDefault(200)
-
-  val CONNECT_COPY_FROM_LOCAL_TO_FS_ALLOW_DEST_LOCAL =
-    buildStaticConf("spark.connect.copyFromLocalToFs.allowDestLocal")
-      .internal()
-      .doc(s"""
-             |(Deprecated since Spark 4.0, please set
-             |'${SQLConf.ARTIFACT_COPY_FROM_LOCAL_TO_FS_ALLOW_DEST_LOCAL.key}' instead.
-             |""".stripMargin)
-      .version("3.5.0")
-      .booleanConf
-      .createWithDefault(false)
 
   val CONNECT_UI_SESSION_LIMIT = buildStaticConf("spark.sql.connect.ui.retainedSessions")
     .doc("The number of client sessions kept in the Spark Connect UI history.")
@@ -328,6 +372,17 @@ object Connect {
       .booleanConf
       .createWithDefault(true)
 
+  val CONNECT_INACTIVE_OPERATIONS_CACHE_EXPIRATION_MINS =
+    buildStaticConf("spark.connect.session.inactiveOperations.cacheExpiration")
+      .doc(
+        "Expiration time for inactive operation IDs cache in Spark Connect Session." +
+          " Operations are cached after completion for a period of time to detect duplicates." +
+          " The time should allow for network late arrivals, at least several minutes.")
+      .version("4.1.0")
+      .internal()
+      .timeConf(TimeUnit.MINUTES)
+      .createWithDefault(30)
+
   val CONNECT_AUTHENTICATE_TOKEN =
     buildStaticConf("spark.connect.authenticate.token")
       .doc("A pre-shared token that will be used to authenticate clients. This secret must be" +
@@ -392,4 +447,50 @@ object Connect {
       .internal()
       .bytesConf(ByteUnit.BYTE)
       .createWithDefaultString("10g")
+
+  val CONNECT_SESSION_RESULT_CHUNKING_MAX_CHUNK_SIZE =
+    buildConf("spark.connect.session.resultChunking.maxChunkSize")
+      .doc("The max size of a chunk in responses for a result batch. Result chunking is enabled" +
+        " if this config is set to a value greater than 0 and if the client allows it in" +
+        " ResultChunkingOptions. Otherwise, for example if set to -1, this feature is disabled." +
+        " While spark.connect.grpc.arrow.maxBatchSize determines the max size of a result batch," +
+        " maxChunkSize defines the max size of each individual chunk that is part of the batch" +
+        " that will be sent in a response. This allows the server to send large rows to clients." +
+        " The size is in bytes.")
+      .version("4.1.0")
+      .internal()
+      .bytesConf(ByteUnit.BYTE)
+      // 90% of the max message size by default to allow for some overhead.
+      .createWithDefault((ConnectCommon.CONNECT_GRPC_MAX_MESSAGE_SIZE * 0.9).toInt)
+
+  private[spark] val CONNECT_MAX_PLAN_SIZE =
+    buildStaticConf("spark.connect.maxPlanSize")
+      .doc(
+        "The maximum size of a (decompressed) proto plan that can be executed in Spark " +
+          "Connect. If the size of the plan exceeds this limit, an error will be thrown. " +
+          "The size is in bytes.")
+      .version("4.1.0")
+      .internal()
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefault(512 * 1024 * 1024) // 512 MB
+
+  val CONNECT_SESSION_PLAN_COMPRESSION_THRESHOLD =
+    buildConf("spark.connect.session.planCompression.threshold")
+      .doc("The threshold in bytes for the size of proto plan to be compressed. " +
+        "If the size of proto plan is smaller than this threshold, it will not be compressed. " +
+        "Set to -1 to disable plan compression.")
+      .version("4.1.0")
+      .internal()
+      .intConf
+      .createWithDefault(10 * 1024 * 1024) // 10 MB
+
+  val CONNECT_PLAN_COMPRESSION_DEFAULT_ALGORITHM =
+    buildConf("spark.connect.session.planCompression.defaultAlgorithm")
+      .doc("The default algorithm of proto plan compression.")
+      .version("4.1.0")
+      .internal()
+      .stringConf
+      .transform(_.toUpperCase(Locale.ROOT))
+      .checkValues(ConnectPlanCompressionAlgorithm.values.map(_.toString))
+      .createWithDefault(ConnectPlanCompressionAlgorithm.ZSTD.toString)
 }

@@ -21,12 +21,19 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
 
 import org.apache.spark.internal.{Logging, LogKeys}
+import org.apache.spark.sql.{Dataset, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.classic.ClassicConversions._
 import org.apache.spark.sql.classic.SparkSession
+import org.apache.spark.sql.pipelines.autocdc.{
+  Scd1BatchProcessor,
+  Scd1ForeachBatchHandler,
+  Scd2BatchProcessor,
+  Scd2ForeachBatchHandler
+}
 import org.apache.spark.sql.pipelines.graph.QueryOrigin.ExceptionHelpers
 import org.apache.spark.sql.pipelines.util.SparkSessionUtils
 import org.apache.spark.sql.streaming.{OutputMode, StreamingQuery, Trigger}
@@ -53,7 +60,7 @@ trait FlowExecution {
   def identifier: TableIdentifier
 
   /**
-   * Returns a user-visible name for the flow.
+   * Returns the user-visible name of this flow.
    */
   final def displayName: String = identifier.unquotedString
 
@@ -98,6 +105,10 @@ trait FlowExecution {
   /** Context about this pipeline update. */
   def updateContext: PipelineUpdateContext
 
+  /** The session's `spark.sql.caseSensitive` fallback for resolving this flow. */
+  protected def sessionCaseSensitive: Boolean =
+    spark.sessionState.conf.caseSensitiveAnalysis
+
   /** The thread execution context for the current `FlowExecution`. */
   implicit val executionContext: ExecutionContext = {
     ExecutionContext.fromExecutor(FlowExecution.threadPool)
@@ -139,10 +150,6 @@ trait FlowExecution {
     _future = try {
       Option(
         executeInternal()
-          .transform {
-            case Success(_) => Success(ExecutionResult.FINISHED)
-            case Failure(e) => Failure(e)
-          }
           .map(_ => ExecutionResult.FINISHED)
           .recover {
             case _: Throwable if stopped.get() =>
@@ -191,6 +198,14 @@ trait StreamingFlowExecution extends FlowExecution with Logging {
   /** Starts a stream and returns its streaming query. */
   protected def startStream(): StreamingQuery
 
+  private var _streamingQuery: Option[StreamingQuery] = None
+
+  /** Visible for testing */
+  def getStreamingQuery: StreamingQuery =
+    _streamingQuery.getOrElse(
+      throw new IllegalStateException("StreamingPhysicalFlow has not been started")
+    )
+
   /**
    * Executes this `StreamingFlowExecution` by starting its stream with the correct scheduling pool
    * and confs.
@@ -201,6 +216,7 @@ trait StreamingFlowExecution extends FlowExecution with Logging {
       log"checkpoint location ${MDC(LogKeys.CHECKPOINT_PATH, checkpointPath)}"
     )
     val streamingQuery = SparkSessionUtils.withSqlConf(spark, sqlConf.toList: _*)(startStream())
+    _streamingQuery = Option(streamingQuery)
     Future(streamingQuery.awaitTermination())
   }
 }
@@ -220,15 +236,14 @@ class StreamingTableWrite(
   override def getOrigin: QueryOrigin = flow.origin
 
   def startStream(): StreamingQuery = {
-    val data = graph.reanalyzeFlow(flow).df
-    val dataStreamWriter = data.writeStream
+    val data = graph.reanalyzeFlow(flow, sessionCaseSensitive).df
+    val dataStreamWriter = data
+      .writeStream
       .queryName(displayName)
       .option("checkpointLocation", checkpointPath)
       .trigger(trigger)
       .outputMode(OutputMode.Append())
-    if (destination.format.isDefined) {
-      dataStreamWriter.format(destination.format.get)
-    }
+    destination.format.foreach(dataStreamWriter.format)
     dataStreamWriter.toTable(destination.identifier.unquotedString)
   }
 }
@@ -243,21 +258,148 @@ class BatchTableWrite(
     val sqlConf: Map[String, String]
 ) extends FlowExecution {
 
-  override def isStreaming: Boolean = false
+  override final def isStreaming: Boolean = false
   override def getOrigin: QueryOrigin = flow.origin
 
-  def executeInternal(): scala.concurrent.Future[Unit] =
+  def executeInternal(): Future[Unit] = {
     SparkSessionUtils.withSqlConf(spark, sqlConf.toList: _*) {
       updateContext.flowProgressEventLogger.recordRunning(flow = flow)
-      val data = graph.reanalyzeFlow(flow).df
+      val data = graph.reanalyzeFlow(flow, sessionCaseSensitive).df
       Future {
         val dataFrameWriter = data.write
-        if (destination.format.isDefined) {
-          dataFrameWriter.format(destination.format.get)
+        destination.format.foreach(dataFrameWriter.format)
+
+        // In "append" mode with saveAsTable, partition/cluster columns must be specified in query
+        // because the format and options of the existing table is used, and the table could
+        // have been created with partition columns.
+        destination.clusterCols.foreach { clusterCols =>
+          dataFrameWriter.clusterBy(clusterCols.head, clusterCols.tail: _*)
         }
+        destination.partitionCols.foreach { partitionCols =>
+          dataFrameWriter.partitionBy(partitionCols: _*)
+        }
+
         dataFrameWriter
           .mode("append")
           .saveAsTable(destination.identifier.unquotedString)
       }
     }
+  }
+}
+
+/** A `StreamingFlowExecution` that writes a streaming `DataFrame` to a `Sink`. */
+class SinkWrite(
+  val identifier: TableIdentifier,
+  val flow: ResolvedFlow,
+  val graph: DataflowGraph,
+  val updateContext: PipelineUpdateContext,
+  val checkpointPath: String,
+  val trigger: Trigger,
+  val destination: Sink,
+  val sqlConf: Map[String, String]
+) extends StreamingFlowExecution {
+
+  override def getOrigin: QueryOrigin = flow.origin
+
+  def startStream(): StreamingQuery = {
+    val data = graph.reanalyzeFlow(flow, sessionCaseSensitive).df
+    data.writeStream
+      .queryName(displayName)
+      .option("checkpointLocation", checkpointPath)
+      .trigger(trigger)
+      .outputMode(OutputMode.Append())
+      .format(destination.format)
+      .options(destination.options)
+      .start()
+  }
+}
+
+/**
+ * A [[StreamingFlowExecution]] that applies a CDC event stream to a target [[Table]] via
+ * SCD Type 1 MERGE semantics.
+ */
+class Scd1MergeStreamingWrite(
+    val identifier: TableIdentifier,
+    val flow: AutoCdcMergeFlow,
+    val graph: DataflowGraph,
+    val updateContext: PipelineUpdateContext,
+    val checkpointPath: String,
+    val trigger: Trigger,
+    val destination: Table,
+    val sqlConf: Map[String, String]
+) extends StreamingFlowExecution {
+
+  override def getOrigin: QueryOrigin = flow.origin
+
+  override def startStream(): StreamingQuery = {
+    val sourceChangeDataFeed = graph.reanalyzeFlow(flow, sessionCaseSensitive).df
+
+    // The auxiliary table is created and evolved during dataset materialization (see
+    // [[DatasetManager]]), so it already exists by the time this flow executes; resolve its
+    // identifier to hand to the foreachBatch handler.
+    val auxiliaryTableIdentifier = AutoCdcAuxiliaryTable.identifier(destination.identifier)
+
+    val foreachBatchHandler = Scd1ForeachBatchHandler(
+      batchProcessor = Scd1BatchProcessor(
+        changeArgs = flow.changeArgs,
+        resolvedSequencingType = flow.sequencingType
+      ),
+      auxiliaryTableIdentifier = auxiliaryTableIdentifier,
+      targetTableIdentifier = destination.identifier
+    )
+
+    sourceChangeDataFeed.writeStream
+      .queryName(displayName)
+      .option("checkpointLocation", checkpointPath)
+      .trigger(trigger)
+      .foreachBatch((batch: Dataset[Row], batchId: Long) => {
+        foreachBatchHandler.execute(batch, batchId)
+      })
+      .start()
+  }
+}
+
+/**
+ * A [[StreamingFlowExecution]] that applies a CDC event stream to a target [[Table]] via
+ * SCD Type 2 MERGE semantics.
+ */
+class Scd2MergeStreamingWrite(
+    val identifier: TableIdentifier,
+    val flow: AutoCdcMergeFlow,
+    val graph: DataflowGraph,
+    val updateContext: PipelineUpdateContext,
+    val checkpointPath: String,
+    val trigger: Trigger,
+    val destination: Table,
+    val sqlConf: Map[String, String]
+) extends StreamingFlowExecution {
+
+  override def getOrigin: QueryOrigin = flow.origin
+
+  override def startStream(): StreamingQuery = {
+    val sourceChangeDataFeed = graph.reanalyzeFlow(flow, sessionCaseSensitive).df
+
+    // The auxiliary table is created and evolved during dataset materialization (see
+    // [[DatasetManager]]), so it already exists by the time this flow executes; resolve its
+    // identifier to hand to the foreachBatch handler.
+    val auxiliaryTableIdentifier = AutoCdcAuxiliaryTable.identifier(destination.identifier)
+
+    val foreachBatchHandler = Scd2ForeachBatchHandler(
+      batchProcessor = Scd2BatchProcessor(
+        changeArgs = flow.changeArgs,
+        resolvedSequencingType = flow.sequencingType
+      ),
+      auxiliaryTableIdentifier = auxiliaryTableIdentifier,
+      targetTableIdentifier = destination.identifier
+    )
+
+    sourceChangeDataFeed.writeStream
+      .queryName(displayName)
+      .option("checkpointLocation", checkpointPath)
+      .trigger(trigger)
+      .foreachBatch((batch: Dataset[Row], batchId: Long) => {
+        foreachBatchHandler.execute(batch, batchId)
+      })
+      .start()
+  }
 }

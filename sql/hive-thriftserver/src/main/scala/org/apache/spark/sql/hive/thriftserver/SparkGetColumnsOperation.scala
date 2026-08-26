@@ -31,6 +31,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.hive.HiveUtils
 import org.apache.spark.sql.types._
 
 /**
@@ -125,16 +126,18 @@ private[hive] class SparkGetColumnsOperation(
   }
 
   /**
-   * For boolean, numeric and datetime types, it returns the default size of its catalyst type
+   * For boolean, numeric and datetime types, this method returns the input type's default size.
+   * For CHAR(n) and VARCHAR(n), it returns the declared character length n.
    * For struct type, when its elements are fixed-size, the summation of all element sizes will be
    * returned.
-   * For array, map, string, and binaries, the column size is variable, return null as unknown.
+   * For array, map, unbounded string, and binaries, the column size is variable; return null.
    */
   private def getColumnSize(typ: DataType): Option[Int] = typ match {
     case dt @ (BooleanType | _: NumericType | DateType | TimestampType | TimestampNTZType |
                CalendarIntervalType | NullType | _: AnsiIntervalType) =>
       Some(dt.defaultSize)
-    case CharType(n) => Some(n)
+    case c: CharType => Some(c.length)
+    case v: VarcharType => Some(v.length)
     case StructType(fields) =>
       val sizeArr = fields.map(f => getColumnSize(f.dataType))
       if (sizeArr.contains(None)) {
@@ -143,6 +146,22 @@ private[hive] class SparkGetColumnsOperation(
         Some(sizeArr.map(_.get).sum)
       }
     case other => None
+  }
+
+  /**
+   * JDBC CHAR_OCTET_LENGTH is a byte capacity. Spark CHAR/VARCHAR lengths are in
+   * characters, so report 4 * n (UTF-8 maximum bytes per character), saturating at
+   * Int.MaxValue. Unbounded STRING and non-character types stay null (not applicable).
+   */
+  private def getCharOctetLength(typ: DataType): Option[Int] = typ match {
+    case c: CharType => Some(maxUtf8OctetLength(c.length))
+    case v: VarcharType => Some(maxUtf8OctetLength(v.length))
+    case _ => None
+  }
+
+  private def maxUtf8OctetLength(numChars: Int): Int = {
+    val maxChars = Int.MaxValue / 4
+    if (numChars > maxChars) Int.MaxValue else numChars * 4
   }
 
   /**
@@ -177,8 +196,8 @@ private[hive] class SparkGetColumnsOperation(
     case FloatType => java.sql.Types.FLOAT
     case DoubleType => java.sql.Types.DOUBLE
     case _: DecimalType => java.sql.Types.DECIMAL
-    case VarcharType(_) => java.sql.Types.VARCHAR
-    case CharType(_) => java.sql.Types.CHAR
+    case _: VarcharType => java.sql.Types.VARCHAR
+    case _: CharType => java.sql.Types.CHAR
     case _: StringType => java.sql.Types.VARCHAR
     case BinaryType => java.sql.Types.BINARY
     case DateType => java.sql.Types.DATE
@@ -200,8 +219,13 @@ private[hive] class SparkGetColumnsOperation(
     schema.zipWithIndex.foreach { case (column, pos) =>
       if (columnPattern != null && !columnPattern.matcher(column.name).matches()) {
       } else {
+        val ordinal = if (session.conf.get(HiveUtils.LEGACY_STS_ZERO_BASED_COLUMN_ORDINAL)) {
+          pos
+        } else {
+          pos + 1
+        }
         val rowData = Array[AnyRef](
-          null, // TABLE_CAT
+          sessionCatalogTableCat(null), // TABLE_CAT
           dbName, // TABLE_SCHEM
           tableName, // TABLE_NAME
           column.name, // COLUMN_NAME
@@ -216,9 +240,9 @@ private[hive] class SparkGetColumnsOperation(
           null, // COLUMN_DEF
           null, // SQL_DATA_TYPE
           null, // SQL_DATETIME_SUB
-          null, // CHAR_OCTET_LENGTH
-          pos.asInstanceOf[AnyRef], // ORDINAL_POSITION
-          "YES", // IS_NULLABLE
+          getCharOctetLength(column.dataType).map(_.asInstanceOf[AnyRef]).orNull,
+          ordinal.asInstanceOf[AnyRef], // ORDINAL_POSITION, 1-based
+          (if (column.nullable) "YES" else "NO"), // IS_NULLABLE
           null, // SCOPE_CATALOG
           null, // SCOPE_SCHEMA
           null, // SCOPE_TABLE

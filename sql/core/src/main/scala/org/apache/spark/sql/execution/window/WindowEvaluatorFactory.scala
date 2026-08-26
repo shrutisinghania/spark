@@ -30,8 +30,14 @@ class WindowEvaluatorFactory(
     val partitionSpec: Seq[Expression],
     val orderSpec: Seq[SortOrder],
     val childOutput: Seq[Attribute],
-    val spillSize: SQLMetric)
+    val spillSize: SQLMetric,
+    segmentTreeFrames: SQLMetric,
+    segmentTreeFallbackFrames: SQLMetric)
   extends PartitionEvaluatorFactory[InternalRow, InternalRow] with WindowEvaluatorFactoryBase {
+
+  override def numSegmentTreeFrames: Option[SQLMetric] = Some(segmentTreeFrames)
+  override def numSegmentTreeFallbackFrames: Option[SQLMetric] =
+    Some(segmentTreeFallbackFrames)
 
   override def createEvaluator(): PartitionEvaluator[InternalRow, InternalRow] = {
     new WindowPartitionEvaluator()
@@ -45,7 +51,7 @@ class WindowEvaluatorFactory(
     private val factories = windowFrameExpressionFactoryPairs.map(_._2).toArray
     private val inMemoryThreshold = conf.windowExecBufferInMemoryThreshold
     private val spillThreshold = conf.windowExecBufferSpillThreshold
-    private val spillSizeThreshold = conf.windowExecBufferSpillSizeThreshold
+    private val sizeInBytesSpillThreshold = conf.windowExecBufferSpillSizeThreshold
 
     override def eval(
         partitionIndex: Int,
@@ -83,8 +89,13 @@ class WindowEvaluatorFactory(
 
         // Manage the current partition.
         val buffer: ExternalAppendOnlyUnsafeRowArray =
-          new ExternalAppendOnlyUnsafeRowArray(inMemoryThreshold, spillThreshold,
-            spillSizeThreshold)
+          new ExternalAppendOnlyUnsafeRowArray(
+            inMemoryThreshold,
+            // TODO: shall we have a new config to specify the max in-memory buffer size
+            //       of ExternalAppendOnlyUnsafeRowArray?
+            sizeInBytesSpillThreshold,
+            spillThreshold,
+            sizeInBytesSpillThreshold)
 
         var bufferIterator: Iterator[UnsafeRow] = _
 

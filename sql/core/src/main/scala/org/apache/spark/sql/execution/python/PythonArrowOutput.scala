@@ -25,7 +25,7 @@ import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.ipc.ArrowStreamReader
 
 import org.apache.spark.{SparkEnv, TaskContext}
-import org.apache.spark.api.python.{BasePythonRunner, PythonWorker, SpecialLengths}
+import org.apache.spark.api.python.{BasePythonRunner, PythonWorker, PythonWorkerHandle, SpecialLengths}
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
@@ -59,12 +59,12 @@ private[python] trait PythonArrowOutput[OUT <: AnyRef] { self: BasePythonRunner[
       startTime: Long,
       env: SparkEnv,
       worker: PythonWorker,
-      pid: Option[Int],
+      handle: Option[PythonWorkerHandle],
       releasedOrClosed: AtomicBoolean,
       context: TaskContext): Iterator[OUT] = {
 
     new ReaderIterator(
-      stream, writer, startTime, env, worker, pid, releasedOrClosed, context) {
+      stream, writer, startTime, env, worker, handle, releasedOrClosed, context) {
 
       private val allocator = ArrowUtils.rootAllocator.newChildAllocator(
         s"stdin reader for $pythonExec", 0, Long.MaxValue)
@@ -75,6 +75,9 @@ private[python] trait PythonArrowOutput[OUT <: AnyRef] { self: BasePythonRunner[
       private var processor: ArrowOutputProcessor = _
 
       context.addTaskCompletionListener[Unit] { _ =>
+        if (processor != null) {
+          processor.close()
+        }
         if (reader != null) {
           reader.close(false)
         }
@@ -88,6 +91,14 @@ private[python] trait PythonArrowOutput[OUT <: AnyRef] { self: BasePythonRunner[
         super.handleEndOfDataSection()
       }
 
+      protected override def handleTimingData(): Unit = {
+        // Get data size from pythonMetrics which is already being tracked
+        totalDataReceived = pythonMetrics.get("pythonDataReceived")
+          .map(_.value)
+          .getOrElse(0L)
+        super.handleTimingData()
+      }
+
       protected override def read(): OUT = {
         if (writer.exception.isDefined) {
           throw writer.exception.get
@@ -96,6 +107,7 @@ private[python] trait PythonArrowOutput[OUT <: AnyRef] { self: BasePythonRunner[
           if (reader != null && batchLoaded) {
             batchLoaded = processor.loadBatch()
             if (batchLoaded) {
+              batchesProcessed += 1
               val batch = processor.produceBatch()
               deserializeColumnarBatch(batch, schema)
             } else {
@@ -241,6 +253,7 @@ abstract class BaseSliceArrowOutputProcessor(
       prevVectors.foreach(_.close())
       prevRoot.close()
     }
+    super.close()
   }
 }
 
@@ -284,8 +297,8 @@ class SliceBytesArrowOutputProcessorImpl(
     }
   }
 
-  private def getBatchBytes(root: VectorSchemaRoot): Int = {
-    var batchBytes = 0
+  private def getBatchBytes(root: VectorSchemaRoot): Long = {
+    var batchBytes = 0L
     root.getFieldVectors.asScala.foreach { vector =>
       batchBytes += vector.getBufferSize
     }

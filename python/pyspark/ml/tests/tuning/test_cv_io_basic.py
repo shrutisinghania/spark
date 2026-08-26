@@ -16,11 +16,11 @@
 #
 
 import tempfile
-import unittest
 
 from pyspark.ml.classification import LogisticRegression, LogisticRegressionModel
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.linalg import Vectors
+from pyspark.ml.tests.tuning.test_tuning import ValidatorTestUtilsMixin
 from pyspark.ml.tuning import (
     CrossValidator,
     CrossValidatorModel,
@@ -32,7 +32,6 @@ from pyspark.testing.mlutils import (
     DummyLogisticRegressionModel,
     SparkSessionTestCase,
 )
-from pyspark.ml.tests.tuning.test_tuning import ValidatorTestUtilsMixin
 
 
 class CrossValidatorIOBasicTests(SparkSessionTestCase, ValidatorTestUtilsMixin):
@@ -140,12 +139,6 @@ class CrossValidatorIOBasicTests(SparkSessionTestCase, ValidatorTestUtilsMixin):
 
 
 if __name__ == "__main__":
-    from pyspark.ml.tests.tuning.test_cv_io_basic import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

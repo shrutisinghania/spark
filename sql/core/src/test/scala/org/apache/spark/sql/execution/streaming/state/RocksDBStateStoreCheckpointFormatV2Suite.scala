@@ -34,7 +34,7 @@ import org.apache.spark.sql.execution.streaming.state.StateStoreTestsHelper
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming._
-import org.apache.spark.sql.streaming.OutputMode.Update
+import org.apache.spark.sql.streaming.OutputMode.{Append, Update}
 import org.apache.spark.sql.test.TestSparkSession
 import org.apache.spark.sql.types.StructType
 
@@ -68,6 +68,12 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
       key: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): UnsafeRow = {
     innerStore.get(key, colFamilyName)
+  }
+
+  override def keyExists(
+      key: UnsafeRow,
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Boolean = {
+    innerStore.keyExists(key, colFamilyName)
   }
 
   override def valuesIterator(
@@ -116,11 +122,20 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     )
   }
 
+  override def allColumnFamilyNames: Set[String] = innerStore.allColumnFamilyNames
+
   override def put(
       key: UnsafeRow,
       value: UnsafeRow,
       colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit = {
     innerStore.put(key, value, colFamilyName)
+  }
+
+  override def putList(
+      key: UnsafeRow,
+      values: Array[UnsafeRow],
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit = {
+    innerStore.putList(key, values, colFamilyName)
   }
 
   override def remove(
@@ -136,6 +151,13 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     innerStore.merge(key, value, colFamilyName)
   }
 
+  override def mergeList(
+      key: UnsafeRow,
+      values: Array[UnsafeRow],
+      colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit = {
+    innerStore.mergeList(key, values, colFamilyName)
+  }
+
   override def commit(): Long = innerStore.commit()
   override def metrics: StateStoreMetrics = innerStore.metrics
   override def getStateStoreCheckpointInfo(): StateStoreCheckpointInfo = {
@@ -144,6 +166,30 @@ case class CkptIdCollectingStateStoreWrapper(innerStore: StateStore) extends Sta
     ret
   }
   override def hasCommitted: Boolean = innerStore.hasCommitted
+
+  override def prefixScanWithMultiValues(
+      prefixKey: UnsafeRow, colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    innerStore.prefixScanWithMultiValues(prefixKey, colFamilyName)
+  }
+
+  override def rangeScan(
+      startKey: Option[UnsafeRow],
+      endKey: Option[UnsafeRow],
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    innerStore.rangeScan(startKey, endKey, colFamilyName)
+  }
+
+  override def rangeScanWithMultiValues(
+      startKey: Option[UnsafeRow],
+      endKey: Option[UnsafeRow],
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    innerStore.rangeScanWithMultiValues(startKey, endKey, colFamilyName)
+  }
+
+  override def iteratorWithMultiValues(
+      colFamilyName: String): StateStoreIterator[UnsafeRowPair] = {
+    innerStore.iteratorWithMultiValues(colFamilyName)
+  }
 }
 
 class CkptIdCollectingStateStoreProviderWrapper extends StateStoreProvider {
@@ -177,8 +223,13 @@ class CkptIdCollectingStateStoreProviderWrapper extends StateStoreProvider {
 
   override def close(): Unit = innerProvider.close()
 
-  override def getStore(version: Long, stateStoreCkptId: Option[String] = None): StateStore = {
-    val innerStateStore = innerProvider.getStore(version, stateStoreCkptId)
+  override def getStore(
+      version: Long,
+      stateStoreCkptId: Option[String] = None,
+      forceSnapshotOnCommit: Boolean = false,
+      loadEmpty: Boolean = false): StateStore = {
+    val innerStateStore = innerProvider.getStore(version, stateStoreCkptId,
+      forceSnapshotOnCommit, loadEmpty)
     CkptIdCollectingStateStoreWrapper(innerStateStore)
   }
 
@@ -191,7 +242,8 @@ class CkptIdCollectingStateStoreProviderWrapper extends StateStoreProvider {
   override def upgradeReadStoreToWriteStore(
       readStore: ReadStateStore,
       version: Long,
-      uniqueId: Option[String] = None): StateStore = {
+      uniqueId: Option[String] = None,
+      forceSnapshotOnCommit: Boolean = false): StateStore = {
     // Following the pattern from RocksDBStateStoreProvider, we verify version and id match
     assert(version == readStore.version,
       s"Can only upgrade readStore to writeStore with the same version," +
@@ -210,7 +262,7 @@ class CkptIdCollectingStateStoreProviderWrapper extends StateStoreProvider {
 
     // Delegate to inner provider to upgrade the store
     val upgradedStore = innerProvider.upgradeReadStoreToWriteStore(
-      innerReadStore, version, uniqueId)
+      innerReadStore, version, uniqueId, forceSnapshotOnCommit)
 
     // Wrap the upgraded store with CkptIdCollectingStateStoreWrapper
     CkptIdCollectingStateStoreWrapper(upgradedStore)
@@ -606,6 +658,29 @@ class RocksDBStateStoreCheckpointFormatV2Suite extends StreamTest
     assert(checkpointInfoList.count(_.partitionId == 1) == numBatches * numStateStores)
     for (i <- 1 to numBatches) {
       assert(checkpointInfoList.count(_.batchVersion == i) == numStateStores * 2)
+    }
+    validateBaseCheckpointInfo()
+  }
+
+  def validateCheckpointInfoGlobalLimit(
+      numBatches: Int,
+      numStateStores: Int,
+      batchVersionSet: Set[Long]): Unit = {
+    val checkpointInfoList = CkptIdCollectingStateStoreWrapper.getStateStoreCheckpointInfos
+    // We have 6 batches, 1 partitions (since global limit), and 1 state store per batch
+    assert(checkpointInfoList.size == numBatches * numStateStores * 1)
+    checkpointInfoList.foreach { l =>
+      assert(l.stateStoreCkptId.isDefined)
+      if (batchVersionSet.contains(l.batchVersion)) {
+        assert(l.baseStateStoreCkptId.isDefined)
+      }
+    }
+    assert(checkpointInfoList.count(_.partitionId == 0) == numBatches * numStateStores)
+    // Since we use global limit, there should be no partition 1
+    assert(checkpointInfoList.count(_.partitionId == 1) == 0)
+    for (i <- 1 to numBatches) {
+      // Since we use global limit, there should be only one store per batch
+      assert(checkpointInfoList.count(_.batchVersion == i) == numStateStores * 1)
     }
     validateBaseCheckpointInfo()
   }
@@ -1172,6 +1247,54 @@ class RocksDBStateStoreCheckpointFormatV2Suite extends StreamTest
     validateCheckpointInfo(6, 1, Set(2, 4, 6))
   }
 
+
+  // No matter the number of shuffle partitions, global limit should always use one partition
+  Seq(1, 2, 10, 200).foreach { shufflePartitions =>
+    testWithCheckpointInfoTracked(
+      s"checkpointFormatVersion2 validate StreamingGlobalLimit with " +
+      s"shufflePartitions = $shufflePartitions") {
+      withTempDir { checkpointDir =>
+        withSQLConf((SQLConf.SHUFFLE_PARTITIONS.key, shufflePartitions.toString)) {
+          val inputData = MemoryStream[Int]
+          val aggregated = inputData
+            .toDF()
+            .limit(10)
+
+          testStream(aggregated, Append)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+            AddData(inputData, 3),
+            CheckLastBatch(3),
+            AddData(inputData, 3, 2),
+            CheckLastBatch(3, 2),
+            StopStream
+          )
+
+          // Test recovery
+          testStream(aggregated, Append)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+            AddData(inputData, 4, 1, 3),
+            CheckLastBatch(4, 1, 3),
+            AddData(inputData, 5, 4, 4),
+            CheckLastBatch(5, 4, 4),
+            StopStream
+          )
+
+          // crash recovery again
+          testStream(aggregated, Append)(
+            StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+            AddData(inputData, 4, 7),
+            CheckLastBatch(4),
+            AddData(inputData, 5),
+            CheckLastBatch(),
+            StopStream
+          )
+
+          validateCheckpointInfoGlobalLimit(6, 1, Set(2, 3, 4, 5, 6))
+        }
+      }
+    }
+  }
+
   test("checkpointFormatVersion2 validate transformWithState") {
     withTempDir { checkpointDir =>
       val inputData = MemoryStream[String]
@@ -1201,6 +1324,148 @@ class RocksDBStateStoreCheckpointFormatV2Suite extends StreamTest
         CheckNewAnswer(("a", "1"), ("c", "1"))
       )
     }
+  }
+
+  testWithCheckpointInfoTracked(
+    s"checkpointFormatVersion2 validate baseStateStoreCkptId matches driver's sent ID") {
+    withTempDir { checkpointDir =>
+      val inputData = MemoryStream[Int]
+      val aggregated =
+        inputData
+          .toDF()
+          .groupBy($"value")
+          .agg(count("*"))
+          .as[(Int, Long)]
+
+      testStream(aggregated, Update)(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+        AddData(inputData, 3),
+        CheckLastBatch((3, 1)),
+        AddData(inputData, 3, 2),
+        CheckLastBatch((3, 2), (2, 1)),
+        AddData(inputData, 3, 2, 1),
+        CheckLastBatch((3, 3), (2, 2), (1, 1)),
+        StopStream
+      )
+
+      val checkpointInfoList = CkptIdCollectingStateStoreWrapper.getStateStoreCheckpointInfos
+
+      // Read the commit log to get the checkpoint IDs the driver persisted
+      val commitLogPath = new Path(
+        new Path(checkpointDir.getAbsolutePath), "commits").toString
+      val commitLog = new CommitLog(spark, commitLogPath)
+
+      // Verify that the executor-reported baseStateStoreCkptId for batch N+1 matches
+      // the stateStoreCkptId the driver stored in the commit log for batch N
+      val pickedInfos = pickCheckpointInfoFromCommitLog(checkpointDir, checkpointInfoList)
+      assert(pickedInfos.isDefined, "No lineage information matches with commit log")
+
+      // For each batch after the first, verify the baseStateStoreCkptId matches
+      // the commit log's checkpoint ID for the previous batch
+      val infoByBatch = pickedInfos.get.groupBy(_.batchVersion)
+      for (batchVersion <- 2 to 3) {
+        val prevBatchId = batchVersion - 2 // commit log uses batchId = batchVersion - 1
+        val prevCommitMetadata = commitLog.get(Some(prevBatchId), Some(prevBatchId)).head._2
+        val prevCkptIds = prevCommitMetadata.stateUniqueIds.get(0L)
+
+        infoByBatch(batchVersion).foreach { info =>
+          val expectedBaseId = prevCkptIds(info.partitionId)(0)
+          assert(info.baseStateStoreCkptId.isDefined,
+            s"baseStateStoreCkptId should be defined for batch $batchVersion, " +
+              s"partition ${info.partitionId}")
+          assert(info.baseStateStoreCkptId.get == expectedBaseId,
+            s"baseStateStoreCkptId mismatch for batch $batchVersion, " +
+              s"partition ${info.partitionId}: " +
+              s"expected $expectedBaseId, got ${info.baseStateStoreCkptId.get}")
+        }
+      }
+    }
+  }
+
+  testWithCheckpointInfoTracked(
+    s"checkpointFormatVersion2 validate baseStateStoreCkptId across stream restart") {
+    withTempDir { checkpointDir =>
+      val inputData = MemoryStream[Int]
+      val aggregated =
+        inputData
+          .toDF()
+          .groupBy($"value")
+          .agg(count("*"))
+          .as[(Int, Long)]
+
+      // First run: 2 batches
+      testStream(aggregated, Update)(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+        AddData(inputData, 3),
+        CheckLastBatch((3, 1)),
+        AddData(inputData, 3, 2),
+        CheckLastBatch((3, 2), (2, 1)),
+        StopStream
+      )
+
+      CkptIdCollectingStateStoreWrapper.clear()
+
+      // Second run: restart from commit log, then run 2 more batches.
+      // This exercises the populateStartOffsets -> commit log recovery path
+      // for currentStateStoreCkptId, then validates the executor's
+      // baseStateStoreCkptId matches across the restart boundary.
+      testStream(aggregated, Update)(
+        StartStream(checkpointLocation = checkpointDir.getAbsolutePath),
+        AddData(inputData, 3, 2, 1),
+        CheckLastBatch((3, 3), (2, 2), (1, 1)),
+        AddData(inputData, 10),
+        CheckLastBatch((10, 1)),
+        StopStream
+      )
+
+      val checkpointInfoList = CkptIdCollectingStateStoreWrapper.getStateStoreCheckpointInfos
+
+      // Read the commit log to get the IDs the driver persisted before the restart
+      val commitLogPath = new Path(
+        new Path(checkpointDir.getAbsolutePath), "commits").toString
+      val commitLog = new CommitLog(spark, commitLogPath)
+
+      // Batch version 3 is the first batch after restart.
+      // Its baseStateStoreCkptId should match the commit log entry for batchId 1
+      // (which is state version 2, written before the restart).
+      val prevCommitMetadata = commitLog.get(Some(1), Some(1)).head._2
+      val prevCkptIds = prevCommitMetadata.stateUniqueIds.get(0L)
+
+      // Get the batch version 3 infos directly from collected checkpoint infos.
+      // With speculative execution, there may be multiple entries per partition;
+      // all should have a valid baseStateStoreCkptId matching the commit log.
+      val batch3Infos = checkpointInfoList.filter(_.batchVersion == 3)
+      assert(batch3Infos.nonEmpty, "Should have checkpoint info for batch version 3")
+
+      batch3Infos.foreach { info =>
+        val expectedBaseId = prevCkptIds(info.partitionId)(0)
+        assert(info.baseStateStoreCkptId.isDefined,
+          s"baseStateStoreCkptId should be defined for first batch after restart, " +
+            s"partition ${info.partitionId}")
+        assert(info.baseStateStoreCkptId.get == expectedBaseId,
+          s"baseStateStoreCkptId mismatch after restart for " +
+            s"partition ${info.partitionId}: " +
+            s"expected $expectedBaseId, got ${info.baseStateStoreCkptId.get}")
+      }
+    }
+  }
+
+  test("StateStoreBaseCheckpointIdMismatch error has correct error class and message") {
+    val exception = StateStoreErrors.stateStoreBaseCheckpointIdMismatch(
+      batchVersion = 5L,
+      partitionId = 2,
+      operatorId = 0L,
+      expectedBaseId = "[abc-123]",
+      actualBaseId = "[xyz-789]"
+    )
+    assert(exception.isInstanceOf[StateStoreBaseCheckpointIdMismatch])
+    assert(exception.getCondition === "STATE_STORE_BASE_CHECKPOINT_ID_MISMATCH")
+    val message = exception.getMessage
+    assert(message.contains("batch 5"))
+    assert(message.contains("partition 2"))
+    assert(message.contains("operator 0"))
+    assert(message.contains("[abc-123]"))
+    assert(message.contains("[xyz-789]"))
   }
 
   test("checkpointFormatVersion2 racing commits don't return incorrect checkpointInfo") {
@@ -1233,3 +1498,10 @@ class RocksDBStateStoreCheckpointFormatV2Suite extends StreamTest
     }
   }
 }
+
+/**
+ * Test suite that runs all RocksDBStateStoreCheckpointFormatV2Suite tests
+ * with row checksum enabled.
+ */
+class RocksDBStateStoreCheckpointFormatV2SuiteWithRowChecksum
+  extends RocksDBStateStoreCheckpointFormatV2Suite with EnableStateStoreRowChecksum

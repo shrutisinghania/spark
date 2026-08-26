@@ -17,11 +17,11 @@
 
 import unittest
 
-from pyspark.util import is_remote_only
 from pyspark.sql import SparkSession as PySparkSession
 from pyspark.testing.connectutils import ReusedMixedTestCase
 from pyspark.testing.pandasutils import PandasOnSparkTestUtils
 from pyspark.testing.utils import eventually
+from pyspark.util import is_remote_only
 
 
 @unittest.skipIf(is_remote_only(), "Requires JVM access")
@@ -72,7 +72,7 @@ class SparkConnectReattachTestCase(ReusedMixedTestCase, PandasOnSparkTestUtils):
         def check_error(q):
             try:
                 list(q)  # Iterate all.
-            except Exception as e:  # noqa: F841
+            except Exception as e:
                 return e
 
         e = check_error(query1)
@@ -89,12 +89,6 @@ class SparkConnectReattachTestCase(ReusedMixedTestCase, PandasOnSparkTestUtils):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.client.test_reattach import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

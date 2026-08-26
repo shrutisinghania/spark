@@ -27,10 +27,12 @@ from typing import (
 
 from pyspark.errors import PySparkTypeError
 from pyspark.sql.column import Column
-from pyspark.sql.functions.builtin import _invoke_function_over_columns, _invoke_function
+from pyspark.sql.functions.builtin import _invoke_function, _invoke_function_over_columns
+from pyspark.sql.utils import (
+    get_active_spark_context as _get_active_spark_context,
+)
 from pyspark.sql.utils import (
     try_partitioning_remote_functions as _try_partitioning_remote_functions,
-    get_active_spark_context as _get_active_spark_context,
 )
 
 if TYPE_CHECKING:
@@ -206,12 +208,13 @@ def bucket(numBuckets: Union[Column, int], col: "ColumnOrName") -> Column:
     method of the `DataFrameWriterV2`.
 
     """
-    from pyspark.sql.classic.column import _to_java_column, _create_column_from_literal
+    from pyspark.sql.classic.column import _create_column_from_literal, _to_java_column
 
     if not isinstance(numBuckets, (int, Column)):
         raise PySparkTypeError(
-            errorClass="NOT_COLUMN_OR_INT",
+            errorClass="NOT_EXPECTED_TYPE",
             messageParameters={
+                "expected_type": "Column or int",
                 "arg_name": "numBuckets",
                 "arg_type": type(numBuckets).__name__,
             },
@@ -228,8 +231,9 @@ def bucket(numBuckets: Union[Column, int], col: "ColumnOrName") -> Column:
 
 def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.sql.functions.partitioning
+    from pyspark.sql import SparkSession
 
     globs = pyspark.sql.functions.partitioning.__dict__.copy()
     spark = (
@@ -238,7 +242,7 @@ def _test() -> None:
         .getOrCreate()
     )
     globs["spark"] = spark
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.functions.partitioning,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

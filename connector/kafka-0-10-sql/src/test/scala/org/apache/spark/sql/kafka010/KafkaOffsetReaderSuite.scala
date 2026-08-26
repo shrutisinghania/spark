@@ -22,18 +22,20 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 import org.apache.kafka.clients.CommonClientConfigs
+import org.apache.kafka.clients.admin.Admin
 import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.{IsolationLevel, TopicPartition}
+import org.mockito.ArgumentMatchers.any
+import org.mockito.Mockito.{mock, times, verify, when}
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.kafka010.KafkaOffsetRangeLimit.{EARLIEST, LATEST}
 import org.apache.spark.sql.kafka010.KafkaSourceProvider.StrategyOnNoMatchStartingOffset
 import org.apache.spark.sql.test.SharedSparkSession
 
-class KafkaOffsetReaderSuite extends QueryTest with SharedSparkSession with KafkaTest {
+class KafkaOffsetReaderSuite extends SharedSparkSession with KafkaTest {
 
   protected var testUtils: KafkaTestUtils = _
 
@@ -261,6 +263,150 @@ class KafkaOffsetReaderSuite extends QueryTest with SharedSparkSession with Kafk
       withSQLConf(SQLConf.USE_DEPRECATED_KAFKA_OFFSET_FETCHING.key -> useDeprecatedOffsetFetching) {
         func
       }
+    }
+  }
+
+  private def createReaderWithMockedStrategy(
+      mockStrategy: ConsumerStrategy): KafkaOffsetReaderAdmin = {
+    new KafkaOffsetReaderAdmin(
+      mockStrategy,
+      KafkaSourceProvider.kafkaParamsForDriver(Map(
+        "bootstrap.servers" -> testUtils.brokerAddress
+      )),
+      CaseInsensitiveMap(Map(
+        KafkaSourceProvider.FETCH_OFFSET_NUM_RETRY -> "3",
+        KafkaSourceProvider.FETCH_OFFSET_RETRY_INTERVAL_MS -> "0"
+      )),
+      ""
+    )
+  }
+
+  test("SPARK-55561: fetchPartitionOffsets retries on transient failures") {
+    val tp0 = new TopicPartition("topic", 0)
+    val tp1 = new TopicPartition("topic", 1)
+    val expectedPartitions = Set(tp0, tp1)
+
+    val mockStrategy = mock(classOf[ConsumerStrategy])
+    val mockAdmin = mock(classOf[Admin])
+    when(mockStrategy.createAdmin(any())).thenReturn(mockAdmin)
+    when(mockStrategy.assignedTopicPartitions(any()))
+      .thenThrow(new RuntimeException("Transient error"))
+      .thenThrow(new RuntimeException("Transient error"))
+      .thenReturn(expectedPartitions)
+
+    val reader = createReaderWithMockedStrategy(mockStrategy)
+    try {
+      val result = reader.fetchPartitionOffsets(
+        EarliestOffsetRangeLimit, isStartingOffsets = true)
+      assert(result === expectedPartitions.map(tp => tp -> KafkaOffsetRangeLimit.EARLIEST).toMap)
+      verify(mockStrategy, times(3)).assignedTopicPartitions(any())
+    } finally {
+      reader.close()
+    }
+  }
+
+  test("SPARK-55561: fetchPartitionOffsets throws after all retries exhausted") {
+    val mockStrategy = mock(classOf[ConsumerStrategy])
+    val mockAdmin = mock(classOf[Admin])
+    when(mockStrategy.createAdmin(any())).thenReturn(mockAdmin)
+    when(mockStrategy.assignedTopicPartitions(any()))
+      .thenThrow(new RuntimeException("Persistent error"))
+
+    val reader = createReaderWithMockedStrategy(mockStrategy)
+    try {
+      val ex = intercept[RuntimeException] {
+        reader.fetchPartitionOffsets(EarliestOffsetRangeLimit, isStartingOffsets = true)
+      }
+      assert(ex.getMessage === "Persistent error")
+      verify(mockStrategy, times(3)).assignedTopicPartitions(any())
+    } finally {
+      reader.close()
+    }
+  }
+
+  // SPARK-49442: When partition.metadata.cache.ttl.ms is set, repeated fetchLatestOffsets
+  // calls within the TTL window must reuse the cached partition set and issue only one
+  // DescribeTopics RPC to the broker, regardless of how many micro-batches run.
+  test("SPARK-49442: partition.metadata.cache.ttl.ms suppresses redundant " +
+      "DescribeTopics RPCs within the TTL window") {
+    val topic = newTopic()
+    testUtils.createTopic(topic, partitions = 3)
+
+    val ttlMs = 300000 // 5 minutes
+    val describeCount = new AtomicInteger(0)
+    val countingStrategy = new SubscribeStrategy(Seq(topic)) {
+      override def assignedTopicPartitions(admin: Admin): Set[TopicPartition] = {
+        describeCount.incrementAndGet()
+        super.assignedTopicPartitions(admin)
+      }
+    }
+
+    val reader = new KafkaOffsetReaderAdmin(
+      countingStrategy,
+      KafkaSourceProvider.kafkaParamsForDriver(Map(
+        "bootstrap.servers" -> testUtils.brokerAddress
+      )),
+      CaseInsensitiveMap(Map(
+        KafkaSourceProvider.PARTITION_METADATA_CACHE_TTL_MS -> ttlMs.toString
+      )),
+      ""
+    )
+
+    try {
+      val numBatches = 5
+      for (_ <- 1 to numBatches) {
+        reader.fetchLatestOffsets(None)
+      }
+      // All 5 fetches fall within the TTL window, so the partition set is resolved only once.
+      assert(describeCount.get() === 1,
+        s"Expected 1 DescribeTopics call but got ${describeCount.get()}")
+    } finally {
+      reader.close()
+    }
+  }
+
+  test("SPARK-49442: partition.metadata.cache.ttl.ms refreshes after TTL expires") {
+    val topic = newTopic()
+    testUtils.createTopic(topic, partitions = 3)
+
+    val ttlMs = 2000 // large enough to not expire during two sequential fetches
+    val describeCount = new AtomicInteger(0)
+    val countingStrategy = new SubscribeStrategy(Seq(topic)) {
+      override def assignedTopicPartitions(admin: Admin): Set[TopicPartition] = {
+        describeCount.incrementAndGet()
+        super.assignedTopicPartitions(admin)
+      }
+    }
+
+    val reader = new KafkaOffsetReaderAdmin(
+      countingStrategy,
+      KafkaSourceProvider.kafkaParamsForDriver(Map(
+        "bootstrap.servers" -> testUtils.brokerAddress
+      )),
+      CaseInsensitiveMap(Map(
+        KafkaSourceProvider.PARTITION_METADATA_CACHE_TTL_MS -> ttlMs.toString
+      )),
+      ""
+    )
+
+    try {
+      // First fetch populates the cache (1 RPC).
+      reader.fetchLatestOffsets(None)
+      assert(describeCount.get() === 1)
+
+      // Fetches within the TTL reuse the cache (still 1 RPC).
+      reader.fetchLatestOffsets(None)
+      assert(describeCount.get() === 1)
+
+      // Sleep past the TTL so the next fetch must refresh.
+      Thread.sleep(ttlMs + 50)
+
+      // Cache has expired: one more RPC expected.
+      reader.fetchLatestOffsets(None)
+      assert(describeCount.get() === 2,
+        s"Expected 2 DescribeTopics calls after TTL expiry but got ${describeCount.get()}")
+    } finally {
+      reader.close()
     }
   }
 }

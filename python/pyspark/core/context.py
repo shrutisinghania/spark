@@ -15,21 +15,21 @@
 # limitations under the License.
 #
 
-import uuid
+import importlib
 import os
 import shutil
 import signal
 import sys
 import threading
+import uuid
 import warnings
-import importlib
-from threading import RLock
 from tempfile import NamedTemporaryFile
+from threading import RLock
 from types import TracebackType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
-    cast,
     ClassVar,
     Dict,
     Iterable,
@@ -37,42 +37,42 @@ from typing import (
     NoReturn,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Type,
-    TYPE_CHECKING,
     TypeVar,
-    Set,
+    cast,
 )
 
 from py4j.java_collections import JavaMap
+from py4j.java_gateway import JavaGateway, JavaObject, JVMView, is_instance_of
 from py4j.protocol import Py4JError
 
 from pyspark import accumulators
-from pyspark.conf import SparkConf
 from pyspark.accumulators import Accumulator
+from pyspark.conf import SparkConf
 from pyspark.core.broadcast import Broadcast, BroadcastPickleRegistry
 from pyspark.core.files import SparkFiles
+from pyspark.core.rdd import RDD
+from pyspark.core.status import StatusTracker
+from pyspark.errors import PySparkRuntimeError
 from pyspark.java_gateway import launch_gateway
+from pyspark.profiler import BasicProfiler, MemoryProfiler, ProfilerCollector, UDFBasicProfiler
+from pyspark.resource.information import ResourceInformation
 from pyspark.serializers import (
-    CPickleSerializer,
+    AutoBatchedSerializer,
     BatchedSerializer,
+    ChunkedStream,
+    CPickleSerializer,
+    NoOpSerializer,
+    PairDeserializer,
     Serializer,
     UTF8Deserializer,
-    PairDeserializer,
-    AutoBatchedSerializer,
-    NoOpSerializer,
-    ChunkedStream,
 )
 from pyspark.storagelevel import StorageLevel
-from pyspark.resource.information import ResourceInformation
-from pyspark.core.rdd import RDD
-from pyspark.util import _load_from_socket, local_connect_and_auth
 from pyspark.taskcontext import TaskContext
 from pyspark.traceback_utils import CallSite, first_spark_call
-from pyspark.core.status import StatusTracker
-from pyspark.profiler import ProfilerCollector, BasicProfiler, UDFBasicProfiler, MemoryProfiler
-from pyspark.errors import PySparkRuntimeError
-from py4j.java_gateway import is_instance_of, JavaGateway, JavaObject, JVMView
+from pyspark.util import _load_from_socket, local_connect_and_auth
 
 if TYPE_CHECKING:
     from pyspark.accumulators import AccumulatorParam
@@ -85,7 +85,6 @@ __all__ = ["SparkContext"]
 # the default ones for Spark if they are not configured by user.
 DEFAULT_CONFIGS: Dict[str, Any] = {
     "spark.serializer.objectStreamReset": 100,
-    "spark.rdd.compress": True,
     # Disable artifact isolation in PySpark, or user-added .py file won't work
     "spark.sql.artifact.isolation.enabled": "false",
 }
@@ -95,7 +94,6 @@ U = TypeVar("U")
 
 
 class SparkContext:
-
     """
     Main entry point for Spark functionality. A SparkContext represents the
     connection to a Spark cluster, and can be used to create :class:`RDD` and
@@ -162,9 +160,9 @@ class SparkContext:
     _next_accum_id = 0
     _active_spark_context: ClassVar[Optional["SparkContext"]] = None
     _lock = RLock()
-    _python_includes: Optional[
-        List[str]
-    ] = None  # zip and egg files that need to be added to PYTHONPATH
+    _python_includes: Optional[List[str]] = (
+        None  # zip and egg files that need to be added to PYTHONPATH
+    )
     serializer: Serializer
     profiler_collector: ProfilerCollector
 
@@ -327,7 +325,7 @@ class SparkContext:
                 self._accumulatorServer.server_address
             )
         else:
-            (host, port) = self._accumulatorServer.server_address  # type: ignore[misc]
+            host, port = self._accumulatorServer.server_address  # type: ignore[misc]
             self._javaAccumulator = self._jvm.PythonAccumulatorV2(host, port, auth_token)
         self._jsc.sc().register(self._javaAccumulator)
 
@@ -362,7 +360,7 @@ class SparkContext:
         # with SparkContext.addFile, so we just need to add them to the PYTHONPATH
         for path in self._conf.get("spark.submit.pyFiles", "").split(","):
             if path != "":
-                (dirname, filename) = os.path.split(path)
+                dirname, filename = os.path.split(path)
                 try:
                     filepath = os.path.join(SparkFiles.getRootDirectory(), filename)
                     if not os.path.exists(filepath):
@@ -405,12 +403,15 @@ class SparkContext:
 
         # create a signal handler which would be invoked on receiving SIGINT
         def signal_handler(signal: Any, frame: Any) -> NoReturn:
-            self.cancelAllJobs()
-            raise KeyboardInterrupt()
+            try:
+                self.cancelAllJobs()
+            finally:
+                raise KeyboardInterrupt()
 
         # see http://stackoverflow.com/questions/23206787/
         if isinstance(
-            threading.current_thread(), threading._MainThread  # type: ignore[attr-defined]
+            threading.current_thread(),
+            threading._MainThread,  # type: ignore[attr-defined]
         ):
             signal.signal(signal.SIGINT, signal_handler)
 
@@ -436,9 +437,7 @@ class SparkContext:
                 <dd><code>{sc.appName}</code></dd>
             </dl>
         </div>
-        """.format(
-            sc=self
-        )
+        """.format(sc=self)
 
     def _initialize_context(self, jconf: JavaObject) -> JavaObject:
         """
@@ -834,8 +833,8 @@ class SparkContext:
             size = len(c)
             if size == 0:
                 return self.parallelize([], numSlices)
-            step = c[1] - c[0] if size > 1 else 1  # type: ignore[index]
-            start0 = c[0]  # type: ignore[index]
+            step = c[1] - c[0] if size > 1 else 1
+            start0 = c[0]
 
             def getStart(split: int) -> int:
                 assert numSlices is not None
@@ -858,7 +857,8 @@ class SparkContext:
         if "__len__" not in dir(c):
             c = list(c)  # Make it a list so we can compute its length
         batchSize = max(
-            1, min(len(c) // numSlices, self._batchSize or 1024)  # type: ignore[arg-type]
+            1,
+            min(len(c) // numSlices, self._batchSize or 1024),  # type: ignore[arg-type]
         )
         serializer = BatchedSerializer(self._unbatched_serializer, batchSize)
 
@@ -899,7 +899,7 @@ class SparkContext:
         if self._encryption_enabled:
             # with encryption, we open a server in java and send the data directly
             server = server_func()
-            (sock_file, _) = local_connect_and_auth(server.connInfo(), server.secret())
+            sock_file, _ = local_connect_and_auth(server.connInfo(), server.secret())
             chunked_out = ChunkedStream(sock_file, 8192)
             serializer.dump_stream(data, chunked_out)
             chunked_out.close()
@@ -1985,7 +1985,7 @@ class SparkContext:
         A path can be added only once. Subsequent additions of the same path are ignored.
         """
         self.addFile(path)
-        (dirname, filename) = os.path.split(path)  # dirname may be directory or HDFS/S3 prefix
+        dirname, filename = os.path.split(path)  # dirname may be directory or HDFS/S3 prefix
         if filename[-4:].lower() in self.PACKAGE_EXTENSIONS:
             assert self._python_includes is not None
             self._python_includes.append(filename)
@@ -2491,11 +2491,20 @@ class SparkContext:
         """
         return self._jsc.cancelJobsWithTag(tag)
 
-    def cancelAllJobs(self) -> None:
+    def cancelAllJobs(self, reason: Optional[str] = None) -> None:
         """
         Cancel all jobs that have been scheduled or are running.
 
         .. versionadded:: 1.1.0
+
+        Parameters
+        ----------
+        reason : str, optional
+            Reason for cancellation. It is surfaced in the error of every cancelled job, so that
+            a job aborted as collateral of a context-wide cancellation can be told apart from one
+            that failed on its own.
+
+            .. versionadded:: 4.4.0
 
         See Also
         --------
@@ -2503,7 +2512,10 @@ class SparkContext:
         :meth:`SparkContext.cancelJobsWithTag`
         :meth:`SparkContext.runJob`
         """
-        self._jsc.sc().cancelAllJobs()
+        if reason is None:
+            self._jsc.sc().cancelAllJobs()
+        else:
+            self._jsc.sc().cancelAllJobs(reason)
 
     def statusTracker(self) -> StatusTracker:
         """
@@ -2568,7 +2580,8 @@ class SparkContext:
         mappedRDD = rdd.mapPartitions(partitionFunc)
         assert self._jvm is not None
         sock_info = self._jvm.PythonRDD.runJob(self._jsc.sc(), mappedRDD._jrdd, partitions)
-        return list(_load_from_socket(sock_info, mappedRDD._jrdd_deserializer))
+        with _load_from_socket(sock_info, mappedRDD._jrdd_deserializer) as stream:
+            return list(stream)
 
     def show_profiles(self) -> None:
         """Print the profile stats to stdout
@@ -2660,7 +2673,7 @@ def _test() -> None:
     globs = globals().copy()
     conf = SparkConf().set("spark.ui.enabled", "True")
     globs["sc"] = SparkContext("local[4]", "context tests", conf=conf)
-    (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+    failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
     globs["sc"].stop()
     if failure_count:
         sys.exit(-1)

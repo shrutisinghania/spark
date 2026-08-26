@@ -17,18 +17,18 @@
 
 import unittest
 
-from pandas.api.types import CategoricalDtype
 from pandas.api.extensions import ExtensionDtype
+from pandas.api.types import CategoricalDtype
 
 from pyspark.pandas.data_type_ops.base import DataTypeOps
 from pyspark.pandas.data_type_ops.binary_ops import BinaryOps
-from pyspark.pandas.data_type_ops.boolean_ops import BooleanOps, BooleanExtensionOps
+from pyspark.pandas.data_type_ops.boolean_ops import BooleanExtensionOps, BooleanOps
 from pyspark.pandas.data_type_ops.categorical_ops import CategoricalOps
 from pyspark.pandas.data_type_ops.complex_ops import ArrayOps, MapOps, StructOps
 from pyspark.pandas.data_type_ops.date_ops import DateOps
-from pyspark.pandas.data_type_ops.datetime_ops import DatetimeOps, DatetimeNTZOps
+from pyspark.pandas.data_type_ops.datetime_ops import DatetimeNTZOps, DatetimeOps
 from pyspark.pandas.data_type_ops.null_ops import NullOps
-from pyspark.pandas.data_type_ops.num_ops import IntegralOps, FractionalOps, DecimalOps
+from pyspark.pandas.data_type_ops.num_ops import DecimalOps, FractionalOps, IntegralOps
 from pyspark.pandas.data_type_ops.string_ops import StringOps
 from pyspark.pandas.data_type_ops.timedelta_ops import TimedeltaOps
 from pyspark.pandas.data_type_ops.udt_ops import UDTOps
@@ -46,8 +46,8 @@ from pyspark.sql.types import (
     NullType,
     StringType,
     StructType,
-    TimestampType,
     TimestampNTZType,
+    TimestampType,
     UserDefinedType,
 )
 
@@ -99,12 +99,6 @@ class BaseTests(
 
 
 if __name__ == "__main__":
-    from pyspark.pandas.tests.data_type_ops.test_base import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

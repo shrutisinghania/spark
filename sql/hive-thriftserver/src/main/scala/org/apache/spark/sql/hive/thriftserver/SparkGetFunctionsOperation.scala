@@ -78,7 +78,7 @@ private[hive] class SparkGetFunctionsOperation(
 
     try {
       matchingDbs.foreach { db =>
-        catalog.listFunctions(db, functionPattern).foreach {
+        catalog.listFunctions(db, functionPattern).toSeq.sortBy(_._1.funcName).foreach {
           case (funcIdentifier, _) =>
             val info = catalog.lookupFunctionInfo(funcIdentifier)
             val rowData = Array[AnyRef](
@@ -88,7 +88,7 @@ private[hive] class SparkGetFunctionsOperation(
               s"Usage: ${info.getUsage}\nExtended Usage:${info.getExtended}", // REMARKS
               DatabaseMetaData.functionResultUnknown.asInstanceOf[AnyRef], // FUNCTION_TYPE
               info.getClassName) // SPECIFIC_NAME
-            rowSet.addRow(rowData);
+            rowSet.addRow(rowData)
         }
       }
       setState(OperationState.FINISHED)

@@ -14,10 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 
 from pyspark.sql.tests.test_readwriter import ReadwriterTestsMixin, ReadwriterV2TestsMixin
-from pyspark.testing.connectutils import should_test_connect, ReusedConnectTestCase
+from pyspark.testing.connectutils import ReusedConnectTestCase, should_test_connect
 
 if should_test_connect:
     from pyspark.sql.connect.readwriter import DataFrameWriterV2
@@ -37,13 +36,6 @@ class ReadwriterV2ParityTests(ReadwriterV2TestsMixin, ReusedConnectTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.connect.test_parity_readwriter import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -26,22 +26,23 @@ import scala.util.Try
 import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.SparkException
-import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, SaveMode}
-import org.apache.spark.sql.catalyst.analysis.{NoSuchTableException, TableAlreadyExistsException}
+import org.apache.spark.sql.{AnalysisException, DataFrame, Dataset, SaveMode}
+import org.apache.spark.sql.QueryTest.withQueryExecutionsCaptured
+import org.apache.spark.sql.catalyst.analysis.{AsOfTimestamp, AsOfVersion, NoSuchTableException, TableAlreadyExistsException, TimeTravelSpec}
 import org.apache.spark.sql.catalyst.plans.logical.{AppendData, LogicalPlan, OverwriteByExpression}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
-import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier, InMemoryTableCatalog, SupportsCatalogOptions, TableCatalog}
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier, InMemoryBaseTable, InMemoryTableCatalog, SupportsCatalogOptions, TableCatalog, TableWritePrivilege}
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.connector.expressions.{FieldReference, IdentityTransform}
 import org.apache.spark.sql.execution.QueryExecution
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.execution.datasources.v2.{AppendDataExec, DataSourceV2Relation, OverwriteByExpressionExec}
 import org.apache.spark.sql.internal.SQLConf.V2_SESSION_CATALOG_IMPLEMENTATION
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.LongType
 import org.apache.spark.sql.util.{CaseInsensitiveStringMap, QueryExecutionListener}
 import org.apache.spark.unsafe.types.UTF8String
 
-class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with BeforeAndAfter {
+class SupportsCatalogOptionsSuite extends SharedSparkSession with BeforeAndAfter {
 
   import testImplicits._
 
@@ -50,6 +51,10 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
 
   private def catalog(name: String): TableCatalog = {
     spark.sessionState.catalogManager.catalog(name).asInstanceOf[TableCatalog]
+  }
+
+  protected def sessionCatalog: InMemoryTableSessionCatalog = {
+    catalog(SESSION_CATALOG_NAME).asInstanceOf[InMemoryTableSessionCatalog]
   }
 
   private implicit def stringToIdentifier(value: String): Identifier = {
@@ -61,15 +66,18 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
       V2_SESSION_CATALOG_IMPLEMENTATION.key, classOf[InMemoryTableSessionCatalog].getName)
     spark.conf.set(
       s"spark.sql.catalog.$catalogName", classOf[InMemoryTableCatalog].getName)
+    spark.conf.set(s"spark.sql.catalog.$catalogName.tableStateOptionKeys", "load-option")
   }
 
   override def afterEach(): Unit = {
     super.afterEach()
-    Try(catalog(SESSION_CATALOG_NAME).asInstanceOf[InMemoryTableSessionCatalog].clearTables())
+    Try(sessionCatalog.checkUsage())
+    Try(sessionCatalog.clearTables())
     catalog(catalogName).listTables(Array.empty).foreach(
       catalog(catalogName).dropTable(_))
     spark.conf.unset(V2_SESSION_CATALOG_IMPLEMENTATION.key)
     spark.conf.unset(s"spark.sql.catalog.$catalogName")
+    spark.conf.unset(s"spark.sql.catalog.$catalogName.tableStateOptionKeys")
   }
 
   private def testCreateAndRead(
@@ -146,7 +154,7 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
     val dfw = df.write.format(format).mode(SaveMode.Ignore).option("name", "t1")
     dfw.save()
 
-    val table = catalog(SESSION_CATALOG_NAME).loadTable(Identifier.of(Array("default"), "t1"))
+    val table = sessionCatalog.loadTable(Identifier.of(Array("default"), "t1"))
     assert(table.partitioning().isEmpty, "Partitioning should be empty")
     assert(table.columns() sameElements
       Array(Column.create("id", LongType)), "Schema did not match")
@@ -221,7 +229,8 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
     val e = intercept[NoSuchTableException] {
       spark.read.format(format).option("name", "non_existent_table").load()
     }
-    checkErrorTableNotFound(e, "`default`.`non_existent_table`")
+    val currentCatalogName = spark.catalog.currentCatalog().name()
+    checkErrorTableNotFound(e, s"`$currentCatalogName`.`default`.`non_existent_table`")
   }
 
   test("DataFrameWriter creates v2Relation with identifiers") {
@@ -279,7 +288,7 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
         sql(s"create table t1 (id bigint) using $format")
       }
 
-      assert(e.getMessage.contains("Cannot find catalog plugin class"))
+      assert(e.getMessage.contains("cannot find the plugin class"))
       assert(e.getMessage.contains("InvalidCatalogClass"))
     } finally {
       spark.sessionState.catalogManager.reset()
@@ -304,8 +313,13 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
         .mode(SaveMode.Overwrite).save()
 
       // load with version
-      checkAnswer(load("t", Some(catalogName), version = Some("Snapshot123456789")), df1.toDF())
-      checkAnswer(load("t", Some(catalogName), version = Some("2345678910")), df2.toDF())
+      val readDF1 = load("t", Some(catalogName), version = Some("Snapshot123456789"))
+      checkAnswer(readDF1, df1.toDF())
+      checkTimeTravel(readDF1, expectedTimeTravelSpec = AsOfVersion("Snapshot123456789"))
+
+      val readDF2 = load("t", Some(catalogName), version = Some("2345678910"))
+      checkAnswer(readDF2, df2.toDF())
+      checkTimeTravel(readDF2, expectedTimeTravelSpec = AsOfVersion("2345678910"))
     }
 
     val ts1 = DateTimeUtils.stringToTimestampAnsi(
@@ -329,16 +343,26 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
         .mode(SaveMode.Overwrite).save()
 
       // load with timestamp
-      checkAnswer(load("t", Some(catalogName), version = None,
-        timestamp = Some("2019-01-29 00:37:58")), df3.toDF())
-      checkAnswer(load("t", Some(catalogName), version = None,
-        timestamp = Some("2021-01-29 00:37:58")), df4.toDF())
+      val readDF3 = load("t", Some(catalogName), version = None,
+        timestamp = Some("2019-01-29 00:37:58"))
+      checkAnswer(readDF3, df3.toDF())
+      checkTimeTravel(readDF3, expectedTimeTravelSpec = AsOfTimestamp(ts1))
+
+      val readDF4 = load("t", Some(catalogName), version = None,
+        timestamp = Some("2021-01-29 00:37:58"))
+      checkAnswer(readDF4, df4.toDF())
+      checkTimeTravel(readDF4, expectedTimeTravelSpec = AsOfTimestamp(ts2))
 
       // load with timestamp in number format
-      checkAnswer(load("t", Some(catalogName), version = None,
-        timestamp = Some(MICROSECONDS.toSeconds(ts1).toString)), df3.toDF())
-      checkAnswer(load("t", Some(catalogName), version = None,
-        timestamp = Some(MICROSECONDS.toSeconds(ts2).toString)), df4.toDF())
+      val readDF5 = load("t", Some(catalogName), version = None,
+        timestamp = Some(MICROSECONDS.toSeconds(ts1).toString))
+      checkAnswer(readDF5, df3.toDF())
+      checkTimeTravel(readDF5, expectedTimeTravelSpec = AsOfTimestamp(ts1))
+
+      val readDF6 = load("t", Some(catalogName), version = None,
+        timestamp = Some(MICROSECONDS.toSeconds(ts2).toString))
+      checkAnswer(readDF6, df4.toDF())
+      checkTimeTravel(readDF6, expectedTimeTravelSpec = AsOfTimestamp(ts2))
     }
 
     val e = intercept[AnalysisException] {
@@ -357,6 +381,99 @@ class SupportsCatalogOptionsSuite extends QueryTest with SharedSparkSession with
     val v2 = plan.asInstanceOf[DataSourceV2Relation]
     assert(v2.identifier.exists(_.name() == identifier))
     assert(v2.catalog.exists(_ == catalogPlugin))
+  }
+
+  private def checkTimeTravel(ds: Dataset[_], expectedTimeTravelSpec: TimeTravelSpec): Unit = {
+    val relation = ds.logicalPlan.asInstanceOf[DataSourceV2Relation]
+    assert(relation.timeTravelSpec.contains(expectedTimeTravelSpec))
+  }
+
+  test("read options are preserved for scans but filtered from loadTable") {
+    sql(s"create table $catalogName.t1 (id bigint) using $format")
+    val cat = catalog(catalogName).asInstanceOf[InMemoryTableCatalog]
+    cat.resetLoadTableCalls()
+
+    // The provider uses the options to identify the table, but this catalog declares no
+    // table-state options. The relation still retains the complete option map for scan planning.
+    val df = load("t1", Some(catalogName))
+    df.collect()
+    val relation = df.logicalPlan.asInstanceOf[DataSourceV2Relation]
+    assert(relation.options.get("name") === "t1")
+
+    val opts = cat.lastLoadTableOptions
+    assert(opts.isDefined, "loadTable(context, options) was not invoked")
+    assert(opts.get.isEmpty)
+  }
+
+  test("SPARK-58389: SupportsCatalogOptions separates table-state and write options") {
+    sql(s"create table $catalogName.t1 (id bigint) using $format")
+    val cat = catalog(catalogName).asInstanceOf[InMemoryTableCatalog]
+    val loadOption = "load-Option"
+    val loadValue = "load-value"
+    val writeOption = "write-option"
+
+    Seq(
+      (SaveMode.Append, "append", java.util.Set.of(TableWritePrivilege.INSERT)),
+      (SaveMode.Overwrite, "overwrite",
+        java.util.Set.of(TableWritePrivilege.INSERT, TableWritePrivilege.DELETE))
+    ).foreach { case (mode, optionValue, expectedPrivileges) =>
+      cat.resetLoadTableCalls()
+      val Seq(qe) = withQueryExecutionsCaptured(spark) {
+        spark.range(1).write
+          .format(format)
+          .option("name", "t1")
+          .option("catalog", catalogName)
+          .option(loadOption, loadValue)
+          .option(writeOption, optionValue)
+          .mode(mode)
+          .save()
+      }
+
+      val matchingCalls = cat.loadTableCalls.filter {
+        case (_, options) => options.get(loadOption) == loadValue
+      }
+      assert(matchingCalls.nonEmpty, "loadTable(context, options) was not invoked for the write")
+      matchingCalls.foreach { case (context, options) =>
+        assert(context.writePrivileges() === expectedPrivileges)
+        assert(options.size() === 1)
+        assert(options.asCaseSensitiveMap().containsKey(loadOption))
+        assert(options.get(writeOption) === null)
+      }
+
+      val actualWriteOptions = mode match {
+        case SaveMode.Append =>
+          qe.executedPlan.collectFirst {
+            case AppendDataExec(_, _, write, _, _) =>
+              write.toBatch.asInstanceOf[InMemoryBaseTable#Append].info.options
+          }
+        case SaveMode.Overwrite =>
+          qe.executedPlan.collectFirst {
+            case OverwriteByExpressionExec(_, _, write, _, _) =>
+              write.toBatch.asInstanceOf[InMemoryBaseTable#TruncateAndAppend].info.options
+          }
+        case other => fail(s"unexpected save mode: $other")
+      }
+      assert(actualWriteOptions.isDefined, "expected a V2 in-memory batch write")
+      assert(actualWriteOptions.get.get(loadOption) === loadValue)
+      assert(actualWriteOptions.get.get(writeOption) === optionValue)
+      assert(actualWriteOptions.get.get("name") === "t1")
+      assert(actualWriteOptions.get.get("catalog") === catalogName)
+    }
+  }
+
+  test("SPARK-58389: SupportsCatalogOptions rejects time travel options for table creation") {
+    checkError(
+      exception = intercept[AnalysisException] {
+        spark.range(1).write
+          .format(format)
+          .option("name", "t1")
+          .option("catalog", catalogName)
+          .option("versionAsOf", "v1")
+          .option("timestampAsOf", "2021-01-01")
+          .save()
+      },
+      condition = "UNSUPPORTED_FEATURE.TIME_TRAVEL",
+      parameters = Map("relationId" -> "`testcat`.`t1`"))
   }
 
   private def load(

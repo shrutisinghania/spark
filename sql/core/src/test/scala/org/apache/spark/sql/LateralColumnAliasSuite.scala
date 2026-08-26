@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, ExpressionSe
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Project}
 import org.apache.spark.sql.catalyst.trees.TreePattern.OUTER_REFERENCE
+import org.apache.spark.sql.catalyst.util.AUTO_GENERATED_ALIAS
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -32,7 +33,7 @@ import org.apache.spark.sql.test.SharedSparkSession
  * Lateral column alias base suite with LCA off, extended by LateralColumnAliasSuite with LCA on.
  * Should test behaviors remaining the same no matter LCA conf is on or off.
  */
-class LateralColumnAliasSuiteBase extends QueryTest with SharedSparkSession {
+class LateralColumnAliasSuiteBase extends SharedSparkSession {
   // by default the tests in this suites run with LCA off
   val lcaEnabled: Boolean = false
   override protected def test(testName: String, testTags: Tag*)(testFun: => Any)
@@ -1021,8 +1022,8 @@ class LateralColumnAliasSuite extends LateralColumnAliasSuiteBase {
           "(partition by dept order by salary rows between n preceding and current row) as rank " +
           s"from $testTable where dept in (1, 6)")
       },
-      condition = "_LEGACY_ERROR_TEMP_0064",
-      parameters = Map("msg" -> "Frame bound value must be a literal."),
+      condition = "INVALID_SQL_SYNTAX.INVALID_WINDOW_FRAME_BOUND",
+      parameters = Map.empty,
       context = ExpectedContext(fragment = "n preceding", start = 87, stop = 97)
     )
 
@@ -1391,5 +1392,11 @@ class LateralColumnAliasSuite extends LateralColumnAliasSuiteBase {
         assert(outerProjectList.map(_.name) == Seq("a", "b", "c", "d"))
         assert(innerProjectList.map(_.name) == Seq("a", "b"))
     }
+  }
+
+  test("SPARK-53674: Strip metadata from lateral reference of complex type column") {
+    val schema = sql("SELECT array(1,2,3) AS a, a[1]").queryExecution.analyzed.schema
+    assert(!schema("a").metadata.contains(AUTO_GENERATED_ALIAS))
+    assert(schema("lateralAliasReference(a)[1]").metadata.contains(AUTO_GENERATED_ALIAS))
   }
 }

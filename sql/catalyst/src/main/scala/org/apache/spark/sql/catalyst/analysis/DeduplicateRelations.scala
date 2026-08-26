@@ -19,17 +19,14 @@ package org.apache.spark.sql.catalyst.analysis
 
 import scala.collection.mutable
 
+import org.apache.spark.sql.catalyst.analysis.resolver.ResolverTag
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeMap, AttributeReference, AttributeSet, Expression, NamedExpression, OuterReference, SubqueryExpression}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.internal.SQLConf
 
 object DeduplicateRelations extends Rule[LogicalPlan] {
-  val PROJECT_FOR_EXPRESSION_ID_DEDUPLICATION =
-    TreeNodeTag[Unit]("project_for_expression_id_deduplication")
-
   type ExprIdMap = mutable.HashMap[Class[_], mutable.HashSet[Long]]
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
@@ -39,7 +36,8 @@ object DeduplicateRelations extends Rule[LogicalPlan] {
     def noMissingInput(p: LogicalPlan) = !p.exists(_.missingInput.nonEmpty)
 
     newPlan.resolveOperatorsUpWithPruning(
-      _.containsAnyPattern(JOIN, LATERAL_JOIN, AS_OF_JOIN, INTERSECT, EXCEPT, UNION, COMMAND),
+      _.containsAnyPattern(
+        JOIN, LATERAL_JOIN, AS_OF_JOIN, NEAREST_BY_JOIN, INTERSECT, EXCEPT, UNION, COMMAND),
       ruleId) {
       case p: LogicalPlan if !p.childrenResolved => p
       // To resolve duplicate expression IDs for Join.
@@ -50,7 +48,11 @@ object DeduplicateRelations extends Rule[LogicalPlan] {
           if right.resolved && !j.duplicateResolved && noMissingInput(right.plan) =>
         j.copy(right = right.withNewPlan(dedupRight(left, right.plan)))
       // Resolve duplicate output for AsOfJoin.
-      case j @ AsOfJoin(left, right, _, _, _, _, _)
+      case j @ AsOfJoin(left, right, _, _, _, _, _, _, _, _, _, _, _, _)
+          if !j.duplicateResolved && noMissingInput(right) =>
+        j.copy(right = dedupRight(left, right))
+      // Resolve duplicate output for NearestByJoin.
+      case j @ NearestByJoin(left, right, _, _, _, _, _)
           if !j.duplicateResolved && noMissingInput(right) =>
         j.copy(right = dedupRight(left, right))
       // intersect/except will be rewritten to join at the beginning of optimizer. Here we need to
@@ -77,7 +79,7 @@ object DeduplicateRelations extends Rule[LogicalPlan] {
                   }
                   val project = Project(projectList, child)
                   project.setTagValue(
-                    DeduplicateRelations.PROJECT_FOR_EXPRESSION_ID_DEDUPLICATION,
+                    ResolverTag.PROJECT_FOR_EXPRESSION_ID_DEDUPLICATION,
                     ()
                   )
                   project
@@ -194,6 +196,15 @@ object DeduplicateRelations extends Rule[LogicalPlan] {
         g,
         _.generatorOutput.map(_.exprId.id), newGenerate =>
           newGenerate.copy(generatorOutput = newGenerate.generatorOutput.map(_.newInstance())))
+
+    case b: BinBy =>
+      deduplicateAndRenew[BinBy](
+        existingRelations,
+        b,
+        _.producedAttributes.map(_.exprId.id).toSeq,
+        newBinBy => newBinBy.copy(
+          scaledDistributeColumns = newBinBy.scaledDistributeColumns.map(_.newInstance()),
+          appendedAttributes = newBinBy.appendedAttributes.map(_.newInstance())))
 
     case e: Expand =>
       deduplicateAndRenew[Expand](
@@ -444,7 +455,7 @@ object DeduplicateRelations extends Rule[LogicalPlan] {
         newVersion.copyTagsFrom(oldVersion)
         Seq((oldVersion, newVersion))
 
-      case oldVersion @ AttachDistributedSequence(sequenceAttr, _)
+      case oldVersion @ AttachDistributedSequence(sequenceAttr, _, _)
         if oldVersion.producedAttributes.intersect(conflictingAttributes).nonEmpty =>
         val newVersion = oldVersion.copy(sequenceAttr = sequenceAttr.newInstance())
         newVersion.copyTagsFrom(oldVersion)
@@ -454,6 +465,14 @@ object DeduplicateRelations extends Rule[LogicalPlan] {
           if oldVersion.producedAttributes.intersect(conflictingAttributes).nonEmpty =>
         val newOutput = oldVersion.generatorOutput.map(_.newInstance())
         val newVersion = oldVersion.copy(generatorOutput = newOutput)
+        newVersion.copyTagsFrom(oldVersion)
+        Seq((oldVersion, newVersion))
+
+      case oldVersion: BinBy
+          if oldVersion.producedAttributes.intersect(conflictingAttributes).nonEmpty =>
+        val newVersion = oldVersion.copy(
+          scaledDistributeColumns = oldVersion.scaledDistributeColumns.map(_.newInstance()),
+          appendedAttributes = oldVersion.appendedAttributes.map(_.newInstance()))
         newVersion.copyTagsFrom(oldVersion)
         Seq((oldVersion, newVersion))
 

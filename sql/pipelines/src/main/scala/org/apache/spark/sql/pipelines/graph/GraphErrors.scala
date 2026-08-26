@@ -39,25 +39,6 @@ object GraphErrors {
   }
 
   /**
-   * Throws when the catalog or schema name in the "USE CATALOG | SCHEMA" command is invalid
-   *
-   * @param command string "USE CATALOG" or "USE SCHEMA"
-   * @param name the invalid catalog or schema name
-   * @param reason the reason why the name is invalid
-   */
-  def invalidNameInUseCommandError(
-      command: String,
-      name: String,
-      reason: String
-  ): SparkException = {
-    new SparkException(
-      errorClass = "INVALID_NAME_IN_USE_COMMAND",
-      messageParameters = Map("command" -> command, "name" -> name, "reason" -> reason),
-      cause = null
-    )
-  }
-
-  /**
    * Throws when a table path is unresolved, i.e. the table identifier
    * does not exist in the catalog.
    *
@@ -126,6 +107,35 @@ object GraphErrors {
         "incompatibleDataSchema" -> incompatibleSchema.treeString
       ),
       cause = Option(cause.orNull)
+    )
+  }
+
+  /**
+   * Throws if the flows writing to one table disagree on a configuration whose value determines
+   * how the table's schema is derived, so that the resulting schema would otherwise depend on the
+   * order the flows happen to be evaluated in.
+   *
+   * @param tableIdentifier the destination table the conflicting flows write to
+   * @param configKey the configuration the flows disagree on
+   * @param valuesByFlow the distinct values, each with the flows that declared it
+   */
+  def conflictingFlowConfigurationError(
+      tableIdentifier: TableIdentifier,
+      configKey: String,
+      valuesByFlow: Map[String, Seq[TableIdentifier]]): AnalysisException = {
+    val rendered = valuesByFlow.toSeq
+      .sortBy(_._1)
+      .map { case (value, flows) =>
+        s"$value (${flows.map(_.unquotedString).sorted.mkString(", ")})"
+      }
+      .mkString("; ")
+    new AnalysisException(
+      errorClass = "CONFLICTING_PIPELINE_FLOW_CASE_SENSITIVITY",
+      messageParameters = Map(
+        "tableName" -> tableIdentifier.unquotedString,
+        "configKey" -> configKey,
+        "flowConfigurations" -> rendered
+      )
     )
   }
 }

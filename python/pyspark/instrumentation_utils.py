@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
@@ -17,13 +16,12 @@
 #
 
 import functools
+import importlib
 import inspect
 import threading
-import importlib
 import time
 from types import ModuleType
-from typing import Tuple, Union, List, Callable, Any, Type
-
+from typing import Any, Callable, List, Tuple, Type, Union
 
 __all__: List[str] = []
 
@@ -124,7 +122,7 @@ def _attach(
     logger_module: Union[str, ModuleType],
     modules: List[ModuleType],
     classes: List[Type[Any]],
-    missings: List[Tuple[Type[Any], Type[Any]]],
+    missings: List[Tuple[Union[ModuleType, Type[Any]], Type[Any]]],
 ) -> None:
     if isinstance(logger_module, str):
         logger_module = importlib.import_module(logger_module)

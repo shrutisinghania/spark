@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-from types import FunctionType
-from typing import Any, Callable, Iterable, Union, Optional, NewType, Protocol, Tuple
 import datetime
 import decimal
+from types import FunctionType
+from typing import Any, Callable, Iterable, Iterator, NewType, Optional, Protocol, Tuple, Union
 
 import pyarrow
 from pandas.core.frame import DataFrame as PandasDataFrame
@@ -25,7 +25,6 @@ from pandas.core.frame import DataFrame as PandasDataFrame
 from pyspark.sql.column import Column
 from pyspark.sql.connect.types import DataType
 from pyspark.sql.streaming.state import GroupState
-
 
 ColumnOrName = Union[Column, str]
 
@@ -39,15 +38,15 @@ LiteralType = PrimitiveType
 
 DecimalLiteral = decimal.Decimal
 
-DateTimeLiteral = Union[datetime.datetime, datetime.date]
+DateTimeLiteral = Union[datetime.date, datetime.time, datetime.datetime]
 
 DataTypeOrString = Union[DataType, str]
 
 DataFrameLike = PandasDataFrame
 
-PandasMapIterFunction = Callable[[Iterable[DataFrameLike]], Iterable[DataFrameLike]]
+PandasMapIterFunction = Callable[[Iterator[DataFrameLike]], Iterator[DataFrameLike]]
 
-ArrowMapIterFunction = Callable[[Iterable[pyarrow.RecordBatch]], Iterable[pyarrow.RecordBatch]]
+ArrowMapIterFunction = Callable[[Iterator[pyarrow.RecordBatch]], Iterator[pyarrow.RecordBatch]]
 
 PandasGroupedMapFunction = Union[
     Callable[[DataFrameLike], DataFrameLike],
@@ -77,16 +76,12 @@ class UserDefinedFunctionLike(Protocol):
     deterministic: bool
 
     @property
-    def returnType(self) -> DataType:
-        ...
+    def returnType(self) -> DataType: ...
 
-    def __call__(self, *args: ColumnOrName) -> Column:
-        ...
+    def __call__(self, *args: ColumnOrName) -> Column: ...
 
-    def asNondeterministic(self) -> "UserDefinedFunctionLike":
-        ...
+    def asNondeterministic(self) -> "UserDefinedFunctionLike": ...
 
 
 class UserDefinedFunctionCallable(Protocol):
-    def __call__(self, *_: ColumnOrName) -> Column:
-        ...
+    def __call__(self, *_: ColumnOrName) -> Column: ...

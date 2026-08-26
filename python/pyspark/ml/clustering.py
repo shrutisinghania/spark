@@ -15,49 +15,51 @@
 # limitations under the License.
 #
 
+import functools
 import sys
 import warnings
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-import functools
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 
-from pyspark import since, keyword_only
+from pyspark import keyword_only, since
+from pyspark.ml.common import inherit_doc
+from pyspark.ml.linalg import Matrix, Vector
 from pyspark.ml.param.shared import (
-    HasMaxIter,
-    HasFeaturesCol,
-    HasSeed,
-    HasPredictionCol,
     HasAggregationDepth,
-    HasWeightCol,
-    HasTol,
-    HasProbabilityCol,
-    HasDistanceMeasure,
     HasCheckpointInterval,
-    HasSolver,
+    HasDistanceMeasure,
+    HasFeaturesCol,
+    HasIntermediateStorageLevel,
     HasMaxBlockSizeInMB,
+    HasMaxIter,
+    HasPredictionCol,
+    HasProbabilityCol,
+    HasSeed,
+    HasSolver,
+    HasTol,
+    HasWeightCol,
     Param,
     Params,
     TypeConverters,
 )
+from pyspark.ml.stat import MultivariateGaussian
 from pyspark.ml.util import (
-    JavaMLWritable,
-    JavaMLReadable,
     GeneralJavaMLWritable,
     HasTrainingSummary,
-    try_remote_attribute_relation,
+    JavaMLReadable,
+    JavaMLWritable,
     invoke_helper_relation,
+    try_remote_attribute_relation,
 )
 from pyspark.ml.wrapper import JavaEstimator, JavaModel, JavaParams, JavaWrapper
-from pyspark.ml.common import inherit_doc
-from pyspark.ml.stat import MultivariateGaussian
 from pyspark.sql import DataFrame
-from pyspark.ml.linalg import Vector, Matrix
 from pyspark.sql.utils import is_remote
 
 if TYPE_CHECKING:
-    from pyspark.ml._typing import M
     from py4j.java_gateway import JavaObject
+
+    from pyspark.ml._typing import M
 
 
 __all__ = [
@@ -169,7 +171,7 @@ class _GaussianMixtureParams(
     )
 
     def __init__(self, *args: Any):
-        super(_GaussianMixtureParams, self).__init__(*args)
+        super().__init__(*args)
         self._setDefault(k=2, tol=0.01, maxIter=100, aggregationDepth=2)
 
     @since("2.0.0")
@@ -422,7 +424,7 @@ class GaussianMixture(
                  probabilityCol="probability", tol=0.01, maxIter=100, seed=None, \
                  aggregationDepth=2, weightCol=None)
         """
-        super(GaussianMixture, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.clustering.GaussianMixture", self.uid
         )
@@ -582,6 +584,7 @@ class _KMeansParams(
     HasWeightCol,
     HasSolver,
     HasMaxBlockSizeInMB,
+    HasIntermediateStorageLevel,
 ):
     """
     Params for :py:class:`KMeans` and :py:class:`KMeansModel`.
@@ -617,7 +620,7 @@ class _KMeansParams(
     )
 
     def __init__(self, *args: Any):
-        super(_KMeansParams, self).__init__(*args)
+        super().__init__(*args)
         self._setDefault(
             k=2,
             initMode="k-means||",
@@ -800,7 +803,7 @@ class KMeans(JavaEstimator[KMeansModel], _KMeansParams, JavaMLWritable, JavaMLRe
                  distanceMeasure="euclidean", weightCol=None, solver="auto", \
                  maxBlockSizeInMB=0.0)
         """
-        super(KMeans, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj("org.apache.spark.ml.clustering.KMeans", self.uid)
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
@@ -921,6 +924,13 @@ class KMeans(JavaEstimator[KMeansModel], _KMeansParams, JavaMLWritable, JavaMLRe
         """
         return self._set(maxBlockSizeInMB=value)
 
+    @since("5.0.0")
+    def setIntermediateStorageLevel(self, value: str) -> "KMeans":
+        """
+        Sets the value of :py:attr:`intermediateStorageLevel`.
+        """
+        return self._set(intermediateStorageLevel=value)
+
 
 @inherit_doc
 class _BisectingKMeansParams(
@@ -952,7 +962,7 @@ class _BisectingKMeansParams(
     )
 
     def __init__(self, *args: Any):
-        super(_BisectingKMeansParams, self).__init__(*args)
+        super().__init__(*args)
         self._setDefault(maxIter=20, k=4, minDivisibleClusterSize=1.0)
 
     @since("2.0.0")
@@ -1146,7 +1156,7 @@ class BisectingKMeans(
                  seed=None, k=4, minDivisibleClusterSize=1.0, distanceMeasure="euclidean", \
                  weightCol=None)
         """
-        super(BisectingKMeans, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.clustering.BisectingKMeans", self.uid
         )
@@ -1270,8 +1280,7 @@ class _LDAParams(HasMaxIter, HasFeaturesCol, HasSeed, HasCheckpointInterval):
     optimizer: Param[str] = Param(
         Params._dummy(),
         "optimizer",
-        "Optimizer or inference algorithm used to estimate the LDA model.  "
-        "Supported: online, em",
+        "Optimizer or inference algorithm used to estimate the LDA model.  Supported: online, em",
         typeConverter=TypeConverters.toString,
     )
     learningOffset: Param[float] = Param(
@@ -1337,7 +1346,7 @@ class _LDAParams(HasMaxIter, HasFeaturesCol, HasSeed, HasCheckpointInterval):
     )
 
     def __init__(self, *args: Any):
-        super(_LDAParams, self).__init__(*args)
+        super().__init__(*args)
         self._setDefault(
             maxIter=20,
             checkpointInterval=10,
@@ -1542,9 +1551,12 @@ class DistributedLDAModel(LDAModel, JavaMLReadable["DistributedLDAModel"], JavaM
 
         .. warning:: This involves collecting a large :py:func:`topicsMatrix` to the driver.
         """
-        model = LocalLDAModel(self._call_java("toLocal"))
         if is_remote():
-            return model
+            from pyspark.ml.util import RemoteModelRef
+
+            return LocalLDAModel(RemoteModelRef(self._call_java("toLocal")))
+
+        model = LocalLDAModel(self._call_java("toLocal"))
 
         # SPARK-10931: Temporary fix to be removed once LDAModel defines Params
         model._create_params_from_java()
@@ -1710,7 +1722,7 @@ class LDA(JavaEstimator[LDAModel], _LDAParams, JavaMLReadable["LDA"], JavaMLWrit
                   docConcentration=None, topicConcentration=None,\
                   topicDistributionCol="topicDistribution", keepLastCheckpoint=True)
         """
-        super(LDA, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj("org.apache.spark.ml.clustering.LDA", self.uid)
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
@@ -1948,7 +1960,7 @@ class _PowerIterationClusteringParams(HasMaxIter, HasWeightCol):
     )
 
     def __init__(self, *args: Any):
-        super(_PowerIterationClusteringParams, self).__init__(*args)
+        super().__init__(*args)
         self._setDefault(k=2, maxIter=20, initMode="random", srcCol="src", dstCol="dst")
 
     @since("2.4.0")
@@ -2054,7 +2066,7 @@ class PowerIterationClustering(
         __init__(self, \\*, k=2, maxIter=20, initMode="random", srcCol="src", dstCol="dst",\
                  weightCol=None)
         """
-        super(PowerIterationClustering, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj(
             "org.apache.spark.ml.clustering.PowerIterationClustering", self.uid
         )
@@ -2169,7 +2181,9 @@ class PowerIterationClustering(
 
 if __name__ == "__main__":
     import doctest
+
     import numpy
+
     import pyspark.ml.clustering
     from pyspark.sql import SparkSession
 
@@ -2190,7 +2204,7 @@ if __name__ == "__main__":
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

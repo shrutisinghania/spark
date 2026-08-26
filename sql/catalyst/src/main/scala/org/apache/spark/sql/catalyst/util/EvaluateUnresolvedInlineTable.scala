@@ -14,8 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.spark.sql.catalyst
+package org.apache.spark.sql.catalyst.util
 
+import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.expressions.{AliasHelper, EvalHelper, Expression}
 import org.apache.spark.sql.catalyst.optimizer.EvalInlineTables
@@ -23,7 +24,7 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.trees.TreePattern.CURRENT_LIKE
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.TypeUtils.{toSQLExpr, toSQLId}
-import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.types.{StringHelper, StringType, StructField, StructType}
 
 /**
  * Utility object used to replace [[UnresolvedInlineTable]] with [[ResolvedInlineTable]] or
@@ -35,13 +36,17 @@ import org.apache.spark.sql.types.{StructField, StructType}
 object EvaluateUnresolvedInlineTable extends SQLConfHelper
   with AliasHelper with EvalHelper with CastSupport {
 
-  def evaluate(plan: UnresolvedInlineTable): LogicalPlan =
-    if (plan.expressionsResolved) evaluateUnresolvedInlineTable(plan) else plan
+  def evaluate(
+      plan: UnresolvedInlineTable,
+      ignoreCollation: Boolean = false): LogicalPlan =
+    if (plan.expressionsResolved) evaluateUnresolvedInlineTable(plan, ignoreCollation) else plan
 
-  def evaluateUnresolvedInlineTable(table: UnresolvedInlineTable): LogicalPlan = {
+  def evaluateUnresolvedInlineTable(
+      table: UnresolvedInlineTable,
+      ignoreCollation: Boolean = false): LogicalPlan = {
     validateInputDimension(table)
     validateInputEvaluable(table)
-    val resolvedTable = findCommonTypesAndCast(table)
+    val resolvedTable = findCommonTypesAndCast(table, ignoreCollation)
     earlyEvalIfPossible(resolvedTable)
   }
 
@@ -105,11 +110,23 @@ object EvaluateUnresolvedInlineTable extends SQLConfHelper
    *
    * This is package visible for unit testing.
    */
-  def findCommonTypesAndCast(table: UnresolvedInlineTable): ResolvedInlineTable = {
+  def findCommonTypesAndCast(
+      table: UnresolvedInlineTable,
+      ignoreCollation: Boolean = false): ResolvedInlineTable = {
     // For each column, traverse all the values and find a common data type and nullability.
     val (fields, columns) = table.rows.transpose.zip(table.names).map { case (column, name) =>
       val inputTypes = column.map(_.dataType)
-      val tpe = TypeCoercion.findWiderTypeWithoutStringPromotion(inputTypes).getOrElse {
+      // In INSERT INTO ... VALUES, collations are ignored because the target table's column
+      // collation takes precedence - the INSERT coercion will cast each value to the target
+      // column's type, including collation.
+      val strippedInputTypes = if (ignoreCollation) {
+        inputTypes.map(_.transformRecursively {
+          case st: StringType => StringHelper.removeCollation(st)
+        })
+      } else {
+        inputTypes
+      }
+      val tpe = TypeCoercion.findWiderTypeWithoutStringPromotion(strippedInputTypes).getOrElse {
         table.failAnalysis(
           errorClass = "INVALID_INLINE_TABLE.INCOMPATIBLE_TYPES_IN_INLINE_TABLE",
           messageParameters = Map("colName" -> toSQLId(name)))

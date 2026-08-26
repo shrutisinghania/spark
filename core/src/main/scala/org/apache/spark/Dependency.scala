@@ -29,6 +29,7 @@ import org.apache.spark.internal.LogKeys._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriteProcessor}
+import org.apache.spark.shuffle.checksum.RowBasedChecksum
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.Utils
 
@@ -59,6 +60,9 @@ abstract class NarrowDependency[T](_rdd: RDD[T]) extends Dependency[T] {
   override def rdd: RDD[T] = _rdd
 }
 
+object ShuffleDependency {
+  private[spark] val EMPTY_ROW_BASED_CHECKSUMS: Array[RowBasedChecksum] = Array.empty
+}
 
 /**
  * :: DeveloperApi ::
@@ -74,6 +78,7 @@ abstract class NarrowDependency[T](_rdd: RDD[T]) extends Dependency[T] {
  * @param aggregator map/reduce-side aggregator for RDD's shuffle
  * @param mapSideCombine whether to perform partial aggregation (also known as map-side combine)
  * @param shuffleWriterProcessor the processor to control the write behavior in ShuffleMapTask
+ * @param rowBasedChecksums the row-based checksums for each shuffle partition
  */
 @DeveloperApi
 class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
@@ -83,8 +88,31 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     val keyOrdering: Option[Ordering[K]] = None,
     val aggregator: Option[Aggregator[K, V, C]] = None,
     val mapSideCombine: Boolean = false,
-    val shuffleWriterProcessor: ShuffleWriteProcessor = new ShuffleWriteProcessor)
+    val shuffleWriterProcessor: ShuffleWriteProcessor = new ShuffleWriteProcessor,
+    val rowBasedChecksums: Array[RowBasedChecksum] = ShuffleDependency.EMPTY_ROW_BASED_CHECKSUMS,
+    private val _checksumMismatchFullRetryEnabled: Boolean = false,
+    val checksumMismatchQueryLevelRollbackEnabled: Boolean = false)
   extends Dependency[Product2[K, V]] with Logging {
+
+  def this(
+      rdd: RDD[_ <: Product2[K, V]],
+      partitioner: Partitioner,
+      serializer: Serializer,
+      keyOrdering: Option[Ordering[K]],
+      aggregator: Option[Aggregator[K, V, C]],
+      mapSideCombine: Boolean,
+      shuffleWriterProcessor: ShuffleWriteProcessor) = {
+    this(
+      rdd,
+      partitioner,
+      serializer,
+      keyOrdering,
+      aggregator,
+      mapSideCombine,
+      shuffleWriterProcessor,
+      ShuffleDependency.EMPTY_ROW_BASED_CHECKSUMS
+    )
+  }
 
   if (mapSideCombine) {
     require(aggregator.isDefined, "Map-side combine without Aggregator specified!")
@@ -100,14 +128,17 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
 
   val shuffleId: Int = _rdd.context.newShuffleId()
 
-  val shuffleHandle: ShuffleHandle = _rdd.context.env.shuffleManager.registerShuffle(
-    shuffleId, this)
-
   private[this] val numPartitions = rdd.partitions.length
 
   // By default, shuffle merge is allowed for ShuffleDependency if push based shuffle
   // is enabled
   private[this] var _shuffleMergeAllowed = canShuffleMergeBeEnabled()
+
+  // Route to the manager for this dependency's type (the incremental manager for a
+  // PipelinedShuffleDependency, the default manager otherwise). The handle is minted once here on
+  // the driver, so executors that later read it are served by the same manager.
+  val shuffleHandle: ShuffleHandle = _rdd.context.env.shuffleManagerFor(this).registerShuffle(
+    shuffleId, this)
 
   private[spark] def setShuffleMergeAllowed(shuffleMergeAllowed: Boolean): Unit = {
     _shuffleMergeAllowed = shuffleMergeAllowed
@@ -116,6 +147,9 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
   def shuffleMergeEnabled : Boolean = shuffleMergeAllowed && mergerLocs.nonEmpty
 
   def shuffleMergeAllowed : Boolean = _shuffleMergeAllowed
+
+  def checksumMismatchFullRetryEnabled: Boolean =
+    _checksumMismatchFullRetryEnabled && !canShuffleMergeBeEnabled()
 
   /**
    * Stores the location of the list of chosen external shuffle services for handling the
@@ -224,6 +258,74 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
 
   _rdd.sparkContext.cleaner.foreach(_.registerShuffleForCleanup(this))
   _rdd.sparkContext.shuffleDriverComponents.registerShuffle(shuffleId)
+}
+
+
+/**
+ * :: DeveloperApi ::
+ * A [[ShuffleDependency]] whose output can be read incrementally: a consumer stage may begin
+ * reading the shuffle output while the producer stage is still running, rather than waiting for the
+ * producer's full, materialized output.
+ *
+ * This is a subtype of [[ShuffleDependency]] -- and thus, like it, a first-class dependency kind
+ * alongside [[NarrowDependency]] under [[Dependency]]. It is intended to be the marker the
+ * `DAGScheduler` will use to decide that the producer and consumer
+ * stages connected by this edge may run concurrently (a "pipelined group"), and that the shuffle
+ * layer should serve this shuffle with an incremental shuffle implementation. A plain
+ * [[ShuffleDependency]] keeps the existing semantics: its output is fully materialized before any
+ * consumer reads it.
+ *
+ * Two behaviors are active from construction, driven by this type: shuffle registration routes to
+ * the incremental (pipelined) shuffle manager via `SparkEnv.shuffleManagerFor` (a plain
+ * [[ShuffleDependency]] goes to the blocking manager), and push-based shuffle merge is
+ * unconditionally disabled (`setShuffleMergeAllowed(false)`; see below) because merge exposes
+ * output only after a post-completion finalize step and would register merge results for a
+ * transient shuffle. Beyond those, the concurrent scheduling behavior is added separately by the
+ * `DAGScheduler` components that match on this type; code that only matches the parent
+ * `ShuffleDependency` still treats it as an ordinary (materialized) shuffle for everything else.
+ *
+ * The name is *pipelined* rather than *streaming*: reading producer output as it is produced is a
+ * general execution capability (software-pipelining of dependent stages), not specific to
+ * streaming. Streaming / real-time mode is the first caller, but nothing here is
+ * streaming-specific.
+ *
+ * Note: the parent's `checksumMismatchFullRetryEnabled` /
+ * `checksumMismatchQueryLevelRollbackEnabled` parameters are intentionally not exposed here, so
+ * they stay at their `false` defaults for a pipelined shuffle. Their checksum retry / query-level
+ * rollback recomputes and re-runs succeeding stages after a mismatch; in a pipelined group any
+ * failure aborts the whole group and the caller reruns from scratch, so that stage-level recompute
+ * never fires -- the mechanism is moot by construction (it is also incompatible with a consumer
+ * that has already read the output incrementally). Leaving the params unset keeps the idiom
+ * unreachable.
+ */
+@DeveloperApi
+class PipelinedShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
+    _rdd: RDD[_ <: Product2[K, V]],
+    partitioner: Partitioner,
+    serializer: Serializer = SparkEnv.get.serializer,
+    keyOrdering: Option[Ordering[K]] = None,
+    aggregator: Option[Aggregator[K, V, C]] = None,
+    mapSideCombine: Boolean = false,
+    shuffleWriterProcessor: ShuffleWriteProcessor = new ShuffleWriteProcessor,
+    rowBasedChecksums: Array[RowBasedChecksum] = ShuffleDependency.EMPTY_ROW_BASED_CHECKSUMS)
+  extends ShuffleDependency[K, V, C](
+    _rdd,
+    partitioner,
+    serializer,
+    keyOrdering,
+    aggregator,
+    mapSideCombine,
+    shuffleWriterProcessor,
+    rowBasedChecksums) {
+
+  // Push-based shuffle merge is incompatible with a pipelined (incrementally-readable) shuffle: it
+  // exposes output only after a post-completion "finalize" step, the opposite of incremental reads,
+  // and would register merge results in the MapOutputTracker for a transient shuffle that must not
+  // outlive its group. ShuffleDependency enables merge by default whenever push-based shuffle is on
+  // cluster-wide; disable it here so a pipelined producer never acquires merger locations. Without
+  // this, ShuffleWriteProcessor.write would reach the push path and dereference the incremental
+  // manager's shuffleBlockResolver, which the streaming manager does not support.
+  setShuffleMergeAllowed(false)
 }
 
 

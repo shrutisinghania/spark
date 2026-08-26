@@ -181,8 +181,23 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]]
     }
   }
 
+  def mergeTagsFrom(other: BaseType): Unit = {
+    if (!other.isTagsEmpty) {
+      // Merge all tags from the other node into this node.
+      // Unlike copyTagsFrom which only copies when this node has no tags,
+      // mergeTagsFrom will always merge tags regardless of existing state.
+      // If both nodes have the same tag with different values, the value
+      // from the other node will overwrite the existing value in this node.
+      tags ++= other.tags
+    }
+  }
+
   def setTagValue[T](tag: TreeNodeTag[T], value: T): Unit = {
     tags(tag) = value
+  }
+
+  def containsTag[T](tag: TreeNodeTag[T]): Boolean = {
+    getTagValue[T](tag).isDefined
   }
 
   def getTagValue[T](tag: TreeNodeTag[T]): Option[T] = {
@@ -212,7 +227,7 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]]
     children.map(_.height).reduceOption(_ max _).getOrElse(0) + 1)
   def height: Int = _height()
 
-  private val _hashCode = new BestEffortLazyVal[Integer](() => MurmurHash3.productHash(this))
+  private val _hashCode = new BestEffortLazyVal[Integer](() => MurmurHash3.caseClassHash(this))
   override def hashCode(): Int = _hashCode()
 
   /**
@@ -454,6 +469,22 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]]
    */
   def transformDown(rule: PartialFunction[BaseType, BaseType]): BaseType = {
     transformDownWithPruning(AlwaysProcess.fn, UnknownRuleId)(rule)
+  }
+
+  /**
+   * A variant of [[transformDown]] that retains structurally equal replacement nodes.
+   */
+  private[sql] def transformDownWithReferenceEquality(
+      rule: PartialFunction[BaseType, BaseType]): BaseType = {
+    val afterRule = CurrentOrigin.withOrigin(origin) {
+      rule.applyOrElse(this, identity[BaseType])
+    }
+    if (this eq afterRule) {
+      mapChildrenWithReferenceEquality(_.transformDownWithReferenceEquality(rule))
+    } else {
+      afterRule.copyTagsFrom(this)
+      afterRule.mapChildrenWithReferenceEquality(_.transformDownWithReferenceEquality(rule))
+    }
   }
 
   /**
@@ -718,6 +749,22 @@ abstract class TreeNode[BaseType <: TreeNode[BaseType]]
       withNewChildren(children.map(f))
     } else {
       this
+    }
+  }
+
+  private[sql] final def mapChildrenWithReferenceEquality(
+      f: BaseType => BaseType): BaseType = {
+    val newChildren = children.map(f)
+    if (children.iterator.zip(newChildren.iterator).forall { case (oldChild, newChild) =>
+        oldChild eq newChild
+      }) {
+      this
+    } else {
+      CurrentOrigin.withOrigin(origin) {
+        val res = withNewChildrenInternal(asIndexedSeq(newChildren))
+        res.copyTagsFrom(this)
+        res
+      }
     }
   }
 

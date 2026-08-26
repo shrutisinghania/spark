@@ -18,21 +18,31 @@
 package org.apache.spark.sql.connect.client
 
 import java.net.URI
-import java.util.{Locale, UUID}
-import java.util.concurrent.Executor
+import java.nio.charset.StandardCharsets.UTF_8
+import java.util.{Base64, Locale, UUID}
+import java.util.concurrent.{Executor, TimeUnit}
 
 import scala.collection.mutable
+import scala.concurrent.duration.FiniteDuration
 import scala.jdk.CollectionConverters._
 import scala.util.Properties
+import scala.util.control.NonFatal
 
+import com.google.protobuf
 import com.google.protobuf.ByteString
 import io.grpc._
 
 import org.apache.spark.SparkBuildInfo.{spark_version => SPARK_VERSION}
+import org.apache.spark.SparkThrowable
+import org.apache.spark.annotation.{DeveloperApi, Experimental}
 import org.apache.spark.connect.proto
 import org.apache.spark.connect.proto.UserContext
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.LogKeys.{ERROR, RATIO, SIZE, TIME}
+import org.apache.spark.sql.connect.RuntimeConfig
 import org.apache.spark.sql.connect.common.ProtoUtils
 import org.apache.spark.sql.connect.common.config.ConnectCommon
+import org.apache.spark.sql.util.CloseableIterator
 import org.apache.spark.util.SparkSystemUtils
 
 /**
@@ -40,11 +50,20 @@ import org.apache.spark.util.SparkSystemUtils
  */
 private[sql] class SparkConnectClient(
     private[sql] val configuration: SparkConnectClient.Configuration,
-    private[sql] val channel: ManagedChannel) {
+    private[sql] val channel: ManagedChannel)
+    extends Logging {
 
   private val userContext: UserContext = configuration.userContext
 
-  private[this] val stubState = new SparkConnectStubState(channel, configuration.retryPolicies)
+  private[this] val stubState = new SparkConnectStubState(channel, configuration)
+
+  if (configuration.metadata.keys.exists(
+      _.equalsIgnoreCase(SparkConnectClient.OPERATION_ID_HEADER))) {
+    logWarning(
+      s"Connection option ${SparkConnectClient.OPERATION_ID_HEADER} is ignored because " +
+        "Spark Connect sets it for each ExecutePlan request.")
+  }
+
   private[this] val bstub =
     new CustomSparkConnectBlockingStub(channel, stubState)
   private[this] val stub =
@@ -63,6 +82,70 @@ private[sql] class SparkConnectClient(
   // concurrent Spark sessions of the same user. If the channel is closed, creating
   // a new client will create a new session ID.
   private[sql] val sessionId: String = configuration.sessionId.getOrElse(UUID.randomUUID.toString)
+
+  private val conf: RuntimeConfig = new RuntimeConfig(this)
+
+  // Cached plan compression options.
+  private var _planCompressionOptions: Option[Option[PlanCompressionOptions]] = None
+
+  // Get the plan compression options. The options are cached after the first call.
+  private[sql] def getPlanCompressionOptions: Option[PlanCompressionOptions] = {
+    _planCompressionOptions match {
+      case Some(options) => options
+      case None =>
+        val options =
+          try {
+            Some(
+              PlanCompressionOptions(
+                thresholdBytes =
+                  conf.get("spark.connect.session.planCompression.threshold").toInt,
+                algorithm = conf.get("spark.connect.session.planCompression.defaultAlgorithm")))
+          } catch {
+            // Disable plan compression if the server does not support it. Other exceptions are not
+            // swallowed.
+            case e: NoSuchElementException =>
+              logWarning(
+                log"Plan compression is disabled because the server does not support it",
+                e)
+              None
+            case e: SparkThrowable
+                if e.getCondition == "INVALID_CONF_VALUE"
+                  || e.getCondition == "SQL_CONF_NOT_FOUND"
+                  || e.getCondition == "CONFIG_NOT_AVAILABLE" =>
+              logWarning(
+                log"Plan compression is disabled because the server does not support it",
+                e)
+              None
+          }
+        _planCompressionOptions = Some(options)
+        options
+    }
+  }
+
+  // For testing and internal use only.
+  private[sql] def setPlanCompressionOptions(
+      planCompressionOptions: Option[PlanCompressionOptions]): Unit = {
+    _planCompressionOptions = Some(planCompressionOptions)
+  }
+
+  /**
+   * Handle plan compression errors.
+   */
+  private def handlePlanCompressionErrors[E](fn: => E): E = {
+    try {
+      fn
+    } catch {
+      // If the server cannot parse the compressed plan, disable plan compression for subsequent
+      // requests on the session.
+      case e: SparkThrowable if e.getCondition == "CONNECT_INVALID_PLAN.CANNOT_PARSE" =>
+        logWarning(
+          log"Disabling plan compression for the session due to " +
+            log"CONNECT_INVALID_PLAN.CANNOT_PARSE error.")
+        setPlanCompressionOptions(None)
+        // Retry the code block without plan compression.
+        fn
+    }
+  }
 
   /**
    * Hijacks the stored server side session ID with the given suffix. Used for testing to make
@@ -121,6 +204,90 @@ private[sql] class SparkConnectClient(
   }
 
   /**
+   * Try to compress the plan if it exceeds the threshold defined in the planCompressionOptions.
+   * Return the original plan if compression is disabled, not needed, or not effective.
+   */
+  private def tryCompressPlan(plan: proto.Plan): proto.Plan = {
+    def tryCompressMessage(
+        message: protobuf.Message,
+        opType: proto.Plan.CompressedOperation.OpType,
+        options: PlanCompressionOptions): Option[proto.Plan.CompressedOperation] = {
+      val serialized = message.toByteArray
+      if (serialized.length > options.thresholdBytes) {
+        try {
+          import com.github.luben.zstd.Zstd
+
+          val startTime = System.nanoTime()
+          val compressed = Zstd.compress(serialized)
+          val duration = (System.nanoTime() - startTime) / 1e9
+          val savingRatio = 1 - compressed.length.toDouble / serialized.length
+          logDebug(
+            log"Plan compression: original_size=${MDC(SIZE, serialized.length)}, " +
+              log"compressed_size=${MDC(SIZE, compressed.length)}, " +
+              log"saving_ratio=${MDC(RATIO, savingRatio)}, " +
+              log"duration_s=${MDC(TIME, duration)}")
+          if (compressed.length < serialized.length) {
+            return Some(
+              proto.Plan.CompressedOperation
+                .newBuilder()
+                .setData(ByteString.copyFrom(compressed))
+                .setOpType(opType)
+                .setCompressionCodec(proto.CompressionCodec.COMPRESSION_CODEC_ZSTD)
+                .build())
+          } else {
+            logDebug(log"Plan compression not effective. Using original plan.")
+          }
+        } catch {
+          case _: NoClassDefFoundError | _: ClassNotFoundException =>
+            logInfo(log"Zstd library not available. Disabling plan compression.")
+            setPlanCompressionOptions(None)
+          case NonFatal(e) =>
+            logWarning(
+              log"Failed to compress plan: ${MDC(ERROR, e.getMessage)}. Using original " +
+                log"plan and disabling plan compression.")
+            setPlanCompressionOptions(None)
+        }
+      }
+      None
+    }
+
+    def maybeCompressPlan(
+        plan: proto.Plan,
+        message: protobuf.Message,
+        opType: proto.Plan.CompressedOperation.OpType,
+        clearFn: proto.Plan.Builder => proto.Plan.Builder,
+        options: PlanCompressionOptions): proto.Plan = {
+      tryCompressMessage(message, opType, options) match {
+        case Some(compressedOperation) =>
+          clearFn(proto.Plan.newBuilder(plan)).setCompressedOperation(compressedOperation).build()
+        case None => plan
+      }
+    }
+
+    getPlanCompressionOptions match {
+      case Some(options) if options.algorithm == "ZSTD" && options.thresholdBytes >= 0 =>
+        plan.getOpTypeCase match {
+          case proto.Plan.OpTypeCase.ROOT =>
+            maybeCompressPlan(
+              plan,
+              plan.getRoot,
+              proto.Plan.CompressedOperation.OpType.OP_TYPE_RELATION,
+              _.clearRoot(),
+              options)
+          case proto.Plan.OpTypeCase.COMMAND =>
+            maybeCompressPlan(
+              plan,
+              plan.getCommand,
+              proto.Plan.CompressedOperation.OpType.OP_TYPE_COMMAND,
+              _.clearCommand(),
+              options)
+          case _ => plan
+        }
+      case _ => plan
+    }
+  }
+
+  /**
    * Execute the plan and return response iterator.
    *
    * It returns CloseableIterator. For resource management it is better to close it once you are
@@ -131,25 +298,45 @@ private[sql] class SparkConnectClient(
       plan: proto.Plan,
       operationId: Option[String] = None): CloseableIterator[proto.ExecutePlanResponse] = {
     artifactManager.uploadAllClassFileArtifacts()
-    val request = proto.ExecutePlanRequest
-      .newBuilder()
-      .setPlan(plan)
-      .setUserContext(userContext)
-      .setSessionId(sessionId)
-      .setClientType(userAgent)
-      .addAllTags(tags.get.toSeq.asJava)
-    serverSideSessionId.foreach(session => request.setClientObservedServerSideSessionId(session))
-    operationId.foreach { opId =>
+    handlePlanCompressionErrors {
+      // Compress the plan if needed.
+      val maybeCompressedPlan = tryCompressPlan(plan)
+      val request = proto.ExecutePlanRequest
+        .newBuilder()
+        .setPlan(maybeCompressedPlan)
+        .setUserContext(userContext)
+        .setSessionId(sessionId)
+        .setClientType(userAgent)
+        .addAllTags(tags.get.toSeq.asJava)
+
+      // Add request option to allow result chunking.
+      if (configuration.allowArrowBatchChunking) {
+        val chunkingOptionsBuilder = proto.ResultChunkingOptions
+          .newBuilder()
+          .setAllowArrowBatchChunking(true)
+        configuration.preferredArrowChunkSize.foreach { size =>
+          chunkingOptionsBuilder.setPreferredArrowChunkSize(size)
+        }
+        request.addRequestOptions(
+          proto.ExecutePlanRequest.RequestOption
+            .newBuilder()
+            .setResultChunkingOptions(chunkingOptionsBuilder.build())
+            .build())
+      }
+
+      serverSideSessionId.foreach(session =>
+        request.setClientObservedServerSideSessionId(session))
+      val resolvedOperationId = operationId.getOrElse(UUID.randomUUID.toString)
       require(
-        isValidUUID(opId),
-        s"Invalid operationId: $opId. The id must be an UUID string of " +
+        isValidUUID(resolvedOperationId),
+        s"Invalid operationId: $resolvedOperationId. The id must be an UUID string of " +
           "the format `00112233-4455-6677-8899-aabbccddeeff`")
-      request.setOperationId(opId)
-    }
-    if (configuration.useReattachableExecute) {
-      bstub.executePlanReattachable(request.build())
-    } else {
-      bstub.executePlan(request.build())
+      request.setOperationId(resolvedOperationId)
+      if (configuration.useReattachableExecute) {
+        bstub.executePlanReattachable(request.build())
+      } else {
+        bstub.executePlan(request.build())
+      }
     }
   }
 
@@ -180,71 +367,87 @@ private[sql] class SparkConnectClient(
       plan: Option[proto.Plan] = None,
       explainMode: Option[proto.AnalyzePlanRequest.Explain.ExplainMode] = None)
       : proto.AnalyzePlanResponse = {
-    val builder = proto.AnalyzePlanRequest.newBuilder()
-    method match {
-      case proto.AnalyzePlanRequest.AnalyzeCase.SCHEMA =>
-        assert(plan.isDefined)
-        builder.setSchema(
-          proto.AnalyzePlanRequest.Schema
-            .newBuilder()
-            .setPlan(plan.get)
-            .build())
-      case proto.AnalyzePlanRequest.AnalyzeCase.EXPLAIN =>
-        if (explainMode.isEmpty) {
-          throw new IllegalArgumentException(s"ExplainMode is required in Explain request")
-        }
-        assert(plan.isDefined)
-        builder.setExplain(
-          proto.AnalyzePlanRequest.Explain
-            .newBuilder()
-            .setPlan(plan.get)
-            .setExplainMode(explainMode.get)
-            .build())
-      case proto.AnalyzePlanRequest.AnalyzeCase.IS_LOCAL =>
-        assert(plan.isDefined)
-        builder.setIsLocal(
-          proto.AnalyzePlanRequest.IsLocal
-            .newBuilder()
-            .setPlan(plan.get)
-            .build())
-      case proto.AnalyzePlanRequest.AnalyzeCase.IS_STREAMING =>
-        assert(plan.isDefined)
-        builder.setIsStreaming(
-          proto.AnalyzePlanRequest.IsStreaming
-            .newBuilder()
-            .setPlan(plan.get)
-            .build())
-      case proto.AnalyzePlanRequest.AnalyzeCase.INPUT_FILES =>
-        assert(plan.isDefined)
-        builder.setInputFiles(
-          proto.AnalyzePlanRequest.InputFiles
-            .newBuilder()
-            .setPlan(plan.get)
-            .build())
-      case proto.AnalyzePlanRequest.AnalyzeCase.SPARK_VERSION =>
-        builder.setSparkVersion(proto.AnalyzePlanRequest.SparkVersion.newBuilder().build())
-      case other => throw new IllegalArgumentException(s"Unknown Analyze request $other")
+    handlePlanCompressionErrors {
+      val builder = proto.AnalyzePlanRequest.newBuilder()
+      // Compress the plan if needed.
+      val maybeCompressedPlan = plan match {
+        case Some(p) => Some(tryCompressPlan(p))
+        case None => None
+      }
+      method match {
+        case proto.AnalyzePlanRequest.AnalyzeCase.SCHEMA =>
+          assert(maybeCompressedPlan.isDefined)
+          builder.setSchema(
+            proto.AnalyzePlanRequest.Schema
+              .newBuilder()
+              .setPlan(maybeCompressedPlan.get)
+              .build())
+        case proto.AnalyzePlanRequest.AnalyzeCase.EXPLAIN =>
+          if (explainMode.isEmpty) {
+            throw new IllegalArgumentException(s"ExplainMode is required in Explain request")
+          }
+          assert(maybeCompressedPlan.isDefined)
+          builder.setExplain(
+            proto.AnalyzePlanRequest.Explain
+              .newBuilder()
+              .setPlan(maybeCompressedPlan.get)
+              .setExplainMode(explainMode.get)
+              .build())
+        case proto.AnalyzePlanRequest.AnalyzeCase.IS_LOCAL =>
+          assert(maybeCompressedPlan.isDefined)
+          builder.setIsLocal(
+            proto.AnalyzePlanRequest.IsLocal
+              .newBuilder()
+              .setPlan(maybeCompressedPlan.get)
+              .build())
+        case proto.AnalyzePlanRequest.AnalyzeCase.IS_STREAMING =>
+          assert(maybeCompressedPlan.isDefined)
+          builder.setIsStreaming(
+            proto.AnalyzePlanRequest.IsStreaming
+              .newBuilder()
+              .setPlan(maybeCompressedPlan.get)
+              .build())
+        case proto.AnalyzePlanRequest.AnalyzeCase.INPUT_FILES =>
+          assert(maybeCompressedPlan.isDefined)
+          builder.setInputFiles(
+            proto.AnalyzePlanRequest.InputFiles
+              .newBuilder()
+              .setPlan(maybeCompressedPlan.get)
+              .build())
+        case proto.AnalyzePlanRequest.AnalyzeCase.SPARK_VERSION =>
+          builder.setSparkVersion(proto.AnalyzePlanRequest.SparkVersion.newBuilder().build())
+        case other => throw new IllegalArgumentException(s"Unknown Analyze request $other")
+      }
+      analyze(builder)
     }
-    analyze(builder)
   }
 
   def sameSemantics(plan: proto.Plan, otherPlan: proto.Plan): proto.AnalyzePlanResponse = {
-    val builder = proto.AnalyzePlanRequest.newBuilder()
-    builder.setSameSemantics(
-      proto.AnalyzePlanRequest.SameSemantics
-        .newBuilder()
-        .setTargetPlan(plan)
-        .setOtherPlan(otherPlan))
-    analyze(builder)
+    handlePlanCompressionErrors {
+      val builder = proto.AnalyzePlanRequest.newBuilder()
+      // Compress the plan if needed.
+      val maybeCompressedPlan = tryCompressPlan(plan)
+      val otherMaybeCompressedPlan = tryCompressPlan(otherPlan)
+      builder.setSameSemantics(
+        proto.AnalyzePlanRequest.SameSemantics
+          .newBuilder()
+          .setTargetPlan(maybeCompressedPlan)
+          .setOtherPlan(otherMaybeCompressedPlan))
+      analyze(builder)
+    }
   }
 
   def semanticHash(plan: proto.Plan): proto.AnalyzePlanResponse = {
-    val builder = proto.AnalyzePlanRequest.newBuilder()
-    builder.setSemanticHash(
-      proto.AnalyzePlanRequest.SemanticHash
-        .newBuilder()
-        .setPlan(plan))
-    analyze(builder)
+    handlePlanCompressionErrors {
+      val builder = proto.AnalyzePlanRequest.newBuilder()
+      // Compress the plan if needed.
+      val maybeCompressedPlan = tryCompressPlan(plan)
+      builder.setSemanticHash(
+        proto.AnalyzePlanRequest.SemanticHash
+          .newBuilder()
+          .setPlan(maybeCompressedPlan))
+      analyze(builder)
+    }
   }
 
   private[sql] def analyze(
@@ -301,6 +504,43 @@ private[sql] class SparkConnectClient(
     bstub.releaseSession(request.build())
   }
 
+  /**
+   * Get status of operations in the session.
+   *
+   * @param operationIds
+   *   Optional sequence of operation IDs to get status for. If empty, returns status of all
+   *   operations in the session.
+   * @param operationExtensions
+   *   Optional per-operation extensions to include in the OperationStatusRequest.
+   * @param requestExtensions
+   *   Optional request-level extensions to include in the GetStatusRequest.
+   * @return
+   *   The [[proto.GetStatusResponse]] for the requested operations, including any extensions.
+   */
+  @Experimental
+  def getOperationStatuses(
+      operationIds: Seq[String] = Seq.empty,
+      operationExtensions: Seq[protobuf.Any] = Seq.empty,
+      requestExtensions: Seq[protobuf.Any] = Seq.empty): proto.GetStatusResponse = {
+    val requestBuilder = proto.GetStatusRequest
+      .newBuilder()
+      .setUserContext(userContext)
+      .setSessionId(sessionId)
+      .setClientType(userAgent)
+
+    serverSideSessionId.foreach(session =>
+      requestBuilder.setClientObservedServerSideSessionId(session))
+
+    val opStatusRequest = proto.GetStatusRequest.OperationStatusRequest.newBuilder()
+    operationIds.foreach(opStatusRequest.addOperationIds)
+    operationExtensions.foreach(opStatusRequest.addExtensions)
+    requestBuilder.setOperationStatus(opStatusRequest)
+
+    requestExtensions.foreach(requestBuilder.addExtensions)
+
+    bstub.getStatus(requestBuilder.build())
+  }
+
   private[this] val tags = new InheritableThreadLocal[mutable.Set[String]] {
     override def childValue(parent: mutable.Set[String]): mutable.Set[String] = {
       // Note: make a clone such that changes in the parent tags aren't reflected in
@@ -331,6 +571,16 @@ private[sql] class SparkConnectClient(
   }
 
   def copy(): SparkConnectClient = configuration.toSparkConnectClient
+
+  /**
+   * Returns whether arrow batch chunking is allowed.
+   */
+  def allowArrowBatchChunking: Boolean = configuration.allowArrowBatchChunking
+
+  /**
+   * Returns the preferred arrow chunk size in bytes.
+   */
+  def preferredArrowChunkSize: Option[Int] = configuration.preferredArrowChunkSize
 
   /**
    * Add a single artifact to the client session.
@@ -403,27 +653,90 @@ private[sql] class SparkConnectClient(
   }
 
   /**
-   * Cache the given local relation at the server, and return its key in the remote cache.
+   * Clone this client session, creating a new session with the same configuration and shared
+   * state as the current session but with independent runtime state.
+   *
+   * @return
+   *   A new SparkConnectClient instance with the cloned session.
    */
-  private[sql] def cacheLocalRelation(data: ByteString, schema: String): String = {
-    val localRelation = proto.Relation
+  @DeveloperApi
+  def cloneSession(): SparkConnectClient = {
+    clone(None)
+  }
+
+  /**
+   * Clone this client session with a custom session ID, creating a new session with the same
+   * configuration and shared state as the current session but with independent runtime state.
+   *
+   * @param newSessionId
+   *   Custom session ID to use for the cloned session (must be a valid UUID).
+   * @return
+   *   A new SparkConnectClient instance with the cloned session.
+   */
+  @DeveloperApi
+  def clone(newSessionId: String): SparkConnectClient = {
+    clone(Some(newSessionId))
+  }
+
+  private def clone(newSessionId: Option[String]): SparkConnectClient = {
+    val requestBuilder = proto.CloneSessionRequest
       .newBuilder()
-      .getLocalRelationBuilder
-      .setSchema(schema)
-      .setData(data)
-      .build()
-    artifactManager.cacheArtifact(localRelation.toByteArray)
+      .setUserContext(userContext)
+      .setSessionId(sessionId)
+      .setClientType("scala")
+
+    newSessionId.foreach(requestBuilder.setNewSessionId)
+
+    val response: proto.CloneSessionResponse = bstub.cloneSession(requestBuilder.build())
+
+    // Assert that the returned session ID matches the requested ID if one was provided
+    newSessionId.foreach { expectedId =>
+      require(
+        response.getNewSessionId == expectedId,
+        s"Returned session ID '${response.getNewSessionId}' does not match " +
+          s"requested ID '$expectedId'")
+    }
+
+    // Create a new client with the cloned session ID
+    val newConfiguration = configuration.copy(sessionId = Some(response.getNewSessionId))
+    new SparkConnectClient(newConfiguration, configuration.createChannel())
   }
 }
 
+// Options for plan compression
+case class PlanCompressionOptions(thresholdBytes: Int, algorithm: String)
+
+private final class SparkConnectOperationIdException(val operationId: String)
+    extends RuntimeException(s"Spark Connect operation ID: $operationId", null, false, false)
+
 object SparkConnectClient {
+
+  private[connect] val OPERATION_ID_HEADER = "spark-connect-operation-id"
+
+  /**
+   * Returns the ExecutePlan operation ID attached to a Spark Connect failure, when available.
+   *
+   * @since 4.3.0
+   */
+  @DeveloperApi
+  def getOperationId(error: Throwable): Option[String] = {
+    error.getSuppressed.collectFirst { case marker: SparkConnectOperationIdException =>
+      marker.operationId
+    }
+  }
+
+  private[client] def attachOperationId(error: Throwable, operationId: String): Unit = {
+    if (getOperationId(error).isEmpty) {
+      error.addSuppressed(new SparkConnectOperationIdException(operationId))
+    }
+  }
 
   private[sql] val SPARK_REMOTE: String = "SPARK_REMOTE"
 
   private val DEFAULT_USER_AGENT: String = "_SPARK_CONNECT_SCALA"
 
   private val AUTH_TOKEN_META_DATA_KEY: Metadata.Key[String] =
-    Metadata.Key.of("Authentication", Metadata.ASCII_STRING_MARSHALLER)
+    Metadata.Key.of("Authorization", Metadata.ASCII_STRING_MARSHALLER)
 
   // for internal tests
   private[sql] def apply(channel: ManagedChannel): SparkConnectClient = {
@@ -522,6 +835,25 @@ object SparkConnectClient {
       retryPolicy(List(policy))
     }
 
+    def rpcDeadlines(deadlines: RpcDeadlines): Builder = {
+      _configuration = _configuration.copy(rpcDeadlines = deadlines)
+      this
+    }
+
+    /**
+     * Sets the maximum cumulative wall-clock time the client will keep retrying a
+     * [[GrpcRetryHandler.RetryException]] (raised internally when a reattach attempt keeps
+     * hitting DEADLINE_EXCEEDED, or when the initial ExecutePlan never reached the server) before
+     * giving up and surfacing the underlying error. Defaults to 1 hour.
+     *
+     * @return
+     *   this builder.
+     */
+    def maxRetryExceptionElapsedTime(duration: FiniteDuration): Builder = {
+      _configuration = _configuration.copy(maxRetryExceptionElapsedTime = duration)
+      this
+    }
+
     private object URIParams {
       val PARAM_USER_ID = "user_id"
       val PARAM_USE_SSL = "use_ssl"
@@ -529,6 +861,10 @@ object SparkConnectClient {
       val PARAM_USER_AGENT = "user_agent"
       val PARAM_SESSION_ID = "session_id"
       val PARAM_GRPC_MAX_MESSAGE_SIZE = "grpc_max_message_size"
+      val PARAM_GRPC_KEEPALIVE_ENABLED = "grpc_keepalive_enabled"
+      val PARAM_GRPC_KEEPALIVE_TIME_MS = "grpc_keepalive_time_ms"
+      val PARAM_GRPC_KEEPALIVE_TIMEOUT_MS = "grpc_keepalive_timeout_ms"
+      val PARAM_GRPC_KEEPALIVE_WITHOUT_CALLS = "grpc_keepalive_without_calls"
     }
 
     private def verifyURI(uri: URI): Unit = {
@@ -591,6 +927,48 @@ object SparkConnectClient {
 
     def grpcMaxRecursionLimit: Int = _configuration.grpcMaxRecursionLimit
 
+    /**
+     * Whether the client sends gRPC/HTTP2 keepalive PINGs to detect a silently-dead connection
+     * (see `grpcKeepAliveTimeMs`/`grpcKeepAliveTimeoutMs`). Enabled by default; can be turned off
+     * as an escape hatch, e.g. if it interacts badly with a particular network path, or a client
+     * environment is prone to stalls long enough to trip false-positive disconnects.
+     */
+    def grpcKeepAliveEnabled(enabled: Boolean): Builder = {
+      _configuration = _configuration.copy(grpcKeepAliveEnabled = enabled)
+      this
+    }
+
+    def grpcKeepAliveEnabled: Boolean = _configuration.grpcKeepAliveEnabled
+
+    def grpcKeepAliveTimeMs(timeMs: Long): Builder = {
+      _configuration = _configuration.copy(grpcKeepAliveTimeMs = timeMs)
+      this
+    }
+
+    def grpcKeepAliveTimeMs: Long = _configuration.grpcKeepAliveTimeMs
+
+    def grpcKeepAliveTimeoutMs(timeoutMs: Long): Builder = {
+      _configuration = _configuration.copy(grpcKeepAliveTimeoutMs = timeoutMs)
+      this
+    }
+
+    def grpcKeepAliveTimeoutMs: Long = _configuration.grpcKeepAliveTimeoutMs
+
+    /**
+     * Whether to keep sending keepalive PINGs when there are no in-flight RPCs on the channel.
+     * Defaults to true, so a long-idle connection (e.g. a parked/unused session) is still
+     * monitored and not just calls that are actively blocked. Set to false to avoid the resulting
+     * steady background PING traffic for deployments with very large numbers of mostly-idle
+     * connections, at the cost of only detecting a dead connection once the next RPC is attempted
+     * on it.
+     */
+    def grpcKeepAliveWithoutCalls(enabled: Boolean): Builder = {
+      _configuration = _configuration.copy(grpcKeepAliveWithoutCalls = enabled)
+      this
+    }
+
+    def grpcKeepAliveWithoutCalls: Boolean = _configuration.grpcKeepAliveWithoutCalls
+
     def option(key: String, value: String): Builder = {
       _configuration = _configuration.copy(metadata = _configuration.metadata + ((key, value)))
       this
@@ -618,6 +996,11 @@ object SparkConnectClient {
             if (java.lang.Boolean.valueOf(value)) enableSsl() else disableSsl()
           case URIParams.PARAM_SESSION_ID => sessionId(value)
           case URIParams.PARAM_GRPC_MAX_MESSAGE_SIZE => grpcMaxMessageSize(value.toInt)
+          case URIParams.PARAM_GRPC_KEEPALIVE_ENABLED => grpcKeepAliveEnabled(value.toBoolean)
+          case URIParams.PARAM_GRPC_KEEPALIVE_TIME_MS => grpcKeepAliveTimeMs(value.toLong)
+          case URIParams.PARAM_GRPC_KEEPALIVE_TIMEOUT_MS => grpcKeepAliveTimeoutMs(value.toLong)
+          case URIParams.PARAM_GRPC_KEEPALIVE_WITHOUT_CALLS =>
+            grpcKeepAliveWithoutCalls(value.toBoolean)
           case _ => option(key, value)
         }
       }
@@ -700,6 +1083,21 @@ object SparkConnectClient {
       this
     }
 
+    def allowArrowBatchChunking(allow: Boolean): Builder = {
+      _configuration = _configuration.copy(allowArrowBatchChunking = allow)
+      this
+    }
+
+    def allowArrowBatchChunking: Boolean = _configuration.allowArrowBatchChunking
+
+    def preferredArrowChunkSize(size: Option[Int]): Builder = {
+      size.foreach(s => require(s > 0, "preferredArrowChunkSize must be positive"))
+      _configuration = _configuration.copy(preferredArrowChunkSize = size)
+      this
+    }
+
+    def preferredArrowChunkSize: Option[Int] = _configuration.preferredArrowChunkSize
+
     def build(): SparkConnectClient = _configuration.toSparkConnectClient
   }
 
@@ -740,11 +1138,20 @@ object SparkConnectClient {
       userAgent: String = genUserAgent(
         sys.env.getOrElse("SPARK_CONNECT_USER_AGENT", DEFAULT_USER_AGENT)),
       retryPolicies: Seq[RetryPolicy] = RetryPolicy.defaultPolicies(),
+      rpcDeadlines: RpcDeadlines = RpcDeadlines(),
+      maxRetryExceptionElapsedTime: FiniteDuration =
+        GrpcRetryHandler.DEFAULT_MAX_RETRY_EXCEPTION_ELAPSED_TIME,
       useReattachableExecute: Boolean = true,
       interceptors: List[ClientInterceptor] = List.empty,
       sessionId: Option[String] = None,
       grpcMaxMessageSize: Int = ConnectCommon.CONNECT_GRPC_MAX_MESSAGE_SIZE,
-      grpcMaxRecursionLimit: Int = ConnectCommon.CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT) {
+      grpcMaxRecursionLimit: Int = ConnectCommon.CONNECT_GRPC_MARSHALLER_RECURSION_LIMIT,
+      grpcKeepAliveEnabled: Boolean = ConnectCommon.CONNECT_GRPC_KEEPALIVE_ENABLED,
+      grpcKeepAliveTimeMs: Long = ConnectCommon.CONNECT_GRPC_KEEPALIVE_TIME_SECONDS * 1000,
+      grpcKeepAliveTimeoutMs: Long = ConnectCommon.CONNECT_GRPC_KEEPALIVE_TIMEOUT_SECONDS * 1000,
+      grpcKeepAliveWithoutCalls: Boolean = ConnectCommon.CONNECT_GRPC_KEEPALIVE_WITHOUT_CALLS,
+      allowArrowBatchChunking: Boolean = true,
+      preferredArrowChunkSize: Option[Int] = None) {
 
     private def isLocal = host.equals("localhost")
 
@@ -781,9 +1188,11 @@ object SparkConnectClient {
 
       // Workaround LocalChannelCredentials are added in
       // https://github.com/grpc/grpc-java/issues/9900
-      var metadataWithOptionalToken = metadata
+      var metadataWithOptionalToken = metadata.filterNot { case (key, _) =>
+        key.equalsIgnoreCase(OPERATION_ID_HEADER)
+      }
       if (!isSslEnabled.contains(true) && isLocal && token.isDefined) {
-        metadataWithOptionalToken = metadata + (("Authorization", s"Bearer ${token.get}"))
+        metadataWithOptionalToken += (("Authorization", s"Bearer ${token.get}"))
       }
 
       if (metadataWithOptionalToken.nonEmpty) {
@@ -793,6 +1202,18 @@ object SparkConnectClient {
       interceptors.foreach(channelBuilder.intercept(_))
 
       channelBuilder.maxInboundMessageSize(grpcMaxMessageSize)
+      if (grpcKeepAliveEnabled) {
+        // Detects a silently-dead connection (e.g. a NAT gateway/load balancer dropping an idle
+        // connection mapping without sending a TCP RST/FIN) so a blocked RPC (such as streaming
+        // query awaitTermination()) surfaces as UNAVAILABLE instead of hanging forever. Note: a
+        // stall on either end longer than keepAliveTime + keepAliveTimeout (e.g. a long JVM GC
+        // pause) can also cause an otherwise-healthy connection to be dropped -- raise both
+        // values (or disable via grpcKeepAliveEnabled) in environments prone to long GC pauses
+        // or other event-loop stalls.
+        channelBuilder.keepAliveTime(grpcKeepAliveTimeMs, TimeUnit.MILLISECONDS)
+        channelBuilder.keepAliveTimeout(grpcKeepAliveTimeoutMs, TimeUnit.MILLISECONDS)
+        channelBuilder.keepAliveWithoutCalls(grpcKeepAliveWithoutCalls)
+      }
       channelBuilder.build()
     }
 
@@ -818,7 +1239,7 @@ object SparkConnectClient {
           applier.apply(headers)
         } catch {
           case e: Throwable =>
-            applier.fail(Status.UNAUTHENTICATED.withCause(e));
+            applier.fail(Status.UNAUTHENTICATED.withCause(e))
         }
       })
     }
@@ -832,6 +1253,24 @@ object SparkConnectClient {
    */
   private[client] class MetadataHeaderClientInterceptor(metadata: Map[String, String])
       extends ClientInterceptor {
+
+    // Sealed trait for pre-processed metadata entries
+    private sealed trait MetadataEntry
+    private case class AsciiEntry(key: Metadata.Key[String], value: String) extends MetadataEntry
+    private case class BinaryEntry(key: Metadata.Key[Array[Byte]], value: Array[Byte])
+        extends MetadataEntry
+
+    // Pre-process metadata at construction time
+    private val entries: Seq[MetadataEntry] = metadata.map { case (key, value) =>
+      assert(key != null && value != null)
+      if (key.endsWith(Metadata.BINARY_HEADER_SUFFIX)) {
+        val valueByteArray = Base64.getDecoder.decode(value.getBytes(UTF_8))
+        BinaryEntry(Metadata.Key.of(key, Metadata.BINARY_BYTE_MARSHALLER), valueByteArray)
+      } else {
+        AsciiEntry(Metadata.Key.of(key, Metadata.ASCII_STRING_MARSHALLER), value)
+      }
+    }.toSeq
+
     override def interceptCall[ReqT, RespT](
         method: MethodDescriptor[ReqT, RespT],
         callOptions: CallOptions,
@@ -841,8 +1280,9 @@ object SparkConnectClient {
         override def start(
             responseListener: ClientCall.Listener[RespT],
             headers: Metadata): Unit = {
-          metadata.foreach { case (key, value) =>
-            headers.put(Metadata.Key.of(key, Metadata.ASCII_STRING_MARSHALLER), value)
+          entries.foreach {
+            case AsciiEntry(key, value) => headers.put(key, value)
+            case BinaryEntry(key, value) => headers.put(key, value)
           }
           super.start(responseListener, headers)
         }

@@ -53,7 +53,10 @@ case class ApplicationAttemptInfo private[spark](
     duration: Long,
     sparkUser: String,
     completed: Boolean = false,
-    appSparkVersion: String) {
+    appSparkVersion: String,
+    exitCode: Option[Int] = None,
+    logSourceName: Option[String] = None,
+    logSourceFullPath: Option[String] = None) {
 
   def getStartTimeEpoch: Long = startTime.getTime
 
@@ -62,6 +65,11 @@ case class ApplicationAttemptInfo private[spark](
   def getLastUpdatedEpoch: Long = lastUpdated.getTime
 
 }
+
+class ApplicationHoldStatus private[spark](
+    val supported: Boolean,
+    val held: Boolean,
+    val draining: Int)
 
 class ResourceProfileInfo private[spark](
     val id: Int,

@@ -17,10 +17,9 @@
 
 package org.apache.spark.sql.execution.command
 
-import org.apache.spark.QueryContext
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.logical.{ColumnDefinition, CreatePipelineDatasetAsSelect}
-import org.apache.spark.sql.connector.expressions.{FieldReference, IdentityTransform}
+import org.apache.spark.sql.connector.expressions.{ClusterByTransform, FieldReference, IdentityTransform}
 import org.apache.spark.sql.execution.SparkSqlParser
 import org.apache.spark.sql.execution.command.v1.CommandSuiteBase
 import org.apache.spark.sql.types.{IntegerType, MetadataBuilder, StringType, StructField, StructType}
@@ -86,6 +85,18 @@ trait CreatePipelineDatasetAsSelectParserSuiteBase extends CommandSuiteBase {
     }
   }
 
+  test("Clustering is correctly parsed") {
+    Seq(
+      (s"CREATE $datasetSqlSyntax table1 CLUSTER BY (a) AS SELECT * FROM input",
+        Seq(ClusterByTransform(Seq(FieldReference(Seq("a")))))),
+      (s"CREATE $datasetSqlSyntax table1 AS SELECT * FROM input", Seq.empty)
+    ).foreach { case (query, partitioning) =>
+      val plan = parser.parsePlan(query)
+      val cmd = plan.asInstanceOf[CreatePipelineDatasetAsSelect]
+      assert(cmd.partitioning == partitioning)
+    }
+  }
+
   test("Location is unsupported") {
     val ex = intercept[ParseException] {
       parser.parsePlan(
@@ -110,7 +121,7 @@ trait CreatePipelineDatasetAsSelectParserSuiteBase extends CommandSuiteBase {
       exception = ex,
       condition = "_LEGACY_ERROR_TEMP_0035",
       parameters = Map("message" -> ("Pipeline datasets do not currently support column " +
-        "constraints. Please remove and CHECK, UNIQUE, PK, and FK constraints specified on the " +
+        "constraints. Please remove any CHECK, UNIQUE, PK, and FK constraints specified on the " +
         "pipeline dataset.")),
       queryContext = ex.getQueryContext.map(toExpectedContext)
     )
@@ -261,14 +272,4 @@ trait CreatePipelineDatasetAsSelectParserSuiteBase extends CommandSuiteBase {
       assert(cmd.tableSpec.collation == collationOpt)
     }
   }
-
-  /** Return an ExpectedContext that is equivalent to the passed QueryContext. Used to no-op
-   * queryContext checks on error validation */
-  def toExpectedContext(actualQueryContext: QueryContext): ExpectedContext = ExpectedContext(
-    objectType = actualQueryContext.objectType(),
-    objectName = actualQueryContext.objectName(),
-    startIndex = actualQueryContext.startIndex(),
-    stopIndex = actualQueryContext.stopIndex(),
-    fragment = actualQueryContext.fragment()
-  )
 }

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # pyspark documentation build configuration file, created by
 # sphinx-quickstart on Thu Aug 28 15:17:47 2014.
@@ -74,6 +73,8 @@ extensions = [
     'IPython.sphinxext.ipython_console_highlighting',
     'numpydoc',  # handle NumPy documentation formatted docstrings.
     'sphinx_plotly_directive',  # For visualize plot result
+    # Local: forbid ':lines:' on 'literalinclude' (fragile line-number pinning).
+    'forbid_literalinclude_lines',
 ]
 
 # sphinx copy button
@@ -96,7 +97,7 @@ rst_epilog = """
 .. _binder: https://mybinder.org/v2/gh/apache/spark/{0}?filepath=python%2Fdocs%2Fsource%2Fgetting_started%2Fquickstart_df.ipynb
 .. |binder_df| replace:: Live Notebook: DataFrame
 .. _binder_df: https://mybinder.org/v2/gh/apache/spark/{0}?filepath=python%2Fdocs%2Fsource%2Fgetting_started%2Fquickstart_df.ipynb
-.. |binder_ps| replace:: Live Notebook: pandas API on Spark
+.. |binder_ps| replace:: Live Notebook: Pandas API on Spark
 .. _binder_ps: https://mybinder.org/v2/gh/apache/spark/{0}?filepath=python%2Fdocs%2Fsource%2Fgetting_started%2Fquickstart_ps.ipynb
 .. |binder_connect| replace:: Live Notebook: Spark Connect
 .. _binder_connect: https://mybinder.org/v2/gh/apache/spark/{0}?filepath=python%2Fdocs%2Fsource%2Fgetting_started%2Fquickstart_connect.ipynb

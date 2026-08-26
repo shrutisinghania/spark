@@ -18,13 +18,12 @@ import unittest
 
 import pandas as pd
 
-from pyspark.pandas.config import set_option, reset_option
-from pyspark.testing.pandasutils import PandasOnSparkTestCase
-from pyspark.testing.sqlutils import SQLTestUtils
-from pyspark.pandas.typedef.typehints import extension_dtypes_available
+from pyspark.pandas.config import reset_option, set_option
 from pyspark.pandas.tests.diff_frames_ops.test_arithmetic_chain import (
     ArithmeticChainTestingFuncMixin,
 )
+from pyspark.pandas.typedef.typehints import extension_dtypes_available
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
 class ArithmeticChainExtMixin(ArithmeticChainTestingFuncMixin):
@@ -102,19 +101,11 @@ class ArithmeticChainExtMixin(ArithmeticChainTestingFuncMixin):
 class ArithmeticChainExtTests(
     ArithmeticChainExtMixin,
     PandasOnSparkTestCase,
-    SQLTestUtils,
 ):
     pass
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.diff_frames_ops.test_arithmetic_chain_ext import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

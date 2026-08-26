@@ -163,6 +163,10 @@ private[spark] abstract class YarnSchedulerBackend(
     yarnSchedulerEndpointRef.ask[Boolean](prepareRequestExecutors(resourceProfileToTotalExecs))
   }
 
+  // The AM honors a zero executor target without killing the running executors, so the
+  // executors can be held gracefully.
+  private[spark] override def supportsExecutorHold: Boolean = true
+
   /**
    * Request that the ApplicationMaster kill the specified executors.
    */
@@ -179,7 +183,7 @@ private[spark] abstract class YarnSchedulerBackend(
       resourceProfileId: Int): Seq[BlockManagerId] = {
     // TODO (SPARK-33481) This is a naive way of calculating numMergersDesired for a stage,
     // TODO we can use better heuristics to calculate numMergersDesired for a stage.
-    val maxExecutors = if (Utils.isDynamicAllocationEnabled(sc.getConf)) {
+    val maxExecutors = if (Utils.isDynamicAllocationEnabled(sc.getReadOnlyConf)) {
       maxNumExecutors
     } else {
       numExecutors

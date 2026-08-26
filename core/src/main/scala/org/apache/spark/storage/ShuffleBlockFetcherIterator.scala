@@ -193,6 +193,14 @@ final class ShuffleBlockFetcherIterator(
 
   initialize()
 
+  private def withFetchWaitTimeTracked[T](f: => T): T = {
+    val startFetchWait = System.nanoTime()
+    val res = f
+    val fetchWaitTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startFetchWait)
+    shuffleMetrics.incFetchWaitTime(fetchWaitTime)
+    res
+  }
+
   // Decrements the buffer reference count.
   // The currentResult is set to null to prevent releasing the buffer again on cleanup()
   private[storage] def releaseCurrentResultBuffer(): Unit = {
@@ -301,8 +309,9 @@ final class ShuffleBlockFetcherIterator(
             buf.retain()
             remainingBlocks -= blockId
             blockOOMRetryCounts.remove(blockId)
-            updateMergedReqsDuration(BlockId(blockId).isShuffleChunk)
-            results.put(SuccessFetchResult(BlockId(blockId), infoMap(blockId)._2,
+            val blkId = BlockId(blockId)
+            updateMergedReqsDuration(blkId.isShuffleChunk)
+            results.put(SuccessFetchResult(blkId, infoMap(blockId)._2,
               address, infoMap(blockId)._1, buf, remainingBlocks.isEmpty))
             logDebug("remainingBlocks: " + remainingBlocks)
             enqueueDeferredFetchRequestIfNecessary()
@@ -718,7 +727,7 @@ final class ShuffleBlockFetcherIterator(
       ", expected bytesInFlight = 0 but found bytesInFlight = " + bytesInFlight)
 
     // Send out initial requests for blocks, up to our maxBytesInFlight
-    fetchUpToMaxBytes()
+    withFetchWaitTimeTracked(fetchUpToMaxBytes())
 
     val numDeferredRequest = deferredFetchRequests.values.map(_.size).sum
     val numFetches = remoteRequests.size - fetchRequests.size - numDeferredRequest
@@ -731,7 +740,7 @@ final class ShuffleBlockFetcherIterator(
     fetchLocalBlocks(localBlocks)
     logDebug(s"Got local blocks in ${Utils.getUsedTimeNs(startTimeNs)}")
     // Get host local blocks if any
-    fetchAllHostLocalBlocks(hostLocalBlocksByExecutor)
+    withFetchWaitTimeTracked(fetchAllHostLocalBlocks(hostLocalBlocksByExecutor))
     pushBasedFetchHelper.fetchAllPushMergedLocalBlocks(pushMergedLocalBlocks)
   }
 
@@ -813,10 +822,7 @@ final class ShuffleBlockFetcherIterator(
     // is also corrupt, so the previous stage could be retried.
     // For local shuffle block, throw FailureFetchResult for the first IOException.
     while (result == null) {
-      val startFetchWait = System.nanoTime()
-      result = results.take()
-      val fetchWaitTime = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startFetchWait)
-      shuffleMetrics.incFetchWaitTime(fetchWaitTime)
+      result = withFetchWaitTimeTracked[FetchResult](results.take())
 
       result match {
         case SuccessFetchResult(blockId, mapIndex, address, size, buf, isNetworkReqDone) =>
@@ -879,7 +885,7 @@ final class ShuffleBlockFetcherIterator(
                 bufIn
               }
             } catch {
-              // The exception could only be throwed by local shuffle block
+              // The exception could only be thrown by local shuffle block
               case e: IOException =>
                 assert(buf.isInstanceOf[FileSegmentManagedBuffer])
                 e match {
@@ -1076,7 +1082,7 @@ final class ShuffleBlockFetcherIterator(
       }
 
       // Send fetch requests up to maxBytesInFlight
-      fetchUpToMaxBytes()
+      withFetchWaitTimeTracked(fetchUpToMaxBytes())
     }
 
     currentResult = result.asInstanceOf[SuccessFetchResult]
@@ -1319,15 +1325,12 @@ final class ShuffleBlockFetcherIterator(
     }
 
     def filterRequests(queue: mutable.Queue[FetchRequest]): Unit = {
-      val fetchRequestsToRemove = new mutable.Queue[FetchRequest]()
-      fetchRequestsToRemove ++= queue.dequeueAll { req =>
+      queue.dequeueAll { req =>
         val firstBlock = req.blocks.head
         firstBlock.blockId.isShuffleChunk && req.address.equals(address) &&
           sameShuffleReducePartition(firstBlock.blockId)
-      }
-      fetchRequestsToRemove.foreach { _ =>
-        removedChunkIds ++=
-          fetchRequestsToRemove.flatMap(_.blocks.map(_.blockId.asInstanceOf[ShuffleBlockChunkId]))
+      }.foreach { req =>
+        removedChunkIds ++= req.blocks.map(_.blockId.asInstanceOf[ShuffleBlockChunkId])
       }
     }
 
@@ -1665,7 +1668,7 @@ object ShuffleBlockFetcherIterator {
    *                       of shuffle by an indeterminate stage attempt.
    * @param reduceId reduce id.
    * @param bitmaps bitmaps for every chunk.
-   * @param localDirs local directories where the push-merged shuffle files are storedl
+   * @param localDirs local directories where the push-merged shuffle files are stored
    */
   private[storage] case class PushMergedLocalMetaFetchResult(
       shuffleId: Int,

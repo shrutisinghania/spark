@@ -245,7 +245,7 @@ class GBTRegressionModel private[ml](
   // For ml connect only
   private[ml] def this() = this("", Array(new DecisionTreeRegressionModel), Array(Double.NaN), -1)
 
-  override def estimatedSize: Long = getEstimatedSize()
+  private[spark] override def estimatedSize: Long = estimateMatadataSize + getEstimatedSize()
 
   @Since("1.4.0")
   override def trees: Array[DecisionTreeRegressionModel] = _trees
@@ -280,7 +280,7 @@ class GBTRegressionModel private[ml](
       val predictUDF = udf { features: Vector => bcastModel.value.predict(features) }
       predictionColNames :+= $(predictionCol)
       predictionColumns :+= predictUDF(col($(featuresCol)))
-        .as($(featuresCol), outputSchema($(featuresCol)).metadata)
+        .as($(predictionCol), outputSchema($(predictionCol)).metadata)
     }
 
     if ($(leafCol).nonEmpty) {

@@ -19,26 +19,26 @@
 
 import sys
 from typing import (
-    overload,
-    Any,
     TYPE_CHECKING,
+    Any,
+    Callable,
     Union,
+    overload,
 )
 
-from pyspark.sql.tvf_argument import TableValuedFunctionArgument
-from pyspark.sql.utils import dispatch_col_method
-from pyspark.sql.types import DataType
 from pyspark.errors import PySparkValueError
+from pyspark.sql.tvf_argument import TableValuedFunctionArgument
+from pyspark.sql.types import DataType
+from pyspark.sql.utils import dispatch_col_method
 
 if TYPE_CHECKING:
-    from pyspark.sql._typing import LiteralType, DecimalLiteral, DateTimeLiteral
+    from pyspark.sql._typing import DateTimeLiteral, DecimalLiteral, LiteralType
     from pyspark.sql.window import WindowSpec
 
 __all__ = ["Column"]
 
 
 class Column(TableValuedFunctionArgument):
-
     """
     A column in a DataFrame.
 
@@ -78,92 +78,77 @@ class Column(TableValuedFunctionArgument):
 
     # arithmetic operators
     @dispatch_col_method
-    def __neg__(self) -> "Column":
-        ...
+    def __neg__(self) -> "Column": ...
 
     @dispatch_col_method
     def __add__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __sub__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __mul__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __div__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __truediv__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __mod__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __radd__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __rsub__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __rmul__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __rdiv__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __rtruediv__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __rmod__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __pow__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __rpow__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     # logistic operators
     @dispatch_col_method
@@ -185,26 +170,22 @@ class Column(TableValuedFunctionArgument):
     @dispatch_col_method
     def __lt__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __le__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __ge__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __gt__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def eqNullSafe(
@@ -280,30 +261,25 @@ class Column(TableValuedFunctionArgument):
     @dispatch_col_method
     def __and__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __or__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
-    def __invert__(self) -> "Column":
-        ...
+    def __invert__(self) -> "Column": ...
 
     @dispatch_col_method
     def __rand__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     @dispatch_col_method
     def __ror__(
         self, other: Union["Column", "LiteralType", "DecimalLiteral", "DateTimeLiteral"]
-    ) -> "Column":
-        ...
+    ) -> "Column": ...
 
     # container operators
     @dispatch_col_method
@@ -647,8 +623,7 @@ class Column(TableValuedFunctionArgument):
         ...
 
     @dispatch_col_method
-    def __iter__(self) -> None:
-        ...
+    def __iter__(self) -> None: ...
 
     # string methods
     @dispatch_col_method
@@ -824,12 +799,10 @@ class Column(TableValuedFunctionArgument):
         ...
 
     @overload
-    def substr(self, startPos: int, length: int) -> "Column":
-        ...
+    def substr(self, startPos: int, length: int) -> "Column": ...
 
     @overload
-    def substr(self, startPos: "Column", length: "Column") -> "Column":
-        ...
+    def substr(self, startPos: "Column", length: "Column") -> "Column": ...
 
     @dispatch_col_method
     def substr(self, startPos: Union[int, "Column"], length: Union[int, "Column"]) -> "Column":
@@ -1539,6 +1512,58 @@ class Column(TableValuedFunctionArgument):
         ...
 
     @dispatch_col_method
+    def transform(self, f: Callable[["Column"], "Column"]) -> "Column":
+        """
+        Applies a transformation function to this column.
+
+        This method allows you to apply a function that takes a Column and returns a Column,
+        enabling method chaining and functional transformations.
+
+        .. versionadded:: 4.1.0
+
+        Parameters
+        ----------
+        f : callable
+            A function that takes a :class:`Column` and returns a :class:`Column`.
+
+        Returns
+        -------
+        :class:`Column`
+            The result of applying the function to this column.
+
+        Examples
+        --------
+        Example 1: Chain built-in functions
+
+        >>> from pyspark.sql.functions import trim, upper
+        >>> df = spark.createDataFrame([("  hello  ",), ("  world  ",)], ["text"])
+        >>> df.select(df.text.transform(trim).transform(upper).alias("result")).show()
+        +------+
+        |result|
+        +------+
+        | HELLO|
+        | WORLD|
+        +------+
+
+        Example 2: Use lambda functions
+
+        >>> df = spark.createDataFrame([(10,), (20,), (30,)], ["value"])
+        >>> df.select(
+        ...     df.value.transform(lambda c: c + 5)
+        ...     .transform(lambda c: c * 2)
+        ...     .transform(lambda c: c - 10).alias("result")
+        ... ).show()
+        +------+
+        |result|
+        +------+
+        |    20|
+        |    40|
+        |    60|
+        +------+
+        """
+        ...
+
+    @dispatch_col_method
     def outer(self) -> "Column":
         """
         Mark this column as an outer column if its expression refers to columns from an outer query.
@@ -1551,34 +1576,54 @@ class Column(TableValuedFunctionArgument):
 
         See Also
         --------
-        pyspark.sql.dataframe.DataFrame.scalar
-        pyspark.sql.dataframe.DataFrame.exists
+        pyspark.sql.DataFrame.scalar
+        pyspark.sql.DataFrame.exists
+
+        Examples
+        --------
+        >>> from pyspark.sql import functions as sf
+        >>> employees = spark.createDataFrame(
+        ...     [
+        ...         (1, "Alice", 45000, 101), (2, "Bob", 54000, 101), (3, "Charlie", 29000, 102),
+        ...         (4, "David", 61000, 102), (5, "Eve", 48000, 101),
+        ...     ],
+        ...     ["id", "name", "salary", "department_id"],
+        ... )
+        >>> employees.alias("e1").where(
+        ...     sf.col("salary") > employees.alias("e2").where(
+        ...         sf.col("e2.department_id") == sf.col("e1.department_id").outer()
+        ...     ).select(sf.avg("salary")).scalar()
+        ... ).select("name", "salary", "department_id").orderBy("name").show()
+        +-----+------+-------------+
+        | name|salary|department_id|
+        +-----+------+-------------+
+        |  Bob| 54000|          101|
+        |David| 61000|          102|
+        +-----+------+-------------+
         """
         ...
 
     @dispatch_col_method
-    def __nonzero__(self) -> None:
-        ...
+    def __nonzero__(self) -> None: ...
 
     @dispatch_col_method
-    def __bool__(self) -> None:
-        ...
+    def __bool__(self) -> None: ...
 
     @dispatch_col_method
-    def __repr__(self) -> str:
-        ...
+    def __repr__(self) -> str: ...
 
 
 def _test() -> None:
     import doctest
-    from pyspark.sql import SparkSession
+
     import pyspark.sql.column
+    from pyspark.sql import SparkSession
 
     globs = pyspark.sql.column.__dict__.copy()
     spark = SparkSession.builder.master("local[4]").appName("sql.column tests").getOrCreate()
     globs["spark"] = spark
 
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.sql.column,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE | doctest.REPORT_NDIFF,

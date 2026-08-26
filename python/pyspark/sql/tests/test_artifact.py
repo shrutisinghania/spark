@@ -14,13 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-import unittest
 import os
 import tempfile
 
+from pyspark.errors import PySparkRuntimeError
+from pyspark.sql.functions import assert_true, lit, udf
 from pyspark.sql.tests.connect.client.test_artifact import ArtifactTestsMixin
 from pyspark.testing.sqlutils import ReusedSQLTestCase
-from pyspark.errors import PySparkRuntimeError
 
 
 class ArtifactTests(ArtifactTestsMixin, ReusedSQLTestCase):
@@ -36,6 +36,37 @@ class ArtifactTests(ArtifactTestsMixin, ReusedSQLTestCase):
         # Test multi sessions. Should be able to add the same
         # file from different session.
         self.check_add_pyfile(self.spark.newSession())
+
+    def test_add_multiple_pyfiles(self):
+        def check_add_multiple_pyfiles(spark_session):
+            with tempfile.TemporaryDirectory(prefix="check_add_multiple_pyfiles") as d:
+                pyfile_paths = []
+                for name, value in [
+                    ("my_pyfile_a.py", 1),
+                    ("my_pyfile_b.py", 2),
+                    ("my_pyfile_c.py", 3),
+                ]:
+                    pyfile_path = os.path.join(d, name)
+                    with open(pyfile_path, "w") as f:
+                        f.write(f"my_func = lambda: {value}")
+                    pyfile_paths.append(pyfile_path)
+
+                @udf("int")
+                def func(x):
+                    import my_pyfile_a
+                    import my_pyfile_b
+                    import my_pyfile_c
+
+                    return my_pyfile_a.my_func() + my_pyfile_b.my_func() + my_pyfile_c.my_func()
+
+                spark_session.addArtifacts(*pyfile_paths, pyfile=True)
+                spark_session.range(1).select(assert_true(func("id") == lit(6))).show()
+
+        check_add_multiple_pyfiles(self.spark)
+
+        # Test multi sessions. Should be able to add the same
+        # files from different session.
+        check_add_multiple_pyfiles(self.spark.newSession())
 
     def test_add_file(self):
         self.check_add_file(self.spark)
@@ -83,12 +114,6 @@ class ArtifactTests(ArtifactTestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_artifact import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore[import]
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

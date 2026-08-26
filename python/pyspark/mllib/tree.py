@@ -15,16 +15,16 @@
 # limitations under the License.
 #
 
-import sys
 import random
+import sys
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union, overload
 
-from pyspark import RDD, since
-from pyspark.mllib.common import callMLlibFunc, inherit_doc, JavaModelWrapper
+from pyspark import since
+from pyspark.core.rdd import RDD
+from pyspark.mllib.common import JavaModelWrapper, callMLlibFunc, inherit_doc
 from pyspark.mllib.linalg import _convert_to_vector
 from pyspark.mllib.regression import LabeledPoint
 from pyspark.mllib.util import JavaLoader, JavaSaveable
-from typing import Dict, Optional, Tuple, Union, overload, TYPE_CHECKING
-from pyspark.core.rdd import RDD
 
 if TYPE_CHECKING:
     from pyspark.mllib._typing import VectorLike
@@ -47,12 +47,10 @@ class TreeEnsembleModel(JavaModelWrapper, JavaSaveable):
     """
 
     @overload
-    def predict(self, x: "VectorLike") -> float:
-        ...
+    def predict(self, x: "VectorLike") -> float: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[float]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[float]: ...
 
     def predict(self, x: Union["VectorLike", RDD["VectorLike"]]) -> Union[float, RDD[float]]:
         """
@@ -105,12 +103,10 @@ class DecisionTreeModel(JavaModelWrapper, JavaSaveable, JavaLoader["DecisionTree
     """
 
     @overload
-    def predict(self, x: "VectorLike") -> float:
-        ...
+    def predict(self, x: "VectorLike") -> float: ...
 
     @overload
-    def predict(self, x: RDD["VectorLike"]) -> RDD[float]:
-        ...
+    def predict(self, x: RDD["VectorLike"]) -> RDD[float]: ...
 
     def predict(self, x: Union["VectorLike", RDD["VectorLike"]]) -> Union[float, RDD[float]]:
         """
@@ -876,7 +872,7 @@ def _test() -> None:
 
     spark = SparkSession.builder.master("local[4]").appName("mllib.tree tests").getOrCreate()
     globs["sc"] = spark.sparkContext
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         globs=globs, optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE
     )
     spark.stop()

@@ -24,7 +24,7 @@ import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, Par
 import org.apache.spark.sql.execution.datasources.v2.state.StateSourceOptions.JoinSideValues
 import org.apache.spark.sql.execution.datasources.v2.state.utils.SchemaUtil
 import org.apache.spark.sql.execution.streaming.operators.stateful.StatefulOperatorStateInfo
-import org.apache.spark.sql.execution.streaming.operators.stateful.join.{JoinStateManagerStoreGenerator, SymmetricHashJoinStateManager}
+import org.apache.spark.sql.execution.streaming.operators.stateful.join.{JoinStateManagerStoreGenerator, SnapshotOptions, SymmetricHashJoinStateManager}
 import org.apache.spark.sql.execution.streaming.operators.stateful.join.StreamingSymmetricHashJoinHelper.{JoinSide, LeftSide, RightSide}
 import org.apache.spark.sql.execution.streaming.state.StateStoreConf
 import org.apache.spark.sql.types.{BooleanType, StructType}
@@ -38,23 +38,31 @@ class StreamStreamJoinStatePartitionReaderFactory(
     storeConf: StateStoreConf,
     hadoopConf: SerializableConfiguration,
     userFacingSchema: StructType,
-    stateSchema: StructType) extends PartitionReaderFactory {
+    stateSchema: StructType,
+    joinStateFormatVersion: Option[Int] = None) extends PartitionReaderFactory {
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
     new StreamStreamJoinStatePartitionReader(storeConf, hadoopConf,
-      partition.asInstanceOf[StateStoreInputPartition], userFacingSchema, stateSchema)
+      partition.asInstanceOf[StateStoreInputPartition], userFacingSchema, stateSchema,
+      joinStateFormatVersion)
   }
 }
 
 /**
  * An implementation of [[PartitionReader]] for State Store data source, specifically to read
  * the partition for the state from stream-stream join.
+ *
+ * NOTE: The state data source is strictly read-only. Any new reader added here must open the
+ * state store in read-only mode. For the join reader, this means constructing the
+ * [[SymmetricHashJoinStateManager]] with readOnly = true.
  */
 class StreamStreamJoinStatePartitionReader(
     storeConf: StateStoreConf,
     hadoopConf: SerializableConfiguration,
     partition: StateStoreInputPartition,
     userFacingSchema: StructType,
-    stateSchema: StructType) extends PartitionReader[InternalRow] with Logging {
+    stateSchema: StructType,
+    joinStateFormatVersion: Option[Int] = None)
+  extends PartitionReader[InternalRow] with Logging {
 
   private val keySchema = SchemaUtil.getSchemaAsDataType(stateSchema, "key")
     .asInstanceOf[StructType]
@@ -71,31 +79,68 @@ class StreamStreamJoinStatePartitionReader(
       throw StateDataSourceErrors.internalError("Unexpected join side for stream-stream read!")
   }
 
-  /*
-   * This is to handle the difference of schema across state format versions. The major difference
-   * is whether we have added new field(s) in addition to the fields from input schema.
-   *
-   * - version 1: no additional field
-   * - version 2: the field "matched" is added to the last
-   */
+  private val usesVirtualColumnFamilies = StreamStreamJoinStateHelper.usesVirtualColumnFamilies(
+    hadoopConf.value,
+    partition.sourceOptions.stateCheckpointLocation.toString,
+    partition.sourceOptions.operatorId)
+
+  private val startStateStoreCheckpointIds =
+    SymmetricHashJoinStateManager.getStateStoreCheckpointIds(
+      partition.partition,
+      partition.sourceOptions.startOperatorStateUniqueIds,
+      usesVirtualColumnFamilies)
+
+  private val endStateStoreCheckpointIds =
+    SymmetricHashJoinStateManager.getStateStoreCheckpointIds(
+      partition.partition,
+      partition.sourceOptions.endOperatorStateUniqueIds,
+      usesVirtualColumnFamilies)
+
+  private val startKeyToNumValuesStateStoreCkptId = if (joinSide == LeftSide) {
+    startStateStoreCheckpointIds.left.keyToNumValues
+  } else {
+    startStateStoreCheckpointIds.right.keyToNumValues
+  }
+
+  private val startKeyWithIndexToValueStateStoreCkptId = if (joinSide == LeftSide) {
+    startStateStoreCheckpointIds.left.keyWithIndexToValue
+  } else {
+    startStateStoreCheckpointIds.right.keyWithIndexToValue
+  }
+
+  private val endKeyToNumValuesStateStoreCkptId = if (joinSide == LeftSide) {
+    endStateStoreCheckpointIds.left.keyToNumValues
+  } else {
+    endStateStoreCheckpointIds.right.keyToNumValues
+  }
+
+  private val endKeyWithIndexToValueStateStoreCkptId = if (joinSide == LeftSide) {
+    endStateStoreCheckpointIds.left.keyWithIndexToValue
+  } else {
+    endStateStoreCheckpointIds.right.keyWithIndexToValue
+  }
+
   private val (inputAttributes, formatVersion) = {
     val maybeMatchedColumn = valueSchema.last
-    val (fields, version) = {
-      // If there is a matched column, version is either 2 or 3. We need to drop the matched
-      // column from the value schema to get the actual fields.
-      if (maybeMatchedColumn.name == "matched" && maybeMatchedColumn.dataType == BooleanType) {
-        // If checkpoint is using one store and virtual column families, version is 3
-        if (StreamStreamJoinStateHelper.usesVirtualColumnFamilies(
-          hadoopConf.value,
-          partition.sourceOptions.stateCheckpointLocation.toString,
-          partition.sourceOptions.operatorId)) {
-          (valueSchema.dropRight(1), 3)
-        } else {
-          (valueSchema.dropRight(1), 2)
-        }
-      } else {
+    // If there is a matched column, version is higher than 1. We need to drop the matched
+    // column from the value schema to get the actual fields.
+    val (fields, version) = joinStateFormatVersion match {
+      // Use explicit format version when available from offset log
+      case Some(v) if v >= 2 =>
+        (valueSchema.dropRight(1), v)
+      case Some(1) =>
         (valueSchema, 1)
-      }
+      // Fall back to heuristic-based detection for old checkpoints
+      case _ =>
+        if (maybeMatchedColumn.name == "matched" && maybeMatchedColumn.dataType == BooleanType) {
+          if (usesVirtualColumnFamilies) {
+            (valueSchema.dropRight(1), 3)
+          } else {
+            (valueSchema.dropRight(1), 2)
+          }
+        } else {
+          (valueSchema, 1)
+        }
     }
 
     assert(fields.toArray.sameElements(userFacingValueSchema.fields),
@@ -130,14 +175,21 @@ class StreamStreamJoinStatePartitionReader(
         storeConf = storeConf,
         hadoopConf = hadoopConf.value,
         partitionId = partition.partition,
-        keyToNumValuesStateStoreCkptId = None,
-        keyWithIndexToValueStateStoreCkptId = None,
+        keyToNumValuesStateStoreCkptId = startKeyToNumValuesStateStoreCkptId,
+        keyWithIndexToValueStateStoreCkptId = startKeyWithIndexToValueStateStoreCkptId,
         formatVersion,
         skippedNullValueCount = None,
         useStateStoreCoordinator = false,
-        snapshotStartVersion =
-          partition.sourceOptions.fromSnapshotOptions.map(_.snapshotStartBatchId + 1),
-        joinStoreGenerator = new JoinStateManagerStoreGenerator()
+        snapshotOptions =
+          partition.sourceOptions.fromSnapshotOptions.map(opts => SnapshotOptions(
+            snapshotVersion = opts.snapshotStartBatchId + 1,
+            endVersion = partition.sourceOptions.batchId + 1,
+            startKeyToNumValuesStateStoreCkptId = startKeyToNumValuesStateStoreCkptId,
+            startKeyWithIndexToValueStateStoreCkptId = startKeyWithIndexToValueStateStoreCkptId,
+            endKeyToNumValuesStateStoreCkptId = endKeyToNumValuesStateStoreCkptId,
+            endKeyWithIndexToValueStateStoreCkptId = endKeyWithIndexToValueStateStoreCkptId)),
+        joinStoreGenerator = new JoinStateManagerStoreGenerator(),
+        readOnly = true
       )
     }
 

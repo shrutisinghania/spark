@@ -211,7 +211,7 @@ private[spark] class TypedConfigBuilder[T](
   def createOptional: OptionalConfigEntry[T] = {
     val entry = new OptionalConfigEntry[T](parent.key, parent._prependedKey,
       parent._prependSeparator, parent._alternatives, converter, stringConverter, parent._doc,
-      parent._public, parent._version)
+      parent._public, parent._version, parent._bindingPolicy)
     parent._onCreate.foreach(_(entry))
     entry
   }
@@ -227,7 +227,8 @@ private[spark] class TypedConfigBuilder[T](
         val transformedDefault = converter(stringConverter(default))
         val entry = new ConfigEntryWithDefault[T](parent.key, parent._prependedKey,
           parent._prependSeparator, parent._alternatives, transformedDefault, converter,
-          stringConverter, parent._doc, parent._public, parent._version)
+          stringConverter, parent._doc, parent._public, parent._version,
+          parent._bindingPolicy)
         parent._onCreate.foreach(_ (entry))
         entry
     }
@@ -237,7 +238,7 @@ private[spark] class TypedConfigBuilder[T](
   def createWithDefaultFunction(defaultFunc: () => T): ConfigEntry[T] = {
     val entry = new ConfigEntryWithDefaultFunction[T](parent.key, parent._prependedKey,
       parent._prependSeparator, parent._alternatives, defaultFunc, converter, stringConverter,
-      parent._doc, parent._public, parent._version)
+      parent._doc, parent._public, parent._version, parent._bindingPolicy)
     parent._onCreate.foreach(_ (entry))
     entry
   }
@@ -249,7 +250,7 @@ private[spark] class TypedConfigBuilder[T](
   def createWithDefaultString(default: String): ConfigEntry[T] = {
     val entry = new ConfigEntryWithDefaultString[T](parent.key, parent._prependedKey,
       parent._prependSeparator, parent._alternatives, default, converter, stringConverter,
-      parent._doc, parent._public, parent._version)
+      parent._doc, parent._public, parent._version, parent._bindingPolicy)
     parent._onCreate.foreach(_(entry))
     entry
   }
@@ -272,6 +273,27 @@ private[spark] case class ConfigBuilder(key: String) {
   private[config] var _version = ""
   private[config] var _onCreate: Option[ConfigEntry[_] => Unit] = None
   private[config] var _alternatives = List.empty[String]
+  private[config] var _bindingPolicy: Option[ConfigBindingPolicy.Value] = None
+
+  /**
+   * Sets the binding policy for how this config value behaves within SQL views, UDFs, or
+   * procedures.
+   *
+   * - [[ConfigBindingPolicy.SESSION]]: The config value propagates from the active session
+   *   to views/UDFs/procedures. This is important for queries that should have uniform behavior
+   *   across the entire query.
+   *
+   * - [[ConfigBindingPolicy.PERSISTED]]: The view/UDF/procedure will use the value saved on
+   *   view/UDF/procedure creation if it exists, or Spark default value for that config if it
+   *   doesn't.
+   *
+   * - [[ConfigBindingPolicy.NOT_APPLICABLE]]: The config does not interact with view/UDF/procedure
+   *   resolution. If accessed at runtime, it behaves the same as [[ConfigBindingPolicy.SESSION]].
+   */
+  def withBindingPolicy(policy: ConfigBindingPolicy.Value): ConfigBuilder = {
+    _bindingPolicy = Some(policy)
+    this
+  }
 
   def internal(): ConfigBuilder = {
     _public = false
@@ -323,6 +345,32 @@ private[spark] case class ConfigBuilder(key: String) {
     new TypedConfigBuilder(this, toNumber(_, _.toDouble, key, "double"))
   }
 
+  /**
+   * Configure a config entry whose value is a (possibly fractional) decimal number, parsed
+   * directly from its string form into a [[scala.math.BigDecimal]]. Constructing the value from
+   * the string (rather than going through a [[Double]]) preserves the exact decimal value the user
+   * typed (e.g. `0.1` is the exact decimal `0.1`, not the double `0.1000000000000000055...`),
+   * which is required for exact accounting of fractional resources such as a fractional
+   * `spark.task.cpus`.
+   */
+  def decimalConf: TypedConfigBuilder[BigDecimal] = {
+    checkPrependConfig
+    new TypedConfigBuilder(this,
+      toNumber(_, s => BigDecimal(s), key, "decimal"),
+      // strip trailing zeros (so a normalized value like 0.200000000 is written back as 0.2) and
+      // use toPlainString to avoid scientific notation. For extreme exponents (e.g. 1e100000000,
+      // as can be rendered in a checkValue rejection message) toPlainString would materialize
+      // one character per zero, so fall back to scientific notation there.
+      { v: BigDecimal =>
+        val stripped = v.bigDecimal.stripTrailingZeros()
+        if (stripped.scale > 100 || stripped.scale < -100) {
+          stripped.toString
+        } else {
+          stripped.toPlainString
+        }
+      })
+  }
+
   def booleanConf: TypedConfigBuilder[Boolean] = {
     checkPrependConfig
     new TypedConfigBuilder(this, toBoolean(_, key))
@@ -354,7 +402,7 @@ private[spark] case class ConfigBuilder(key: String) {
 
   def fallbackConf[T](fallback: ConfigEntry[T]): ConfigEntry[T] = {
     val entry = new FallbackConfigEntry(key, _prependedKey, _prependSeparator, _alternatives, _doc,
-      _public, _version, fallback)
+      _public, _version, _bindingPolicy, fallback)
     _onCreate.foreach(_(entry))
     entry
   }

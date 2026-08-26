@@ -15,12 +15,12 @@
 # limitations under the License.
 #
 
-import os
-import tempfile
-import unittest
-import time
-import shutil
 import json
+import os
+import shutil
+import tempfile
+import time
+import unittest
 
 from pyspark import SparkConf, SparkContext
 from pyspark.resource.profile import ResourceProfileBuilder
@@ -142,12 +142,6 @@ class StageSchedulingTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.tests.test_stage_sched import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

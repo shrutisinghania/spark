@@ -19,10 +19,18 @@ import os
 import shutil
 import tempfile
 
-from pyspark.errors import AnalysisException
+from pyspark.errors import AnalysisException, PySparkTypeError, PySparkValueError
+from pyspark.sql import Row
 from pyspark.sql.functions import col, lit
 from pyspark.sql.readwriter import DataFrameWriterV2
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import (
+    ArrayType,
+    BinaryType,
+    MapType,
+    StringType,
+    StructField,
+    StructType,
+)
 from pyspark.testing import assertDataFrameEqual
 from pyspark.testing.sqlutils import ReusedSQLTestCase
 
@@ -155,6 +163,12 @@ class ReadwriterTestsMixin:
             )
             self.assertSetEqual(set(data), set(self.spark.table("pyspark_bucket").collect()))
 
+            with self.assertRaises(PySparkTypeError):
+                df.write.bucketBy("x", "y")
+
+            with self.assertRaises(PySparkValueError):
+                df.write.bucketBy(2, ["x", "y"], "z")
+
     def test_cluster_by(self):
         data = [
             (1, "foo", 3.0),
@@ -238,12 +252,87 @@ class ReadwriterTestsMixin:
 
                 self.assertEqual(join2.columns, ["id", "value_1", "index", "value_2"])
 
+    def test_binary_type(self):
+        """Test that binary type in data sources respects binaryAsBytes config"""
+        schema = StructType(
+            [
+                StructField("id", StringType()),
+                StructField("bin", BinaryType()),
+                StructField("arr_bin", ArrayType(BinaryType())),
+                StructField("map_bin", MapType(StringType(), BinaryType())),
+            ]
+        )
+        # Create DataFrame with binary data (can use either bytes or bytearray)
+        data = [Row(id="1", bin=b"hello", arr_bin=[b"a"], map_bin={"key": b"value"})]
+        df = self.spark.createDataFrame(data, schema)
+
+        tmpPath = tempfile.mkdtemp()
+        try:
+            # Write to parquet
+            df.write.mode("overwrite").parquet(tmpPath)
+
+            for conf_value in ["true", "false"]:
+                expected_type = bytes if conf_value == "true" else bytearray
+                expected_bin = b"hello" if conf_value == "true" else bytearray(b"hello")
+                expected_arr = b"a" if conf_value == "true" else bytearray(b"a")
+                expected_map = b"value" if conf_value == "true" else bytearray(b"value")
+
+                with self.sql_conf({"spark.sql.execution.pyspark.binaryAsBytes": conf_value}):
+                    result = self.spark.read.parquet(tmpPath).collect()
+                    row = result[0]
+                    # Check binary field
+                    self.assertIsInstance(row.bin, expected_type)
+                    self.assertEqual(row.bin, expected_bin)
+                    # Check array of binary
+                    self.assertIsInstance(row.arr_bin[0], expected_type)
+                    self.assertEqual(row.arr_bin[0], expected_arr)
+                    # Check map value
+                    self.assertIsInstance(row.map_bin["key"], expected_type)
+                    self.assertEqual(row.map_bin["key"], expected_map)
+        finally:
+            shutil.rmtree(tmpPath)
+
     # "[SPARK-51182]: DataFrameWriter should throw dataPathNotSpecifiedError when path is not
     # specified"
     def test_save(self):
         writer = self.df.write
         with self.assertRaisesRegex(Exception, "'path' is not specified."):
             writer.save()
+
+    def test_changes_rejects_user_schema(self):
+        with self.assertRaises(AnalysisException) as ctx:
+            self.spark.read.schema("id LONG, data STRING").option("startingVersion", "1").changes(
+                "nonexistent_table"
+            )
+        self.assertIn("changes", str(ctx.exception))
+
+    def test_streaming_changes_rejects_user_schema(self):
+        with self.assertRaises(AnalysisException) as ctx:
+            self.spark.readStream.schema("id LONG, data STRING").option(
+                "startingVersion", "1"
+            ).changes("nonexistent_table")
+        self.assertIn("changes", str(ctx.exception))
+
+    def test_option_none_is_filtered(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "data.csv")
+            with open(path, "w") as f:
+                f.write('"",val\n')
+            schema = "a STRING, b STRING"
+            expected = [Row(a=None, b="val")]
+            self.assertEqual(
+                self.spark.read.schema(schema).option("nullValue", None).csv(path).collect(),
+                expected,
+            )
+            self.assertEqual(
+                self.spark.read.schema(schema).options(nullValue=None).csv(path).collect(),
+                expected,
+            )
+
+    def test_writer_option_none_chains_safely(self):
+        df = self.spark.createDataFrame([(1,)], "x INT")
+        self.assertIsNotNone(df.write.option("foo", None).option("bar", "baz"))
+        self.assertIsNotNone(df.write.options(foo=None, bar="baz"))
 
 
 class ReadwriterV2TestsMixin:
@@ -267,7 +356,8 @@ class ReadwriterV2TestsMixin:
 
     def check_partitioning_functions(self, tpe):
         import datetime
-        from pyspark.sql.functions.partitioning import years, months, days, hours, bucket
+
+        from pyspark.sql.functions.partitioning import bucket, days, hours, months, years
 
         df = self.spark.createDataFrame(
             [(1, datetime.datetime(2000, 1, 1), "foo")], ("id", "ts", "value")
@@ -285,7 +375,8 @@ class ReadwriterV2TestsMixin:
 
     def partitioning_functions_user_error(self):
         import datetime
-        from pyspark.sql.functions.partitioning import years, months, days, hours, bucket
+
+        from pyspark.sql.functions.partitioning import bucket, days, hours, months, years
 
         df = self.spark.createDataFrame(
             [(1, datetime.datetime(2000, 1, 1), "foo")], ("id", "ts", "value")
@@ -351,6 +442,11 @@ class ReadwriterV2TestsMixin:
             self.assertEqual(get_cluster_by_cols(), ["x"])
             self.assertSetEqual(set(data), set(self.spark.table(table_name).collect()))
 
+    def test_v2_writer_option_none_chains_safely(self):
+        df = self.spark.createDataFrame([(1,)], "x INT")
+        self.assertIsNotNone(df.writeTo("notexist").option("foo", None).option("bar", "baz"))
+        self.assertIsNotNone(df.writeTo("notexist").options(foo=None, bar="baz"))
+
 
 class ReadwriterTests(ReadwriterTestsMixin, ReusedSQLTestCase):
     pass
@@ -361,13 +457,6 @@ class ReadwriterV2Tests(ReadwriterV2TestsMixin, ReusedSQLTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.sql.tests.test_readwriter import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

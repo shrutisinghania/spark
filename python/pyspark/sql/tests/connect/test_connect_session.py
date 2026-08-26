@@ -18,27 +18,34 @@
 import os
 import unittest
 import uuid
+from typing import Optional
 
-from pyspark.util import is_remote_only
 from pyspark.errors import PySparkException
 from pyspark.sql import SparkSession as PySparkSession
 from pyspark.testing.connectutils import (
-    should_test_connect,
     ReusedConnectTestCase,
     connect_requirement_message,
+    should_test_connect,
 )
 from pyspark.testing.utils import timeout
+from pyspark.util import is_remote_only
 
 if should_test_connect:
     import grpc
-    from pyspark.sql.connect.session import SparkSession as RemoteSparkSession
-    from pyspark.sql.connect.client import ChannelBuilder
+
     from pyspark.errors.exceptions.connect import (
         AnalysisException,
         SparkConnectException,
         SparkConnectGrpcException,
         SparkUpgradeException,
     )
+    from pyspark.sql.connect.client import ChannelBuilder, DefaultChannelBuilder
+    from pyspark.sql.connect.session import SparkSession as RemoteSparkSession
+
+    class CustomChannelBuilder(DefaultChannelBuilder):
+        @property
+        def userId(self) -> Optional[str]:
+            return "abc"
 
 
 @unittest.skipIf(is_remote_only(), "Session creation different from local mode")
@@ -76,6 +83,20 @@ class SparkConnectSessionTests(ReusedConnectTestCase):
         self.spark.sql("select 1").collect()
         self.assertGreaterEqual(len(handler_called), 0)
 
+    @timeout(10)
+    def test_operation_id_in_execution_info_and_exception(self):
+        df = self.spark.sql("select 1")
+        df.collect()
+        self.assertIsNotNone(df.executionInfo)
+        operation_id = df.executionInfo.operation_id
+        self.assertIsNotNone(operation_id)
+        uuid.UUID(operation_id)
+
+        with self.assertRaises(SparkConnectException) as error:
+            self.spark.sql("select raise_error('expected')").collect()
+        self.assertIsNotNone(error.exception.operation_id)
+        uuid.UUID(error.exception.operation_id)
+
     def _check_no_active_session_error(self, e: PySparkException):
         self.check_error(exception=e, errorClass="NO_ACTIVE_SESSION", messageParameters=dict())
 
@@ -109,6 +130,16 @@ class SparkConnectSessionTests(ReusedConnectTestCase):
             self.spark.conf.get("some.conf")
         self._check_no_active_session_error(e.exception)
 
+    def test_with_block(self):
+        with PySparkSession.builder.remote("local[*]").getOrCreate() as session:
+            df = session.sql("select 1 as a, 2 as b")
+            self.assertEqual(df.collect(), [(1, 2)])
+
+        # Confirm that the session is stopped
+        with self.assertRaises(SparkConnectException) as e:
+            self.spark.sql("select 1")
+        self._check_no_active_session_error(e.exception)
+
     def test_error_enrichment_message(self):
         with self.sql_conf(
             {
@@ -133,18 +164,14 @@ class SparkConnectSessionTests(ReusedConnectTestCase):
         ):
             with self.sql_conf({"spark.sql.connect.serverStacktrace.enabled": False}):
                 with self.assertRaises(SparkUpgradeException) as e:
-                    self.spark.sql(
-                        """select from_json(
-                            '{"d": "02-29"}', 'd date', map('dateFormat', 'MM-dd'))"""
-                    ).collect()
+                    self.spark.sql("""select from_json(
+                            '{"d": "02-29"}', 'd date', map('dateFormat', 'MM-dd'))""").collect()
                 self.assertFalse("JVM stacktrace" in e.exception._message)
 
             with self.sql_conf({"spark.sql.connect.serverStacktrace.enabled": True}):
                 with self.assertRaises(SparkUpgradeException) as e:
-                    self.spark.sql(
-                        """select from_json(
-                            '{"d": "02-29"}', 'd date', map('dateFormat', 'MM-dd'))"""
-                    ).collect()
+                    self.spark.sql("""select from_json(
+                            '{"d": "02-29"}', 'd date', map('dateFormat', 'MM-dd'))""").collect()
                 self.assertTrue("JVM stacktrace" in str(e.exception))
                 self.assertTrue("org.apache.spark.SparkUpgradeException" in str(e.exception))
                 self.assertTrue(
@@ -304,6 +331,89 @@ class SparkConnectSessionTests(ReusedConnectTestCase):
 
 
 @unittest.skipIf(not should_test_connect, connect_requirement_message)
+class SparkConnectSessionBuilderTests(unittest.TestCase):
+    def setUp(self):
+        # Reset class-level session state so tests are order-independent.
+        RemoteSparkSession._default_session = None
+        RemoteSparkSession._active_session.session = None
+
+    def test_fails_to_create_session_without_remote_and_channel_builder(self):
+        with self.assertRaises(ValueError):
+            RemoteSparkSession.builder.getOrCreate()
+
+    def test_fails_to_create_when_both_remote_and_channel_builder_are_specified(self):
+        with self.assertRaises(ValueError):
+            (
+                RemoteSparkSession.builder.channelBuilder(CustomChannelBuilder("sc://localhost"))
+                .remote("sc://localhost")
+                .getOrCreate()
+            )
+
+    def test_creates_session_with_channel_builder(self):
+        test_session = RemoteSparkSession.builder.channelBuilder(
+            CustomChannelBuilder("sc://other")
+        ).getOrCreate()
+        host = test_session.client.host
+        # Skip release_session() since "sc://other" is a fake remote.
+        test_session.release_session_on_close = False
+        test_session.stop()
+
+        self.assertEqual("other", host)
+
+    def test_creates_session_with_remote(self):
+        test_session = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+        host = test_session.client.host
+        test_session.release_session_on_close = False
+        test_session.stop()
+
+        self.assertEqual("other", host)
+
+    def test_session_stop(self):
+        session = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+        session.release_session_on_close = False
+
+        self.assertFalse(session.is_stopped)
+        session.stop()
+        self.assertTrue(session.is_stopped)
+
+    def test_session_create_sets_active_session(self):
+        session = RemoteSparkSession.builder.remote("sc://abc").create()
+        session2 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+
+        self.assertIs(session, session2)
+        session.release_session_on_close = False
+        session.stop()
+
+    def test_active_session_expires_when_client_closes(self):
+        s1 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+        s2 = RemoteSparkSession.getActiveSession()
+
+        self.assertIs(s1, s2)
+
+        # We don't call close() to avoid executing ExecutePlanResponseReattachableIterator
+        s1._client._closed = True
+
+        self.assertIsNone(RemoteSparkSession.getActiveSession())
+        s3 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+
+        self.assertIsNot(s1, s3)
+
+    def test_default_session_expires_when_client_closes(self):
+        s1 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+        s2 = RemoteSparkSession._get_default_session()
+
+        self.assertIs(s1, s2)
+
+        # We don't call close() to avoid executing ExecutePlanResponseReattachableIterator
+        s1._client._closed = True
+
+        self.assertIsNone(RemoteSparkSession._get_default_session())
+        s3 = RemoteSparkSession.builder.remote("sc://other").getOrCreate()
+
+        self.assertIsNot(s1, s3)
+
+
+@unittest.skipIf(not should_test_connect, connect_requirement_message)
 class SparkConnectSessionWithOptionsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.spark = (
@@ -326,13 +436,6 @@ class SparkConnectSessionWithOptionsTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.connect.test_connect_session import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

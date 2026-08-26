@@ -25,7 +25,8 @@ import org.apache.spark.SparkConf
 import org.apache.spark.errors.SparkCoreErrors
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
-import org.apache.spark.rpc.RpcEndpointRef
+import org.apache.spark.internal.config.CLEANER_REFERENCE_TRACKING_BLOCKING_TIMEOUT
+import org.apache.spark.rpc.{RpcEndpointRef, RpcTimeout}
 import org.apache.spark.storage.BlockManagerMessages._
 import org.apache.spark.util.{RpcUtils, ThreadUtils}
 
@@ -38,6 +39,9 @@ class BlockManagerMaster(
   extends Logging {
 
   val timeout = RpcUtils.askRpcTimeout(conf)
+
+  private val waitBlockRemovalTimeout =
+    RpcTimeout(conf, CLEANER_REFERENCE_TRACKING_BLOCKING_TIMEOUT.key, "120s")
 
   /** Remove a dead executor from the driver endpoint. This is only called on the driver side. */
   def removeExecutor(execId: String): Unit = {
@@ -102,9 +106,10 @@ class BlockManagerMaster(
       blockId: BlockId,
       storageLevel: StorageLevel,
       memSize: Long,
-      diskSize: Long): Boolean = {
+      diskSize: Long,
+      checksum: Option[Long] = None): Boolean = {
     val res = driverEndpoint.askSync[Boolean](
-      UpdateBlockInfo(blockManagerId, blockId, storageLevel, memSize, diskSize))
+      UpdateBlockInfo(blockManagerId, blockId, storageLevel, memSize, diskSize, checksum))
     logDebug(s"Updated info of block $blockId")
     res
   }
@@ -120,6 +125,34 @@ class BlockManagerMaster(
   /** Check whether a block is visible */
   def isRDDBlockVisible(blockId: RDDBlockId): Boolean = {
     driverEndpoint.askSync[Boolean](GetRDDBlockVisibility(blockId))
+  }
+
+  /**
+   * The authoritative sealed checksum for an RDD block, or None if it is not sealed. Returns None
+   * for a non-`RDDBlockId`: such blocks are never sealed.
+   */
+  def getSealedChecksum(blockId: BlockId): Option[Long] = {
+    blockId.asRDDId match {
+      case Some(rddBlockId) => driverEndpoint.askSync[Option[Long]](GetSealedChecksum(rddBlockId))
+      case None => None
+    }
+  }
+
+  /**
+   * Seal an RDD's per-block content checksums: for each materialized block keep one version (the
+   * plurality checksum), evict divergent copies, and reject future divergent registrations. Returns
+   * the count of present blocks that had no recorded checksum and so could not be sealed.
+   */
+  def sealRddChecksums(rddId: Int): Int = {
+    driverEndpoint.askSync[Int](SealRddChecksums(rddId))
+  }
+
+  /**
+   * Verify every block of a sealed RDD is sealed and the directory tracks only replicas carrying
+   * the sealed checksum. Returns None if the invariant holds, else a diagnostic string.
+   */
+  def verifyRddChecksumSeal(rddId: Int): Option[String] = {
+    driverEndpoint.askSync[Option[String]](VerifyRddChecksumSeal(rddId))
   }
 
   /** Get locations of the blockId from the driver */
@@ -167,11 +200,12 @@ class BlockManagerMaster(
 
   /**
    * Remove the host from the candidate list of shuffle push mergers. This can be
-   * triggered if there is a FetchFailedException on the host
+   * triggered if there is a FetchFailedException on the host. Non-blocking.
    * @param host
    */
   def removeShufflePushMergerLocation(host: String): Unit = {
-    driverEndpoint.askSync[Unit](RemoveShufflePushMergerLocation(host))
+    logInfo(log"Request to remove shuffle push merger location ${MDC(HOST, host)}")
+    driverEndpoint.ask[Unit](RemoveShufflePushMergerLocation(host))
   }
 
   def getExecutorEndpointRef(executorId: String): Option[RpcEndpointRef] = {
@@ -194,8 +228,7 @@ class BlockManagerMaster(
         log"${MDC(ERROR, e.getMessage)}", e)
     )(ThreadUtils.sameThread)
     if (blocking) {
-      // the underlying Futures will timeout anyway, so it's safe to use infinite timeout here
-      RpcUtils.INFINITE_TIMEOUT.awaitResult(future)
+      waitBlockRemovalTimeout.awaitResult(future)
     }
   }
 
@@ -207,8 +240,7 @@ class BlockManagerMaster(
         log"${MDC(ERROR, e.getMessage)}", e)
     )(ThreadUtils.sameThread)
     if (blocking) {
-      // the underlying Futures will timeout anyway, so it's safe to use infinite timeout here
-      RpcUtils.INFINITE_TIMEOUT.awaitResult(future)
+      waitBlockRemovalTimeout.awaitResult(future)
     }
   }
 
@@ -222,8 +254,7 @@ class BlockManagerMaster(
         log"${MDC(ERROR, e.getMessage)}", e)
     )(ThreadUtils.sameThread)
     if (blocking) {
-      // the underlying Futures will timeout anyway, so it's safe to use infinite timeout here
-      RpcUtils.INFINITE_TIMEOUT.awaitResult(future)
+      waitBlockRemovalTimeout.awaitResult(future)
     }
   }
 
@@ -311,7 +342,7 @@ class BlockManagerMaster(
   /** Send a one-way message to the master endpoint, to which we expect it to reply with true. */
   private def tell(message: Any): Unit = {
     if (!driverEndpoint.askSync[Boolean](message)) {
-      throw SparkCoreErrors.unexpectedBlockManagerMasterEndpointResultError()
+      throw SparkCoreErrors.unexpectedBlockManagerMasterEndpointResultError(message)
     }
   }
 

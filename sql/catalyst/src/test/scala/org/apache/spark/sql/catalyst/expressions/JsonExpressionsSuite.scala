@@ -18,6 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import java.text.{DecimalFormat, DecimalFormatSymbols, SimpleDateFormat}
+import java.time.{LocalDateTime, ZoneOffset}
 import java.util.{Calendar, Locale, TimeZone}
 
 import org.scalatest.exceptions.TestFailedException
@@ -30,6 +31,7 @@ import org.apache.spark.sql.catalyst.expressions.Cast._
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.{PST, UTC, UTC_OPT}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
@@ -570,6 +572,33 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     }
   }
 
+  test("SPARK-57456: from_json with nanos timestamp") {
+    val jsonData = """{"t": "2016-01-01T00:00:00.123456789"}"""
+    // No timestamp format option: the default formatter parses the full sub-second fraction and
+    // truncates the sub-precision digits toward zero to the declared precision.
+    withSQLConf(SQLConf.TIMESTAMP_NANOS_TYPES_ENABLED.key -> "true") {
+      TimestampNanosTestUtils.foreachNanosPrecision { p =>
+        val nano = TimestampNanosTestUtils.nanoOfSecTruncator(p)(123456789)
+        val ldt = LocalDateTime.of(2016, 1, 1, 0, 0, 0, nano)
+        checkEvaluation(
+          JsonToStructs(
+            StructType(StructField("t", TimestampNTZNanosType(p)) :: Nil),
+            Map.empty[String, String],
+            Literal(jsonData),
+            UTC_OPT),
+          InternalRow(TimestampNanosTestUtils.localDateTimeToNanosVal(ldt)))
+        // LTZ: the string has no zone, so it is interpreted in the given time zone (UTC here).
+        checkEvaluation(
+          JsonToStructs(
+            StructType(StructField("t", TimestampLTZNanosType(p)) :: Nil),
+            Map.empty[String, String],
+            Literal(jsonData),
+            UTC_OPT),
+          InternalRow(TimestampNanosTestUtils.instantToNanosVal(ldt.toInstant(ZoneOffset.UTC))))
+      }
+    }
+  }
+
   test("SPARK-19543: from_json empty input column") {
     val schema = StructType(StructField("a", IntegerType) :: Nil)
     checkEvaluation(
@@ -880,6 +909,33 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
     }
   }
 
+  test("json_typeof") {
+    Seq(
+      // Invalid or empty inputs return null.
+      ("", null),
+      ("bad", null),
+      ("""{"key": 45, "random_string"}""", null),
+      // Trailing content after a valid value is not a single well-formed JSON document.
+      ("123 true", null),
+      // Valid JSON values return the type of the outermost value.
+      ("{}", "object"),
+      ("""{"key": 1, "arr": [1, 2]}""", "object"),
+      ("[]", "array"),
+      ("[1, 2, 3]", "array"),
+      ("\"hello\"", "string"),
+      ("123", "number"),
+      ("1.5", "number"),
+      ("-123", "number"),
+      ("-1.5", "number"),
+      ("true", "boolean"),
+      ("false", "boolean"),
+      ("null", "null")
+    ).foreach {
+      case (input, expected) =>
+        checkEvaluation(JsonTypeof(Literal(input)), expected)
+    }
+  }
+
   test("SPARK-35320: from_json should fail with a key type different of StringType") {
     Seq(
       (MapType(IntegerType, StringType), """{"1": "test"}"""),
@@ -906,4 +962,137 @@ class JsonExpressionsSuite extends SparkFunSuite with ExpressionEvalHelper {
       "QUESTION"
     )
   }
+
+  test("from_json/to_json with TIME type - all precisions") {
+    // Test data: (timeString, precision) - covers all precisions and edge cases
+    val testCases = Seq(
+      ("00:00:00", 0),
+      ("14:30:45.1", 1),
+      ("14:30:45.12", 2),
+      ("14:30:45.123", 3),
+      ("14:30:45.1234", 4),
+      ("14:30:45.12345", 5),
+      ("23:59:59.999999", 6),
+      ("14:30:45.1234567", 7),
+      ("14:30:45.12345678", 8),
+      ("23:59:59.999999999", 9)
+    )
+
+    testCases.foreach { case (timeStr, precision) =>
+      val schema = StructType(StructField("t", TimeType(precision)) :: Nil)
+      val timeValue = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString(timeStr))
+      val jsonInput = s"""{"t": "$timeStr"}"""
+      val jsonOutput = s"""{"t":"$timeStr"}"""
+
+      // Test from_json
+      checkEvaluation(
+        JsonToStructs(schema, Map.empty, Literal(jsonInput), UTC_OPT),
+        InternalRow(timeValue))
+
+      // Test to_json
+      val struct = Literal.create(create_row(timeValue), schema)
+      checkEvaluation(
+        StructsToJson(Map.empty, struct, UTC_OPT),
+        jsonOutput)
+
+      // Test roundtrip
+      val jsonResult = StructsToJson(Map.empty, struct, UTC_OPT)
+      checkEvaluation(
+        JsonToStructs(schema, Map.empty, jsonResult, UTC_OPT),
+        InternalRow(timeValue))
+    }
+
+    // Test custom format with microsecond precision
+    val schema = StructType(StructField("t", TimeType(6)) :: Nil)
+    val time = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString("14:30:45.123456"))
+    val customFormat = Map("timeFormat" -> "HH-mm-ss.SSSSSS")
+
+    checkEvaluation(
+      JsonToStructs(schema, customFormat, Literal("""{"t": "14-30-45.123456"}"""), UTC_OPT),
+      InternalRow(time))
+
+    checkEvaluation(
+      StructsToJson(customFormat, Literal.create(create_row(time), schema), UTC_OPT),
+      """{"t":"14-30-45.123456"}""")
+  }
+
+  test("to_json - sortKeys with struct") {
+    val schema = StructType(
+      StructField("c", IntegerType) ::
+      StructField("a", IntegerType) ::
+      StructField("b", IntegerType) :: Nil)
+    val struct = Literal.create(create_row(3, 1, 2), schema)
+    checkEvaluation(
+      StructsToJson(Map("sortKeys" -> "true"), struct, UTC_OPT),
+      """{"a":1,"b":2,"c":3}""")
+    checkEvaluation(
+      StructsToJson(Map.empty, struct, UTC_OPT),
+      """{"c":3,"a":1,"b":2}""")
+  }
+
+  test("to_json - sortKeys with map") {
+    val schema = MapType(StringType, IntegerType)
+    val input = Literal(ArrayBasedMapData(Map(
+      UTF8String.fromString("c") -> 3,
+      UTF8String.fromString("a") -> 1,
+      UTF8String.fromString("b") -> 2)), schema)
+    checkEvaluation(
+      StructsToJson(Map("sortKeys" -> "true"), input),
+      """{"a":1,"b":2,"c":3}""")
+  }
+
+  test("to_json - sortKeys with nested struct") {
+    val innerSchema = StructType(
+      StructField("z", IntegerType) :: StructField("y", IntegerType) :: Nil)
+    val outerSchema = StructType(
+      StructField("b", innerSchema) :: StructField("a", IntegerType) :: Nil)
+    val struct = Literal.create(create_row(create_row(2, 1), 0), outerSchema)
+    checkEvaluation(
+      StructsToJson(Map("sortKeys" -> "true"), struct, UTC_OPT),
+      """{"a":0,"b":{"y":1,"z":2}}""")
+  }
+
+  test("TIME type with arrays") {
+    val inputSchema = ArrayType(StructType(StructField("t", TimeType(3)) :: Nil))
+    val time1 = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString("09:00:00.123"))
+    val time2 = SparkDateTimeUtils.stringToTimeAnsi(UTF8String.fromString("17:30:00.456"))
+    val input = new GenericArrayData(InternalRow(time1) :: InternalRow(time2) :: Nil)
+    val expectedJson = """[{"t":"09:00:00.123"},{"t":"17:30:00.456"}]"""
+
+    checkEvaluation(
+      StructsToJson(Map.empty, Literal.create(input, inputSchema), UTC_OPT),
+      expectedJson)
+
+    checkEvaluation(
+      JsonToStructs(inputSchema, Map.empty, Literal(expectedJson), UTC_OPT),
+      input)
+  }
+
+  test("JsonToStructs, GetJsonObject, JsonTuple, MultiGetJsonObject, JsonValue are stateful " +
+      "and produce fresh copies") {
+    val schema = StructType(StructField("a", IntegerType) :: Nil)
+    val jsonToStructs = JsonToStructs(schema, Map.empty, Literal("{}"), UTC_OPT)
+    assert(jsonToStructs.stateful)
+    assert(jsonToStructs.freshCopyIfContainsStatefulExpression() ne jsonToStructs)
+
+    val getJsonObject = GetJsonObject(Literal("{}"), Literal("$.a"))
+    assert(getJsonObject.stateful)
+    assert(getJsonObject.freshCopyIfContainsStatefulExpression() ne getJsonObject)
+
+    val jsonTuple = JsonTuple(Literal("{}") :: Literal("a") :: Nil)
+    assert(jsonTuple.stateful)
+    assert(jsonTuple.freshCopyIfContainsStatefulExpression() ne jsonTuple)
+
+    val multiGetJsonObject = MultiGetJsonObject(Literal("{}"), Seq("$.a", "$.b"))
+    assert(multiGetJsonObject.stateful)
+    assert(multiGetJsonObject.freshCopyIfContainsStatefulExpression() ne multiGetJsonObject)
+
+    // JsonValue reuses a mutable row to cast the extracted scalar, so it must be stateful.
+    val jsonValue = JsonValue(
+      Literal("{}"), "$.a", StringType,
+      JsonValueBehavior.Null, JsonValueBehavior.Null, None, None)
+    assert(jsonValue.stateful)
+    assert(jsonValue.freshCopyIfContainsStatefulExpression() ne jsonValue)
+  }
+
 }

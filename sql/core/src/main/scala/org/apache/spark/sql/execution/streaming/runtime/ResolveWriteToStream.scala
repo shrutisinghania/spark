@@ -27,9 +27,11 @@ import org.apache.spark.internal.LogKeys.{CHECKPOINT_LOCATION, CHECKPOINT_ROOT, 
 import org.apache.spark.sql.catalyst.analysis.UnsupportedOperationChecker
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.catalyst.streaming.{WriteToStream, WriteToStreamStatement}
+import org.apache.spark.sql.catalyst.streaming.{FlowAssigned, StreamingRelationV2, UserProvided, WriteToStream, WriteToStreamStatement}
+import org.apache.spark.sql.catalyst.util.GeneratedColumn
 import org.apache.spark.sql.connector.catalog.SupportsWrite
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
+import org.apache.spark.sql.execution.streaming.{ContinuousTrigger, RealTimeTrigger}
 import org.apache.spark.sql.execution.streaming.checkpointing.CheckpointFileManager
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
@@ -47,16 +49,33 @@ object ResolveWriteToStream extends Rule[LogicalPlan] {
           log"is not supported in streaming DataFrames/Datasets and will be disabled.")
       }
 
+      // Always check for duplicate source names
+      checkDuplicateSourceNames(s.inputQuery)
+
       if (conf.isUnsupportedOperationCheckEnabled) {
-        if (s.sink.isInstanceOf[SupportsWrite] && s.isContinuousTrigger) {
+        if (s.trigger.isInstanceOf[RealTimeTrigger]) {
+          UnsupportedOperationChecker.
+            checkAdditionalRealTimeModeConstraints(s.inputQuery, s.outputMode)
+        }
+
+        if (s.sink.isInstanceOf[SupportsWrite] && s.trigger.isInstanceOf[ContinuousTrigger]) {
           UnsupportedOperationChecker.checkForContinuous(s.inputQuery, s.outputMode)
         } else {
           UnsupportedOperationChecker.checkForStreaming(s.inputQuery, s.outputMode)
         }
       }
 
+      // Streaming writes with generated columns are not yet supported.
+      s.catalogAndIdent.foreach { case (catalog, ident) =>
+        if (GeneratedColumn.supportsGeneratedColumnsOnWrite(s.sink, s.sink.columns())) {
+          throw QueryCompilationErrors.unsupportedTableOperationError(
+            catalog, ident, "streaming write with generated columns")
+        }
+      }
+
       WriteToStream(
         s.userSpecifiedName.orNull,
+        s.userSpecifiedSinkName,
         resolvedCheckpointLocation,
         s.sink,
         s.outputMode,
@@ -136,6 +155,32 @@ object ResolveWriteToStream extends Rule[LogicalPlan] {
     logInfo(log"Checkpoint root ${MDC(CHECKPOINT_LOCATION, checkpointLocation)} " +
       log"resolved to ${MDC(CHECKPOINT_ROOT, resolvedCheckpointRoot)}.")
     (resolvedCheckpointRoot, deleteCheckpointOnStop)
+  }
+
+  /**
+   * Checks for duplicate source names across all streaming sources.
+   * This validation always runs regardless of source evolution enforcement.
+   */
+  private def checkDuplicateSourceNames(plan: LogicalPlan): Unit = {
+    val allSourceNames = plan.collect {
+      case StreamingRelation(
+        _, _, _, sourceIdentifyingName) => sourceIdentifyingName
+      case StreamingRelationV2(
+        _, _, _, _, _, _, _, _, sourceIdentifyingName) => sourceIdentifyingName
+    }
+
+    // Extract actual name strings only from named sources (ignore Unassigned)
+    val namedSources = allSourceNames.collect {
+      case UserProvided(name) => name
+      case FlowAssigned(name) => name
+    }
+
+    val duplicates = namedSources.groupBy(identity).filter(_._2.size > 1).keys.toSeq.sorted
+
+    if (duplicates.nonEmpty) {
+      throw QueryCompilationErrors.duplicateStreamingSourceNamesError(
+        duplicates.map(name => s"'$name'"))
+    }
   }
 }
 

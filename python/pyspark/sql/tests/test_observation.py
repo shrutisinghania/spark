@@ -15,24 +15,23 @@
 # limitations under the License.
 #
 
-import time
-import unittest
-
-from pyspark.sql import Row
-from pyspark.sql.functions import col, lit, count, sum, mean
 from pyspark.errors import (
+    AnalysisException,
     PySparkAssertionError,
+    PySparkException,
     PySparkTypeError,
     PySparkValueError,
 )
+from pyspark.sql import Observation, Row
+from pyspark.sql import functions as F
+from pyspark.sql.types import LongType, StructType
 from pyspark.testing.sqlutils import ReusedSQLTestCase
+from pyspark.testing.utils import assertDataFrameEqual, eventually
 
 
 class DataFrameObservationTestsMixin:
     def test_observe(self):
         # SPARK-36263: tests the DataFrame.observe(Observation, *Column) method
-        from pyspark.sql import Observation
-
         df = self.spark.createDataFrame(
             [
                 (1, 1.0, "one"),
@@ -58,11 +57,11 @@ class DataFrameObservationTestsMixin:
             df.orderBy("id")
             .observe(
                 named_observation,
-                count(lit(1)).alias("cnt"),
-                sum(col("id")).alias("sum"),
-                mean(col("val")).alias("mean"),
+                F.count(F.lit(1)).alias("cnt"),
+                F.sum(F.col("id")).alias("sum"),
+                F.mean(F.col("val")).alias("mean"),
             )
-            .observe(unnamed_observation, count(lit(1)).alias("rows"))
+            .observe(unnamed_observation, F.count(F.lit(1)).alias("rows"))
         )
 
         # test that observe works transparently
@@ -81,7 +80,7 @@ class DataFrameObservationTestsMixin:
         self.assertEqual(unnamed_observation.get, dict(rows=3))
 
         with self.assertRaises(PySparkAssertionError) as pe:
-            df.observe(named_observation, count(lit(1)).alias("count"))
+            df.observe(named_observation, F.count(F.lit(1)).alias("count"))
 
         self.check_error(
             exception=pe.exception,
@@ -89,8 +88,18 @@ class DataFrameObservationTestsMixin:
             messageParameters={},
         )
 
+        new_observation = Observation("metric")
+        with self.assertRaises(AnalysisException) as pe:
+            observed.observe(new_observation, 2 * F.count(F.lit(1)).alias("cnt")).collect()
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="DUPLICATED_METRICS_NAME",
+            messageParameters={"metricName": "metric"},
+        )
+
         # observation requires name (if given) to be non empty string
-        with self.assertRaisesRegex(TypeError, "`name` should be a str, got int"):
+        with self.assertRaisesRegex(PySparkTypeError, "`name` should be str, got int"):
             Observation(123)
         with self.assertRaisesRegex(ValueError, "`name` must be a non-empty string, got ''."):
             Observation("")
@@ -106,15 +115,19 @@ class DataFrameObservationTestsMixin:
         )
 
         # dataframe.observe requires non-None Columns
-        for args in [(None,), ("id",), (lit(1), None), (lit(1), "id")]:
+        for args in [(None,), ("id",), (F.lit(1), None), (F.lit(1), "id")]:
             with self.subTest(args=args):
                 with self.assertRaises(PySparkTypeError) as pe:
                     df.observe(Observation(), *args)
 
                 self.check_error(
                     exception=pe.exception,
-                    errorClass="NOT_LIST_OF_COLUMN",
-                    messageParameters={"arg_name": "exprs"},
+                    errorClass="NOT_EXPECTED_TYPE",
+                    messageParameters={
+                        "expected_type": "list[Column]",
+                        "arg_name": "exprs",
+                        "arg_type": "tuple",
+                    },
                 )
 
     def test_observe_str(self):
@@ -140,32 +153,36 @@ class DataFrameObservationTestsMixin:
         self.spark.streams.addListener(TestListener())
 
         df = self.spark.readStream.format("rate").option("rowsPerSecond", 10).load()
-        df = df.observe("metric", count(lit(1)).alias("cnt"), sum(col("value")).alias("sum"))
+        df = df.observe(
+            "metric", F.count(F.lit(1)).alias("cnt"), F.sum(F.col("value")).alias("sum")
+        )
         q = df.writeStream.format("noop").queryName("test").start()
         self.assertTrue(q.isActive)
-        time.sleep(10)
-        q.stop()
 
-        self.assertTrue(isinstance(observed_metrics, dict))
-        self.assertTrue("metric" in observed_metrics)
-        row = observed_metrics["metric"]
-        self.assertTrue(isinstance(row, Row))
-        self.assertTrue(hasattr(row, "cnt"))
-        self.assertTrue(hasattr(row, "sum"))
-        self.assertGreaterEqual(row.cnt, 0)
-        self.assertGreaterEqual(row.sum, 0)
+        @eventually(timeout=10, catch_assertions=True)
+        def check_observed_metrics():
+            self.assertTrue(isinstance(observed_metrics, dict))
+            self.assertTrue("metric" in observed_metrics)
+            row = observed_metrics["metric"]
+            self.assertIsInstance(row.cnt, int)
+            self.assertIsInstance(row.sum, int)
+            self.assertGreaterEqual(row.cnt, 0)
+            self.assertGreaterEqual(row.sum, 0)
+            return True
+
+        check_observed_metrics()
+
+        q.stop()
 
     def test_observe_with_same_name_on_different_dataframe(self):
         # SPARK-45656: named observations with the same name on different datasets
-        from pyspark.sql import Observation
-
         observation1 = Observation("named")
         df1 = self.spark.range(50)
-        observed_df1 = df1.observe(observation1, count(lit(1)).alias("cnt"))
+        observed_df1 = df1.observe(observation1, F.count(F.lit(1)).alias("cnt"))
 
         observation2 = Observation("named")
         df2 = self.spark.range(100)
-        observed_df2 = df2.observe(observation2, count(lit(1)).alias("cnt"))
+        observed_df2 = df2.observe(observation2, F.count(F.lit(1)).alias("cnt"))
 
         observed_df1.collect()
         observed_df2.collect()
@@ -174,25 +191,192 @@ class DataFrameObservationTestsMixin:
         self.assertEqual(observation2.get, dict(cnt=100))
 
     def test_observe_on_commands(self):
-        from pyspark.sql import Observation
-
         df = self.spark.range(50)
+        schema = StructType().add("id", LongType(), nullable=False)
 
         test_table = "test_table"
 
         # DataFrameWriter
-        with self.table(test_table):
-            for command, action in [
-                ("collect", lambda df: df.collect()),
-                ("show", lambda df: df.show(50)),
-                ("save", lambda df: df.write.format("noop").mode("overwrite").save()),
-                ("create", lambda df: df.writeTo(test_table).using("parquet").create()),
-            ]:
-                with self.subTest(command=command):
-                    observation = Observation()
-                    observed_df = df.observe(observation, count(lit(1)).alias("cnt"))
-                    action(observed_df)
-                    self.assertEqual(observation.get, dict(cnt=50))
+        for cache_enabled in [False, True]:
+            with (
+                self.subTest(cache_enabled=cache_enabled),
+                self.sql_conf({"spark.connect.session.planCache.enabled": cache_enabled}),
+            ):
+                for command, action in [
+                    ("collect", lambda df: df.collect()),
+                    ("show", lambda df: df.show(50)),
+                    ("save", lambda df: df.write.format("noop").mode("overwrite").save()),
+                    ("create", lambda df: df.writeTo(test_table).using("parquet").create()),
+                ]:
+                    for select_star in [True, False]:
+                        with (
+                            self.subTest(command=command, select_star=select_star),
+                            self.table(test_table),
+                        ):
+                            observation = Observation()
+                            observed_df = df.observe(observation, F.count(F.lit(1)).alias("cnt"))
+                            if select_star:
+                                observed_df = observed_df.select("*")
+                            self.assertEqual(observed_df.schema, schema)
+                            action(observed_df)
+                            self.assertEqual(observation.get, dict(cnt=50))
+
+    def test_observe_with_struct_type(self):
+        observation = Observation("struct")
+
+        df = self.spark.range(10).observe(
+            observation,
+            F.struct(F.count(F.lit(1)).alias("rows"), F.max("id").alias("maxid")).alias("struct"),
+        )
+
+        assertDataFrameEqual(df, [Row(id=id) for id in range(10)])
+
+        self.assertEqual(observation.get, {"struct": Row(rows=10, maxid=9)})
+
+    def test_observe_with_array_type(self):
+        observation = Observation("array")
+
+        df = self.spark.range(10).observe(
+            observation,
+            F.array(F.count(F.lit(1))).alias("array"),
+        )
+
+        assertDataFrameEqual(df, [Row(id=id) for id in range(10)])
+
+        self.assertEqual(observation.get, {"array": [10]})
+
+    def test_observe_with_map_type(self):
+        observation = Observation("map")
+
+        df = self.spark.range(10).observe(
+            observation,
+            F.create_map(F.lit("count"), F.count(F.lit(1))).alias("map"),
+        )
+
+        assertDataFrameEqual(df, [Row(id=id) for id in range(10)])
+
+        self.assertEqual(observation.get, {"map": {"count": 10}})
+
+    def test_observation_errors_propagated_to_client(self):
+        observation = Observation("test_observation")
+        observed_df = self.spark.range(10).observe(
+            observation,
+            F.sum("id").alias("sum_id"),
+            F.raise_error(F.lit("test error")).alias("raise_error"),
+        )
+        actual = observed_df.collect()
+        self.assertEqual(
+            [row.asDict() for row in actual],
+            [{"id": i} for i in range(10)],
+        )
+
+        with self.assertRaises(PySparkException) as cm:
+            _ = observation.get
+
+        self.assertIn("test error", str(cm.exception))
+
+    def test_observe_self_join(self):
+        # SPARK-56322: self-joining an observed DataFrame
+        obs = Observation("my_observation")
+        df = (
+            self.spark.range(100)
+            .selectExpr("id", "CASE WHEN id < 10 THEN 'A' ELSE 'B' END AS group_key")
+            .observe(obs, F.count(F.lit(1)).alias("row_count"))
+        )
+
+        df1 = df.where("id < 20")
+        df2 = df.where("id % 2 == 0")
+
+        joined = df1.alias("a").join(df2.alias("b"), on=["id"], how="inner")
+        result = joined.collect()
+
+        # The join should produce rows where id < 20 AND id is even
+        expected_ids = sorted([i for i in range(20) if i % 2 == 0])
+        actual_ids = sorted([row.id for row in result])
+        self.assertEqual(actual_ids, expected_ids)
+
+        # The observation should have been collected
+        self.assertEqual(obs.get, {"row_count": 100})
+
+        # Check the error conditions
+        with self.assertRaises(PySparkAssertionError) as pe:
+            joined.observe(obs, F.count(F.lit(1)).alias("row_count")).collect()
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="REUSE_OBSERVATION",
+            messageParameters={},
+        )
+
+        obs2 = Observation("my_observation")
+        with self.assertRaises(AnalysisException) as pe:
+            joined.observe(obs2, 2 * F.count(F.lit(1)).alias("row_count")).collect()
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="DUPLICATED_METRICS_NAME",
+            messageParameters={"metricName": "my_observation"},
+        )
+
+    def test_observe_lateral_join(self):
+        # SPARK-56322: lateral self-joining an observed DataFrame
+        obs = Observation("lateral_join_observation")
+        df = self.spark.range(50).observe(obs, F.count(F.lit(1)).alias("row_count"))
+
+        joined = (
+            df.alias("left")
+            .lateralJoin(
+                df.alias("right"), on=F.expr("right.id between left.id - 1 and left.id + 1")
+            )
+            .selectExpr("left.id as left_id", "right.id as right_id")
+        )
+        result = joined.collect()
+
+        # Joins on row 0 should produce rows 0 and 1
+        bounded_matches = sorted([r.right_id for r in result if r.left_id == 0])
+        self.assertEqual(bounded_matches, [0, 1])
+
+        # Joins on row 25 should produce rows 24, 25, and 26
+        unbounded_matches = sorted([r.right_id for r in result if r.left_id == 25])
+        self.assertEqual(unbounded_matches, [24, 25, 26])
+
+        # The observation should have been collected
+        self.assertEqual(obs.get, {"row_count": 50})
+
+        # Check the error conditions
+        with self.assertRaises(PySparkAssertionError) as reused:
+            joined.observe(obs, F.count(F.lit(1)).alias("row_count")).collect()
+
+        self.check_error(
+            exception=reused.exception,
+            errorClass="REUSE_OBSERVATION",
+            messageParameters={},
+        )
+
+        obs2 = Observation("lateral_join_observation")
+        with self.assertRaises(AnalysisException) as pe:
+            joined.observe(obs2, F.count(2 * F.lit(1)).alias("row_count")).collect()
+
+        self.check_error(
+            exception=pe.exception,
+            errorClass="DUPLICATED_METRICS_NAME",
+            messageParameters={"metricName": "lateral_join_observation"},
+        )
+
+    def test_observe_self_join_union(self):
+        # SPARK-56322: union of observed DataFrames with same observation
+        obs = Observation("union_obs")
+        df = self.spark.range(50).observe(obs, F.count(F.lit(1)).alias("cnt"))
+
+        df1 = df.where("id < 25")
+        df2 = df.where("id >= 25")
+
+        unioned = df1.union(df2)
+        result = unioned.collect()
+
+        actual_ids = sorted([row.id for row in result])
+        self.assertEqual(actual_ids, list(range(50)))
+        self.assertEqual(obs.get, {"cnt": 50})
 
 
 class DataFrameObservationTests(
@@ -203,12 +387,6 @@ class DataFrameObservationTests(
 
 
 if __name__ == "__main__":
-    from pyspark.sql.tests.test_observation import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner  # type: ignore
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

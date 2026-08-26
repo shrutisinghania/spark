@@ -16,18 +16,18 @@
 #
 
 import sys
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from pyspark import keyword_only, since
-from pyspark.sql import DataFrame
+from pyspark.ml.param.shared import HasPredictionCol, Param, Params, TypeConverters
 from pyspark.ml.util import (
-    JavaMLWritable,
     JavaMLReadable,
-    try_remote_attribute_relation,
+    JavaMLWritable,
     invoke_helper_relation,
+    try_remote_attribute_relation,
 )
 from pyspark.ml.wrapper import JavaEstimator, JavaModel, JavaParams
-from pyspark.ml.param.shared import HasPredictionCol, Param, TypeConverters, Params
+from pyspark.sql import DataFrame
 
 if TYPE_CHECKING:
     from py4j.java_gateway import JavaObject
@@ -71,7 +71,7 @@ class _FPGrowthParams(HasPredictionCol):
     )
 
     def __init__(self, *args: Any):
-        super(_FPGrowthParams, self).__init__(*args)
+        super().__init__(*args)
         self._setDefault(
             minSupport=0.3, minConfidence=0.8, itemsCol="items", predictionCol="prediction"
         )
@@ -240,6 +240,7 @@ class FPGrowth(
     >>> fpm.transform(data).take(1) == model2.transform(data).take(1)
     True
     """
+
     _input_kwargs: Dict[str, Any]
 
     @keyword_only
@@ -256,7 +257,7 @@ class FPGrowth(
         __init__(self, \\*, minSupport=0.3, minConfidence=0.8, itemsCol="items", \
                  predictionCol="prediction", numPartitions=None)
         """
-        super(FPGrowth, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj("org.apache.spark.ml.fpm.FPGrowth", self.uid)
         kwargs = self._input_kwargs
         self.setParams(**kwargs)
@@ -409,7 +410,7 @@ class PrefixSpan(JavaParams):
         __init__(self, \\*, minSupport=0.1, maxPatternLength=10, maxLocalProjDBSize=32000000, \
                  sequenceCol="sequence")
         """
-        super(PrefixSpan, self).__init__()
+        super().__init__()
         self._java_obj = self._new_java_obj("org.apache.spark.ml.fpm.PrefixSpan", self.uid)
         self._setDefault(
             minSupport=0.1, maxPatternLength=10, maxLocalProjDBSize=32000000, sequenceCol="sequence"
@@ -532,6 +533,7 @@ class PrefixSpan(JavaParams):
 
 if __name__ == "__main__":
     import doctest
+
     import pyspark.ml.fpm
     from pyspark.sql import SparkSession
 
@@ -547,7 +549,7 @@ if __name__ == "__main__":
     temp_path = tempfile.mkdtemp()
     globs["temp_path"] = temp_path
     try:
-        (failure_count, test_count) = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
+        failure_count, test_count = doctest.testmod(globs=globs, optionflags=doctest.ELLIPSIS)
         spark.stop()
     finally:
         from shutil import rmtree

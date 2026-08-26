@@ -477,7 +477,7 @@ Submission Guide for more details.
 [adm]: submitting-applications.html#advanced-dependency-management
 
 ## Supported types for Avro -> Spark SQL conversion
-Currently Spark supports reading all [primitive types](https://avro.apache.org/docs/1.12.0/specification/#primitive-types) and [complex types](https://avro.apache.org/docs/1.12.0/specification/#complex-types) under records of Avro.
+Currently Spark supports reading all [primitive types](https://avro.apache.org/docs/1.12.1/specification/#primitive-types) and [complex types](https://avro.apache.org/docs/1.12.1/specification/#complex-types) under records of Avro.
 <table>
   <thead><tr><th><b>Avro type</b></th><th><b>Spark SQL type</b></th></tr></thead>
   <tr>
@@ -541,7 +541,7 @@ In addition to the types listed above, it supports reading `union` types. The fo
 3. `union(something, null)`, where something is any supported Avro type. This will be mapped to the same Spark SQL type as that of something, with nullable set to true.
 All other union types are considered complex. They will be mapped to StructType where field names are member0, member1, etc., in accordance with members of the union. This is consistent with the behavior when converting between Avro and Parquet.
 
-It also supports reading the following Avro [logical types](https://avro.apache.org/docs/1.12.0/specification/#logical-types):
+It also supports reading the following Avro [logical types](https://avro.apache.org/docs/1.12.1/specification/#logical-types):
 
 <table>
   <thead><tr><th><b>Avro logical type</b></th><th><b>Avro type</b></th><th><b>Spark SQL type</b></th></tr></thead>
@@ -559,6 +559,21 @@ It also supports reading the following Avro [logical types](https://avro.apache.
     <td>timestamp-micros</td>
     <td>long</td>
     <td>TimestampType</td>
+  </tr>
+  <tr>
+    <td>time-micros</td>
+    <td>long</td>
+    <td>TimeType</td>
+  </tr>
+  <tr>
+    <td>timestamp-nanos</td>
+    <td>long</td>
+    <td>TimestampType(p) (with p in 7-9, requires <code>spark.sql.timestampNanosTypes.enabled=true</code>)</td>
+  </tr>
+  <tr>
+    <td>local-timestamp-nanos</td>
+    <td>long</td>
+    <td>TimestampNTZType(p) (with p in 7-9, requires <code>spark.sql.timestampNanosTypes.enabled=true</code>)</td>
   </tr>
   <tr>
     <td>decimal</td>
@@ -602,6 +617,21 @@ Spark supports writing of all Spark SQL types into Avro. For most types, the map
     <td>TimestampType</td>
     <td>long</td>
     <td>timestamp-micros</td>
+  </tr>
+  <tr>
+    <td>TimeType</td>
+    <td>long</td>
+    <td>time-micros</td>
+  </tr>
+  <tr>
+    <td>TimestampType(p) (with p in 7-9)</td>
+    <td>long</td>
+    <td>timestamp-nanos</td>
+  </tr>
+  <tr>
+    <td>TimestampNTZType(p) (with p in 7-9)</td>
+    <td>long</td>
+    <td>local-timestamp-nanos</td>
   </tr>
   <tr>
     <td>DecimalType</td>

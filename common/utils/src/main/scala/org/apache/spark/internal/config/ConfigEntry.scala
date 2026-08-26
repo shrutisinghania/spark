@@ -17,6 +17,11 @@
 
 package org.apache.spark.internal.config
 
+import org.apache.spark.SparkException
+import org.apache.spark.config.ConfigRegistry
+import org.apache.spark.config.protobuf.{BindingPolicy, ConfigEntry => ProtoConfigEntry, ValueType, Visibility}
+import org.apache.spark.util.SparkEnvUtils
+
 // ====================================================================================
 //                      The guideline for naming configurations
 // ====================================================================================
@@ -69,6 +74,7 @@ The followings are best practices of naming configs for some common cases:
  * @param isPublic if this configuration is public to the user. If it's `false`, this
  *                 configuration is only used internally and we should not expose it to users.
  * @param version the spark version when the configuration was released.
+ * @param bindingPolicy optional policy for SQL configs: SESSION or PERSISTED.
  * @tparam T the value type
  */
 private[spark] abstract class ConfigEntry[T] (
@@ -80,7 +86,8 @@ private[spark] abstract class ConfigEntry[T] (
     val stringConverter: T => String,
     val doc: String,
     val isPublic: Boolean,
-    val version: String) {
+    val version: String,
+    val bindingPolicy: Option[ConfigBindingPolicy.Value] = None) {
 
   import ConfigEntry._
 
@@ -106,7 +113,7 @@ private[spark] abstract class ConfigEntry[T] (
 
   override def toString: String = {
     s"ConfigEntry(key=$key, defaultValue=$defaultValueString, doc=$doc, " +
-      s"public=$isPublic, version=$version)"
+      s"public=$isPublic, version=$version, bindingPolicy=$bindingPolicy)"
   }
 }
 
@@ -120,7 +127,8 @@ private class ConfigEntryWithDefault[T] (
     stringConverter: T => String,
     doc: String,
     isPublic: Boolean,
-    version: String)
+    version: String,
+    bindingPolicy: Option[ConfigBindingPolicy.Value] = None)
   extends ConfigEntry(
     key,
     prependedKey,
@@ -130,7 +138,8 @@ private class ConfigEntryWithDefault[T] (
     stringConverter,
     doc,
     isPublic,
-    version
+    version,
+    bindingPolicy
   ) {
 
   override def defaultValue: Option[T] = Some(_defaultValue)
@@ -152,7 +161,8 @@ private class ConfigEntryWithDefaultFunction[T] (
     stringConverter: T => String,
     doc: String,
     isPublic: Boolean,
-    version: String)
+    version: String,
+    bindingPolicy: Option[ConfigBindingPolicy.Value] = None)
   extends ConfigEntry(
     key,
     prependedKey,
@@ -162,7 +172,8 @@ private class ConfigEntryWithDefaultFunction[T] (
     stringConverter,
     doc,
     isPublic,
-    version
+    version,
+    bindingPolicy
   ) {
 
   override def defaultValue: Option[T] = Some(_defaultFunction())
@@ -184,7 +195,8 @@ private class ConfigEntryWithDefaultString[T] (
     stringConverter: T => String,
     doc: String,
     isPublic: Boolean,
-    version: String)
+    version: String,
+    bindingPolicy: Option[ConfigBindingPolicy.Value] = None)
   extends ConfigEntry(
     key,
     prependedKey,
@@ -194,7 +206,8 @@ private class ConfigEntryWithDefaultString[T] (
     stringConverter,
     doc,
     isPublic,
-    version
+    version,
+    bindingPolicy
   ) {
 
   override def defaultValue: Option[T] = Some(valueConverter(_defaultValue))
@@ -220,7 +233,8 @@ private[spark] class OptionalConfigEntry[T](
     val rawStringConverter: T => String,
     doc: String,
     isPublic: Boolean,
-    version: String)
+    version: String,
+    bindingPolicy: Option[ConfigBindingPolicy.Value] = None)
   extends ConfigEntry[Option[T]](
     key,
     prependedKey,
@@ -230,7 +244,8 @@ private[spark] class OptionalConfigEntry[T](
     v => v.map(rawStringConverter).orNull,
     doc,
     isPublic,
-    version
+    version,
+    bindingPolicy
   ) {
 
   override def defaultValueString: String = ConfigEntry.UNDEFINED
@@ -251,6 +266,7 @@ private[spark] class FallbackConfigEntry[T] (
     doc: String,
     isPublic: Boolean,
     version: String,
+    bindingPolicy: Option[ConfigBindingPolicy.Value] = None,
     val fallback: ConfigEntry[T])
   extends ConfigEntry[T](
     key,
@@ -261,13 +277,115 @@ private[spark] class FallbackConfigEntry[T] (
     fallback.stringConverter,
     doc,
     isPublic,
-    version
+    version,
+    bindingPolicy
   ) {
 
   override def defaultValueString: String = s"<value of ${fallback.key}>"
 
   override def readFrom(reader: ConfigReader): T = {
     readString(reader).map(valueConverter).getOrElse(fallback.readFrom(reader))
+  }
+}
+
+/**
+ * Marker trait for config entries backed by proto definitions.
+ */
+private[spark] sealed trait ProtoBackedBase
+
+/**
+ * A proto-backed config entry with a default value.
+ */
+private[spark] class ProtoBackedConfigEntry[T](
+    protoEntry: ProtoConfigEntry,
+    valueConverter: String => T,
+    stringConverter: T => String)
+  extends ConfigEntry[T](
+    key = protoEntry.getKey,
+    prependedKey = None,
+    prependSeparator = "",
+    alternatives = Nil,
+    valueConverter = valueConverter,
+    stringConverter = stringConverter,
+    doc = protoEntry.getDoc,
+    isPublic = protoEntry.getVisibility != Visibility.VISIBILITY_INTERNAL,
+    version = protoEntry.getVersion,
+    bindingPolicy = ProtoBackedConfigEntry.toBindingPolicy(protoEntry)
+  ) with ProtoBackedBase {
+
+  override def defaultValueString: String =
+    defaultValue.map(stringConverter).getOrElse(ConfigEntry.UNDEFINED)
+
+  // The default is derived from immutable proto fields (and the fixed testing flag), so convert it
+  // once and cache rather than re-parsing the string on every default-fallback read.
+  private lazy val cachedDefaultValue: Option[T] = {
+    val defaultStrOpt = if (SparkEnvUtils.isTesting && protoEntry.hasTestDefault) {
+      Some(protoEntry.getTestDefault)
+    } else if (protoEntry.hasDefaultValue) {
+      Some(protoEntry.getDefaultValue)
+    } else {
+      None
+    }
+    defaultStrOpt.map(valueConverter)
+  }
+
+  override def defaultValue: Option[T] = cachedDefaultValue
+
+  override def readFrom(reader: ConfigReader): T = {
+    readString(reader).map(valueConverter).getOrElse(defaultValue.get)
+  }
+
+  def checkValue(validator: T => Boolean, errorMsg: String): ProtoBackedConfigEntry[T] = {
+    new ProtoBackedConfigEntry[T](
+      protoEntry,
+      str => {
+        val v = valueConverter(str)
+        if (!validator(v)) {
+          throw ConfigHelpers.configRequirementError(key, str, errorMsg)
+        }
+        v
+      },
+      stringConverter
+    )
+  }
+}
+
+/**
+ * A proto-backed config entry that does not have a default value.
+ */
+private[spark] class ProtoBackedOptionalConfigEntry[T](
+    protoEntry: ProtoConfigEntry,
+    rawValueConverter: String => T,
+    rawStringConverter: T => String)
+  extends ConfigEntry[Option[T]](
+    key = protoEntry.getKey,
+    prependedKey = None,
+    prependSeparator = "",
+    alternatives = Nil,
+    valueConverter = s => Some(rawValueConverter(s)),
+    stringConverter = v => v.map(rawStringConverter).orNull,
+    doc = protoEntry.getDoc,
+    isPublic = protoEntry.getVisibility != Visibility.VISIBILITY_INTERNAL,
+    version = protoEntry.getVersion,
+    bindingPolicy = ProtoBackedConfigEntry.toBindingPolicy(protoEntry)
+  ) with ProtoBackedBase {
+
+  override def defaultValueString: String = ConfigEntry.UNDEFINED
+
+  override def readFrom(reader: ConfigReader): Option[T] = {
+    readString(reader).map(rawValueConverter)
+  }
+}
+
+private[spark] object ProtoBackedConfigEntry {
+  def toBindingPolicy(
+      protoEntry: ProtoConfigEntry): Option[ConfigBindingPolicy.Value] = {
+    protoEntry.getBindingPolicy match {
+      case BindingPolicy.BINDING_POLICY_SESSION => Some(ConfigBindingPolicy.SESSION)
+      case BindingPolicy.BINDING_POLICY_PERSISTED => Some(ConfigBindingPolicy.PERSISTED)
+      case BindingPolicy.BINDING_POLICY_NOT_APPLICABLE => Some(ConfigBindingPolicy.NOT_APPLICABLE)
+      case _ => None
+    }
   }
 }
 
@@ -278,11 +396,94 @@ private[spark] object ConfigEntry {
   private[spark] val knownConfigs =
     new java.util.concurrent.ConcurrentHashMap[String, ConfigEntry[_]]()
 
+  // Register all proto-backed configs at object initialization.
+  // These can be overwritten later by modules that need to add validation.
+  ConfigRegistry.allConfigs().forEach { protoEntry =>
+    createProtoBackedConfigEntry(protoEntry)
+  }
+
   def registerEntry(entry: ConfigEntry[_]): Unit = {
     val existing = knownConfigs.putIfAbsent(entry.key, entry)
-    require(existing == null, s"Config entry ${entry.key} already registered!")
+    if (existing != null) {
+      // A key registered twice is normally a bug (typo or accidental duplicate), so we fail loudly.
+      // The one exception is the enhancement pattern: a proto-backed config is registered eagerly
+      // at object init, then a Scala entry built via `buildConfFromConfigFile` (e.g. to add
+      // `checkValue`) may intentionally replace it. We allow the overwrite only when the existing
+      // entry is proto-backed; this deliberately trades the duplicate-detection net for that key,
+      // so the Scala side must still reference a key that is genuinely defined in a .textproto
+      // file.
+      require(existing.isInstanceOf[ProtoBackedBase] && entry.isInstanceOf[ProtoBackedBase],
+        s"Config entry ${entry.key} already registered!")
+      knownConfigs.put(entry.key, entry)
+    }
   }
 
   def findEntry(key: String): ConfigEntry[_] = knownConfigs.get(key)
 
+  def listAllEntries(): java.util.Collection[ConfigEntry[_]] = knownConfigs.values()
+
+  def findProtoBackedEntry(key: String): ProtoBackedConfigEntry[_] = {
+    knownConfigs.get(key) match {
+      case entry: ProtoBackedConfigEntry[_] => entry
+      case _ => null
+    }
+  }
+
+  def findProtoDefinedEntry(key: String): ConfigEntry[_] = {
+    if (ConfigRegistry.containsConfig(key)) knownConfigs.get(key) else null
+  }
+
+  def listAllProtoDefinedConfigs(): java.util.Collection[ConfigEntry[_]] = {
+    new java.util.AbstractCollection[ConfigEntry[_]]() {
+      override def iterator(): java.util.Iterator[ConfigEntry[_]] = {
+        val keys = ConfigRegistry.allKeys().iterator()
+        new java.util.Iterator[ConfigEntry[_]]() {
+          override def hasNext: Boolean = keys.hasNext
+          override def next(): ConfigEntry[_] = knownConfigs.get(keys.next())
+        }
+      }
+
+      override def size(): Int = ConfigRegistry.allKeys().size()
+    }
+  }
+
+  private def createProtoBackedConfigEntry(
+      protoEntry: ProtoConfigEntry): ConfigEntry[_] = {
+    // `test_default` only overrides `default_value` in test environments; a config that sets
+    // `test_default` without `default_value` would be a has-default entry under test but an
+    // optional entry in production, diverging the entry's shape (and `buildConfFromConfigFile`'s
+    // success/failure) between the two. Reject it here so the misconfiguration fails consistently.
+    require(!protoEntry.hasTestDefault || protoEntry.hasDefaultValue,
+      s"Config entry ${protoEntry.getKey} sets test_default without default_value; " +
+        "a config with a test default must also declare a default value.")
+    // With the invariant above, `test_default` implies `default_value`, so having a default is
+    // equivalent to having a `default_value` in every environment.
+    val hasDefault = protoEntry.hasDefaultValue
+    protoEntry.getValueType match {
+      case ValueType.VALUE_TYPE_BOOL =>
+        createTypedEntry[Boolean](protoEntry, hasDefault, _.toBoolean, _.toString)
+      case ValueType.VALUE_TYPE_INT =>
+        createTypedEntry[Int](protoEntry, hasDefault, _.toInt, _.toString)
+      case ValueType.VALUE_TYPE_LONG =>
+        createTypedEntry[Long](protoEntry, hasDefault, _.toLong, _.toString)
+      case ValueType.VALUE_TYPE_DOUBLE =>
+        createTypedEntry[Double](protoEntry, hasDefault, _.toDouble, _.toString)
+      case ValueType.VALUE_TYPE_STRING =>
+        createTypedEntry[String](protoEntry, hasDefault, identity[String], identity[String])
+      case other =>
+        throw SparkException.internalError(s"Unsupported value type: $other")
+    }
+  }
+
+  private def createTypedEntry[T](
+      protoEntry: ProtoConfigEntry,
+      hasDefault: Boolean,
+      valueConverter: String => T,
+      stringConverter: T => String): ConfigEntry[_] = {
+    if (hasDefault) {
+      new ProtoBackedConfigEntry[T](protoEntry, valueConverter, stringConverter)
+    } else {
+      new ProtoBackedOptionalConfigEntry[T](protoEntry, valueConverter, stringConverter)
+    }
+  }
 }

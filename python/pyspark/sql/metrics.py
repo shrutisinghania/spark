@@ -16,7 +16,7 @@
 #
 import abc
 import dataclasses
-from typing import Optional, List, Tuple, Dict, Any, Union, TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from pyspark.errors import PySparkValueError
 
@@ -30,18 +30,15 @@ if TYPE_CHECKING:
 class ObservedMetrics(abc.ABC):
     @property
     @abc.abstractmethod
-    def name(self) -> str:
-        ...
+    def name(self) -> str: ...
 
     @property
     @abc.abstractmethod
-    def pairs(self) -> Dict[str, Any]:
-        ...
+    def pairs(self) -> Dict[str, Any]: ...
 
     @property
     @abc.abstractmethod
-    def keys(self) -> List[str]:
-        ...
+    def keys(self) -> List[str]: ...
 
 
 class MetricValue:
@@ -67,6 +64,20 @@ class MetricValue:
     @property
     def metric_type(self) -> str:
         return self._type
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable dictionary representation of this metric value.
+
+        Returns
+        -------
+        dict
+            A dictionary with keys 'name', 'value', and 'type'.
+        """
+        return {
+            "name": self._name,
+            "value": self._value,
+            "type": self._type,
+        }
 
 
 class PlanMetrics:
@@ -96,6 +107,21 @@ class PlanMetrics:
     @property
     def metrics(self) -> List[MetricValue]:
         return self._metrics
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-serializable dictionary representation of this plan metrics.
+
+        Returns
+        -------
+        dict
+            A dictionary with keys 'name', 'plan_id', 'parent_plan_id', and 'metrics'.
+        """
+        return {
+            "name": self._name,
+            "plan_id": self._id,
+            "parent_plan_id": self._parent_id,
+            "metrics": [m.to_dict() for m in self._metrics],
+        }
 
 
 class CollectedMetrics:
@@ -250,9 +276,7 @@ class CollectedMetrics:
                     </TR>
                     <TR><TD COLSPAN="2"><FONT POINT-SIZE=\"10\">Metrics</FONT></TD></TR>
                     {}
-                    </TABLE>>""".format(
-                        v.name, rows
-                    ),
+                    </TABLE>>""".format(v.name, rows),
                 )
                 for c in v.children:
                     dot.edge(str(k), str(c))
@@ -273,10 +297,14 @@ class ExecutionInfo:
     data frame. This value is only set in the data frame if it was executed."""
 
     def __init__(
-        self, metrics: Optional[list[PlanMetrics]], obs: Optional[Sequence[ObservedMetrics]]
+        self,
+        metrics: Optional[list[PlanMetrics]],
+        obs: Optional[Sequence[ObservedMetrics]],
+        operation_id: Optional[str] = None,
     ):
         self._metrics = CollectedMetrics(metrics) if metrics else None
         self._observations = obs if obs else []
+        self._operation_id = operation_id
 
     @property
     def metrics(self) -> Optional[CollectedMetrics]:
@@ -285,3 +313,11 @@ class ExecutionInfo:
     @property
     def flows(self) -> List[Tuple[str, Dict[str, Any]]]:
         return [(f.name, f.pairs) for f in self._observations]
+
+    @property
+    def operation_id(self) -> Optional[str]:
+        """The Spark Connect ExecutePlan operation ID, when available.
+
+        .. versionadded:: 4.3.0
+        """
+        return self._operation_id

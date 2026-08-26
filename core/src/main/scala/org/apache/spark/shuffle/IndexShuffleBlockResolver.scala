@@ -21,7 +21,7 @@ import java.io._
 import java.nio.ByteBuffer
 import java.nio.channels.Channels
 import java.nio.file.Files
-import java.util.{Collections, Map => JMap}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap}
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -58,19 +58,19 @@ private[spark] class IndexShuffleBlockResolver(
     conf: SparkConf,
     // var for testing
     var _blockManager: BlockManager,
-    val taskIdMapsForShuffle: JMap[Int, OpenHashSet[Long]])
+    val taskIdMapsForShuffle: ConcurrentMap[Int, OpenHashSet[Long]])
   extends ShuffleBlockResolver
   with Logging with MigratableResolver {
 
   def this(conf: SparkConf) = {
-    this(conf, null, Collections.emptyMap())
+    this(conf, null, new ConcurrentHashMap[Int, OpenHashSet[Long]]())
   }
 
   def this(conf: SparkConf, _blockManager: BlockManager) = {
-    this(conf, _blockManager, Collections.emptyMap())
+    this(conf, _blockManager, new ConcurrentHashMap[Int, OpenHashSet[Long]]())
   }
 
-  def this(conf: SparkConf, taskIdMapsForShuffle: JMap[Int, OpenHashSet[Long]]) = {
+  def this(conf: SparkConf, taskIdMapsForShuffle: ConcurrentHashMap[Int, OpenHashSet[Long]]) = {
     this(conf, null, taskIdMapsForShuffle)
   }
 
@@ -310,13 +310,13 @@ private[spark] class IndexShuffleBlockResolver(
             val mapTaskIds = taskIdMapsForShuffle.computeIfAbsent(
               shuffleId, _ => new OpenHashSet[Long](8)
             )
-            mapTaskIds.add(mapId)
+            mapTaskIds.synchronized { mapTaskIds.add(mapId) }
 
           case ShuffleDataBlockId(shuffleId, mapId, _) =>
             val mapTaskIds = taskIdMapsForShuffle.computeIfAbsent(
               shuffleId, _ => new OpenHashSet[Long](8)
             )
-            mapTaskIds.add(mapId)
+            mapTaskIds.synchronized { mapTaskIds.add(mapId) }
 
           case _ => // Unreachable
         }
@@ -576,22 +576,21 @@ private[spark] class IndexShuffleBlockResolver(
 
   private[shuffle] def getChecksums(checksumFile: File, blockNum: Int): Array[Long] = {
     if (!checksumFile.exists()) return null
-    val checksums = new ArrayBuffer[Long]
     // Read the checksums of blocks
-    var in: DataInputStream = null
     try {
-      in = new DataInputStream(new NioBufferedFileInputStream(checksumFile))
-      while (checksums.size < blockNum) {
-        checksums += in.readLong()
+      Utils.tryWithResource {
+        new DataInputStream(new NioBufferedFileInputStream(checksumFile))
+      } { in =>
+        val checksums = new ArrayBuffer[Long]
+        while (checksums.size < blockNum) {
+          checksums += in.readLong()
+        }
+        checksums.toArray
       }
     } catch {
       case _: IOException | _: EOFException =>
-        return null
-    } finally {
-      in.close()
+        null
     }
-
-    checksums.toArray
   }
 
   /**

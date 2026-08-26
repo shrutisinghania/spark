@@ -15,13 +15,13 @@
 # limitations under the License.
 #
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from pyspark import pandas as ps
-from pyspark.pandas.config import set_option, reset_option, option_context
-from pyspark.pandas.plot import TopNPlotBase, SampledPlotBase, HistogramPlotBase, BoxPlotBase
+from pyspark.pandas.config import option_context, reset_option, set_option
 from pyspark.pandas.exceptions import PandasNotImplementedError
+from pyspark.pandas.plot import BoxPlotBase, HistogramPlotBase, SampledPlotBase, TopNPlotBase
 from pyspark.testing.pandasutils import PandasOnSparkTestCase
 
 
@@ -139,13 +139,6 @@ class DataFramePlotTests(DataFramePlotTestsMixin, PandasOnSparkTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-    from pyspark.pandas.tests.plot.test_frame_plot import *  # noqa: F401
+    from pyspark.testing import main
 
-    try:
-        import xmlrunner
-
-        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
-    except ImportError:
-        testRunner = None
-    unittest.main(testRunner=testRunner, verbosity=2)
+    main()

@@ -27,7 +27,7 @@ Security features like authentication are not enabled by default. When deploying
 or an untrusted network, it's important to secure access to the cluster to prevent unauthorized applications
 from running on the cluster.
 
-Spark supports multiple deployments types and each one supports different levels of security. Not
+Spark supports multiple deployment types and each one supports different levels of security. Not
 all deployment types will be secure in all environments and none are secure by default. Be
 sure to evaluate your environment, what Spark supports, and take the appropriate measure to secure
 your Spark deployment.
@@ -98,7 +98,7 @@ Kubernetes admin to ensure that Spark authentication is secure.
   <td><code>spark.authenticate.secret</code></td>
   <td>None</td>
   <td>
-    The secret key used authentication. See above for when this configuration should be set.
+    The secret key used for authentication. See above for when this configuration should be set.
   </td>
   <td>1.0.0</td>
 </tr>
@@ -348,8 +348,14 @@ The following options control the authentication of Web UIs:
 <tr>
   <td><code>spark.ui.allowFramingFrom</code></td>
   <td><code>SAMEORIGIN</code></td>
-  <td>Allow framing for a specific named URI via <code>X-Frame-Options</code>. By default, allow only from the same origin.</td>
+  <td>Allow framing for a specific named URI via CSP <code>frame-ancestors</code> directive. By default, allow only from the same origin. Requires <code>spark.ui.contentSecurityPolicy.enabled=true</code> to take effect. When CSP is disabled, <code>X-Frame-Options: SAMEORIGIN</code> is used regardless of this setting.</td>
   <td>1.6.0</td>
+</tr>
+<tr>
+  <td><code>spark.ui.contentSecurityPolicy.frameAncestors.enabled</code></td>
+  <td><code>true</code></td>
+  <td>Whether to include the <code>frame-ancestors</code> directive in the CSP header when <code>spark.ui.contentSecurityPolicy.enabled=true</code>. When enabled, the <code>frame-ancestors</code> directive enforces the <code>spark.ui.allowFramingFrom</code> setting. This setting is ignored when CSP is disabled.</td>
+  <td>4.3.0</td>
 </tr>
 <tr>
   <td><code>spark.ui.filters</code></td>
@@ -766,12 +772,14 @@ Security.
 <thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
 <tr>
   <td><code>spark.ui.xXssProtection</code></td>
-  <td><code>1; mode=block</code></td>
+  <td><code>0</code></td>
   <td>
-    Value for HTTP X-XSS-Protection response header. You can choose appropriate value
-    from below:
+    Value for HTTP X-XSS-Protection response header. The default is <code>0</code> which
+    disables the browser's XSS Auditor. The XSS Auditor has been removed from Chrome and
+    Edge, and was never implemented in Firefox. In browsers that still support it (Safari),
+    it can introduce side-channel vulnerabilities. Use Content-Security-Policy instead.
     <ul>
-      <li><code>0</code> (Disables XSS filtering)</li>
+      <li><code>0</code> (Disables XSS filtering. Recommended.)</li>
       <li><code>1</code> (Enables XSS filtering. If a cross-site scripting attack is detected,
         the browser will sanitize the page.)</li>
       <li><code>1; mode=block</code> (Enables XSS filtering. The browser will prevent rendering
@@ -802,6 +810,16 @@ Security.
     </ul>
   </td>
   <td>2.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.ui.contentSecurityPolicy.enabled</code></td>
+  <td><code>true</code></td>
+  <td>
+    When enabled, the Content-Security-Policy (CSP) HTTP response header is set for the Spark UI,
+    restricting the sources from which the browser is allowed to load resources as a
+    defense-in-depth measure against cross-site scripting (XSS).
+  </td>
+  <td>4.2.0</td>
 </tr>
 </table>
 
@@ -924,9 +942,8 @@ In most cases, Spark relies on the credentials of the current logged in user whe
 to Kerberos-aware services. Such credentials can be obtained by logging in to the configured KDC
 with tools like `kinit`.
 
-When talking to Hadoop-based services, Spark needs to obtain delegation tokens so that non-local
-processes can authenticate. Spark ships with support for HDFS and other Hadoop file systems, Hive
-and HBase.
+When talking to Hadoop-based services, Spark needs to obtain delegation tokens so that processes
+can authenticate. Spark ships with support for HDFS and other Hadoop file systems, Hive and HBase.
 
 When using a Hadoop filesystem (such HDFS or WebHDFS), Spark will acquire the relevant tokens
 for the service hosting the user's home directory.
@@ -946,8 +963,8 @@ mechanism (see `java.util.ServiceLoader`). Implementations of
 `org.apache.spark.security.HadoopDelegationTokenProvider` can be made available to Spark
 by listing their names in the corresponding file in the jar's `META-INF/services` directory.
 
-Delegation token support is currently only supported in YARN and Kubernetes mode. Consult the
-deployment-specific page for more information.
+Delegation token support is currently only supported in Local, YARN and Kubernetes modes.
+Consult the deployment-specific page for more information.
 
 The following options provides finer-grained control for this feature:
 
@@ -963,6 +980,23 @@ The following options provides finer-grained control for this feature:
     application being run.
   </td>
   <td>2.3.0</td>
+</tr>
+<tr>
+  <td><code>spark.security.directCredentialProviders.enabled</code></td>
+  <td><code>false</code></td>
+  <td>
+    When true, enables credential collection and renewal without Kerberos. Providers
+    registered via <code>HadoopDelegationTokenProvider</code> are called directly (without
+    <code>doLogin</code>/<code>doAs</code>) and participate in the same renewal and
+    distribution lifecycle as Kerberos delegation token providers. Providers that require
+    Kerberos self-gate via their <code>delegationTokensRequired</code> method.
+    Requires RPC channel encryption: either <code>spark.ssl.rpc.enabled=true</code>,
+    or <code>spark.authenticate=true</code> together with
+    <code>spark.network.crypto.enabled</code> or
+    <code>spark.authenticate.enableSaslEncryption</code>.
+    Supported on YARN, Kubernetes, and local mode. Not supported on standalone clusters.
+  </td>
+  <td>4.3.0</td>
 </tr>
 <tr>
   <td><code>spark.kerberos.access.hadoopFileSystems</code></td>
@@ -1014,10 +1048,32 @@ It's up to the user to maintain an updated ticket cache that Spark can use.
 The location of the ticket cache can be customized by setting the `KRB5CCNAME` environment
 variable.
 
+## Proxy User
+
+Spark also provides `--proxy-user` parameter for `spark-submit` to enable Hadoop's
+[Proxy user](https://hadoop.apache.org/docs/stable/hadoop-project-dist/hadoop-common/Superusers.html) feature.
+
+If the target cluster, e.g., YARN, HDFS, is running in Secure Mode, the superuser must have a valid
+Kerberos ticket to log in. The impersonated user (proxy-user) does not need to have a Kerberos ticket.
+In addition, the superuser must be configured in the cluster to be allowed to impersonate the
+proxy user.
+
+The authentication happens on the target cluster side, and once the authentication is successful, the cluster will
+do resource allocation and file system access on behalf of the proxy user.
+
+Note that, depending on Spark's deployment mode, the proxy user might behave differently. For cluster mode, the JVM
+running the driver will be started by the proxy user, while for client mode, it will be started by the superuser instead. This is due to
+the Driver being initialized inside the progress of `SparkSubmit` client. This makes a difference in file system access
+for local file permissions. This is not considered a CVE issue, but users should be aware of this difference.
+
+Nowadays, many projects, such as Apache Kyuubi, provide a multi-tenant Spark service with impersonation. To prevent
+server-side local files from reading and leaking by superuser to other tenants, it is recommended to refer to their
+documentation to find out instructions on how to ensure cluster mode is used for a more secure purpose.
+
 ## Secure Interaction with Kubernetes
 
 When talking to Hadoop-based services behind Kerberos, it was noted that Spark needs to obtain delegation tokens
-so that non-local processes can authenticate. These delegation tokens in Kubernetes are stored in Secrets that are
+so that processes can authenticate. These delegation tokens in Kubernetes are stored in Secrets that are
 shared by the Driver and its Executors. As such, there are three ways of submitting a Kerberos job:
 
 In all cases you must define the environment variable: `HADOOP_CONF_DIR` or

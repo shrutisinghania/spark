@@ -22,24 +22,31 @@ import java.util.{Locale, TimeZone}
 
 import scala.jdk.CollectionConverters._
 
-import org.antlr.v4.runtime.{ParserRuleContext, Token}
+import org.antlr.v4.runtime.ParserRuleContext
 import org.antlr.v4.runtime.tree.TerminalNode
 
-import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{CurrentNamespace, GlobalTempView, LocalTempView, PersistedView, PlanWithUnresolvedIdentifier, SchemaEvolution, SchemaTypeEvolution, UnresolvedAttribute, UnresolvedFunctionName, UnresolvedIdentifier, UnresolvedNamespace}
+import org.apache.spark.sql.catalyst.analysis.{CurrentNamespace,
+  GlobalTempView, LocalTempView, PersistedView,
+  SchemaEvolution, SchemaTypeEvolution, UnresolvedAttribute,
+  UnresolvedIdentifier, UnresolvedNamespace, UnresolvedPartitionSpec, UnresolvedProcedure,
+  UnresolvedTableOrViewSearchPathMode}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.expressions.{Expression, Literal}
 import org.apache.spark.sql.catalyst.parser._
+import org.apache.spark.sql.catalyst.parser.SqlBaseParser
 import org.apache.spark.sql.catalyst.parser.SqlBaseParser._
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.catalyst.trees.{CurrentOrigin, Origin}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants
+import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryParsingErrors}
 import org.apache.spark.sql.execution.command._
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.internal.{HiveSerDe, SQLConf, VariableSubstitution}
 import org.apache.spark.sql.internal.StaticSQLConf.CATALOG_IMPLEMENTATION
-import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.metricview.logical.CreateMetricView
+import org.apache.spark.sql.types.{DataType, StringType}
 import org.apache.spark.util.Utils.getUriBuilder
 
 /**
@@ -50,8 +57,171 @@ class SparkSqlParser extends AbstractSqlParser {
 
   private val substitutor = new VariableSubstitution()
 
+  /**
+   * Parse SQL with explicit parameter context, avoiding thread-local usage.
+   * This is the preferred method for parsing SQL with parameters.
+   *
+   * @param command The SQL text to parse
+   * @param parameterContext The parameter context containing parameter values
+   * @param toResult Function to convert the parser result
+   * @return The parsed result
+   */
+  def parseWithParameters[T](
+      command: String,
+      parameterContext: ParameterContext)
+      (toResult: SqlBaseParser => T): T = {
+    parseInternal(command, Some(parameterContext))(toResult)
+  }
+
+  /**
+   * Parse SQL plan with explicit parameter context, avoiding thread-local usage.
+   * This is the preferred method for parsing SQL plans with parameters.
+   *
+   * @param sqlText The SQL text to parse
+   * @param parameterContext The parameter context containing parameter values
+   * @return The parsed logical plan
+   */
+  override def parsePlanWithParameters(
+      sqlText: String,
+      parameterContext: ParameterContext): LogicalPlan = {
+    parseWithParameters(sqlText, parameterContext) { parser =>
+      val ctx = parser.compoundOrSingleStatement()
+      withErrorHandling(ctx, Some(sqlText)) {
+        astBuilder.visitCompoundOrSingleStatement(ctx) match {
+          case compoundBody: CompoundPlanStatement => compoundBody
+          case plan: LogicalPlan => plan
+          case _ =>
+            val position = Origin(None, None)
+            throw QueryParsingErrors.sqlStatementUnsupportedError(sqlText, position)
+        }
+      }
+    }
+  }
+
   protected override def parse[T](command: String)(toResult: SqlBaseParser => T): T = {
-    super.parse(substitutor.substitute(command))(toResult)
+    parseInternal(command, None)(toResult)
+  }
+
+  /**
+   * Split a SQL string into individual statements at `;` boundaries.
+   *
+   * The emitted statements are pieces of the original input -- `${...}` variable
+   * references are NOT expanded here, so they survive into each emitted statement
+   * and are substituted for real per-statement at parse time (see [[parseInternal]]).
+   * This is important for the `spark-sql` CLI's batch mode: a `${x}` whose value
+   * comes from a `SET x=...` in the same batch must resolve to the post-`SET`
+   * value, which is only available *after* the earlier statement executes.
+   *
+   * To still recognize `BEGIN ... END` compound block boundaries when a body
+   * contains a `${...}` reference, the splitter is invoked with a validation
+   * preprocessor that replaces every `${...}` with a fixed valid identifier.
+   * The placeholder makes the candidate region parse-equivalent regardless of
+   * whether (or how) the variable is set, while the emitted statement keeps
+   * the original `${...}` so per-statement substitution at execution still
+   * runs against the real session config (with earlier `SET`s applied).
+   */
+  override def splitStatements(sqlText: String): SqlStatementSplitResult =
+    SqlStatementSplitter.split(sqlText, SparkSqlParser.substituteVariablesForValidation)
+
+  /**
+   * Internal parse method that handles both parameter substitution and regular parsing.
+   *
+   * @param command The SQL text to parse
+   * @param parameterContext Optional parameter context for parameter substitution
+   * @param toResult Function to convert the parser result
+   * @return The parsed result
+   */
+  private def parseInternal[T](
+      command: String,
+      parameterContext: Option[ParameterContext])
+      (toResult: SqlBaseParser => T): T = {
+
+    // Step 1: Apply variable substitution to expand any variable references.
+    val variableSubstituted = substitutor.substitute(command)
+
+    // Step 2: Apply parameter substitution if a parameter context is provided.
+    val (paramSubstituted, positionMapper, hasParameters) = parameterContext match {
+      case Some(context) =>
+        // Check if the context actually contains parameters
+        val contextHasParams = context match {
+          case NamedParameterContext(params) => params.nonEmpty
+          case PositionalParameterContext(params) => params.nonEmpty
+          case HybridParameterContext(args, _) => args.nonEmpty
+        }
+        if (SQLConf.get.legacyParameterSubstitutionConstantsOnly) {
+          // Legacy mode: Parameters are detected but substitution is deferred to analysis phase.
+          // Only set hasParameters if the context actually contains parameters.
+          (variableSubstituted, PositionMapper.identity(variableSubstituted), contextHasParams)
+        } else {
+          // Modern mode: Perform parameter substitution during parsing.
+          val (substituted, mapper) =
+            ParameterHandler.substituteParameters(variableSubstituted, context)
+          // Only set hasParameters if the context actually contains parameters.
+          (substituted, mapper, contextHasParams)
+        }
+      case None =>
+        // No parameter context provided; skip parameter substitution.
+        (variableSubstituted, PositionMapper.identity(variableSubstituted), false)
+    }
+
+    // Step 3: Set up the origin with SQL text and position mapper to enable
+    // parameter-aware error reporting.
+    val currentOrigin = CurrentOrigin.get
+    val originToUse = if (hasParameters) {
+      // Set up origin with the substituted SQL text and position mapper for
+      // proper error reporting.
+      currentOrigin.copy(
+        sqlText = Some(paramSubstituted),
+        startIndex = Some(0),
+        stopIndex = Some(paramSubstituted.length - 1),
+        positionMapper = Some(positionMapper)
+      )
+    } else {
+      // No substitution occurred; use the existing origin unchanged.
+      currentOrigin
+    }
+
+    // Parse with the origin containing position mapper.
+    // CurrentOrigin.withOrigin automatically restores the previous origin.
+    CurrentOrigin.withOrigin(originToUse) {
+      super.parse(paramSubstituted)(toResult)
+    }
+  }
+}
+
+object SparkSqlParser {
+
+  /**
+   * Identifier used to stand in for every `${...}` variable reference when
+   * the splitter validates a candidate compound block. It is intentionally
+   * shaped so that a real user identifier cannot collide with it; it is also
+   * a structurally well-formed Spark SQL identifier (letters + underscores
+   * only) so the parser accepts it in nearly every position a `${...}` might
+   * appear.
+   */
+  private[execution] val VariableRefPlaceholder = "__SPARK_VAR_PLACEHOLDER__"
+
+  /**
+   * Regex matching a `${...}` variable reference. Mirrors
+   * [[org.apache.spark.internal.config.ConfigReader.REF_RE]]: an optional
+   * `prefix:` followed by a non-whitespace name, enclosed in `${ }`.
+   */
+  private val variableRefRe = """\$\{(?:\w+?:)?\S+?\}""".r
+
+  /**
+   * Validation-time preprocessor for the splitter (see
+   * [[SparkSqlParser.splitStatements]]): replaces every `${...}` reference
+   * with [[VariableRefPlaceholder]] so candidate regions parse regardless of
+   * whether the referenced variable is set. The emitted statement keeps the
+   * original `${...}` and is substituted for real at execution time. If
+   * variable substitution is disabled in the session conf, the input is
+   * returned unchanged (matching the behavior of the real substituter).
+   */
+  private[execution] def substituteVariablesForValidation(input: String): String = {
+    if (input == null || input.isEmpty || !input.contains("${")) return input
+    if (!SQLConf.get.variableSubstituteEnabled) return input
+    variableRefRe.replaceAllIn(
+      input, _ => scala.util.matching.Regex.quoteReplacement(VariableRefPlaceholder))
   }
 }
 
@@ -67,22 +237,79 @@ class SparkSqlAstBuilder extends AstBuilder {
   private val configValueDef = """([^;]*);*""".r
   private val strLiteralDef = """(".*?[^\\]"|'.*?[^\\]'|[^ \n\r\t"']+)""".r
 
-  private def withCatalogIdentClause(
-      ctx: CatalogIdentifierReferenceContext,
-      builder: Seq[String] => LogicalPlan): LogicalPlan = {
-    val exprCtx = ctx.expression
-    if (exprCtx != null) {
-      // resolve later in analyzer
-      PlanWithUnresolvedIdentifier(withOrigin(exprCtx) { expression(exprCtx) }, Nil,
-        (ident, _) => builder(ident))
-    } else if (ctx.errorCapturingIdentifier() != null) {
-      // resolve immediately
-      builder.apply(Seq(ctx.errorCapturingIdentifier().getText))
-    } else if (ctx.stringLit() != null) {
-      // resolve immediately
-      builder.apply(Seq(string(visitStringLit(ctx.stringLit()))))
-    } else {
-      throw SparkException.internalError("Invalid catalog name")
+  /**
+   * Extract the actual function name from a potentially qualified temporary function name.
+   * Supports: funcName, session.funcName, system.session.funcName
+   * Throws an error for any other qualification pattern.
+   */
+  private def extractTempFunctionName(
+      functionIdentifier: Seq[String],
+      ctx: ParserRuleContext,
+      forDrop: Boolean = false): String = {
+    functionIdentifier.length match {
+      case 1 =>
+        // Simple unqualified name
+        functionIdentifier.head
+      case 2 =>
+        // Check if it's session.funcName
+        if (functionIdentifier.head.equalsIgnoreCase(CatalogManager.SESSION_NAMESPACE)) {
+          functionIdentifier.last
+        } else {
+          // Otherwise it's an invalid qualifier (e.g., database name)
+          val funcName = functionIdentifier.last
+          val qualifier = functionIdentifier.head
+          throw QueryParsingErrors.invalidTempObjQualifierError(
+            "FUNCTION", funcName, qualifier, ctx)
+        }
+      case 3 =>
+        // Check if it's system.session.funcName
+        if (functionIdentifier(0).equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME) &&
+            functionIdentifier(1).equalsIgnoreCase(CatalogManager.SESSION_NAMESPACE)) {
+          functionIdentifier.last
+        } else {
+          // Invalid three-part qualifier
+          val funcName = functionIdentifier.last
+          val qualifier = functionIdentifier.init.mkString(".")
+          throw QueryParsingErrors.invalidTempObjQualifierError(
+            "FUNCTION", funcName, qualifier, ctx)
+        }
+      case _ =>
+        // More than 3 parts - invalid
+        val funcName = functionIdentifier.last
+        val qualifier = functionIdentifier.init.mkString(".")
+        throw QueryParsingErrors.invalidTempObjQualifierError(
+          "FUNCTION", funcName, qualifier, ctx)
+    }
+  }
+
+  /**
+   * Normalizes a multi-part identifier for CREATE/DROP TEMPORARY VIEW.
+   * Allows: 1-part (v), 2-part session.v, 3-part system.session.v.
+   * Returns the single view name. Throws INVALID_TEMP_OBJ_QUALIFIER for invalid qualifiers.
+   */
+  private def normalizeTempViewIdentifier(
+      viewIdentifier: Seq[String],
+      ctx: ParserRuleContext): String = {
+    viewIdentifier.length match {
+      case 1 => viewIdentifier.head
+      case 2 =>
+        if (viewIdentifier.head.equalsIgnoreCase(CatalogManager.SESSION_NAMESPACE)) {
+          viewIdentifier.last
+        } else {
+          throw QueryParsingErrors.invalidTempObjQualifierError(
+            "VIEW", viewIdentifier.last, viewIdentifier.head, ctx)
+        }
+      case 3 =>
+        if (viewIdentifier(0).equalsIgnoreCase(CatalogManager.SYSTEM_CATALOG_NAME) &&
+            viewIdentifier(1).equalsIgnoreCase(CatalogManager.SESSION_NAMESPACE)) {
+          viewIdentifier.last
+        } else {
+          throw QueryParsingErrors.invalidTempObjQualifierError(
+            "VIEW", viewIdentifier.last, viewIdentifier.init.mkString("."), ctx)
+        }
+      case _ =>
+        throw QueryParsingErrors.invalidTempObjQualifierError(
+          "VIEW", viewIdentifier.last, viewIdentifier.init.mkString("."), ctx)
     }
   }
 
@@ -161,6 +388,19 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   /**
+   * Create a [[SetPathCommand]] to set the session SQL path.
+   * Example SQL :
+   * {{{
+   *   SET PATH = spark_catalog.default, system.builtin;
+   *   SET PATH = DEFAULT_PATH;
+   *   SET PATH = SYSTEM_PATH, spark_catalog.myschema;
+   * }}}
+   */
+  override def visitSetPath(ctx: SetPathContext): LogicalPlan = withOrigin(ctx) {
+    SetPathCommand(ctx.pathElement().asScala.map(visitPathElement).toSeq)
+  }
+
+  /**
    * Create a [[SetCommand]] logical plan to set [[SQLConf.SESSION_LOCAL_TIMEZONE]]
    * Example SQL :
    * {{{
@@ -229,15 +469,13 @@ class SparkSqlAstBuilder extends AstBuilder {
 
   private def extractUnquotedResourcePath(ctx: RefreshResourceContext): String = withOrigin(ctx) {
     val unquotedPath = remainder(ctx.REFRESH.getSymbol).trim
-    validate(
-      unquotedPath != null && !unquotedPath.isEmpty,
-      "Resource paths cannot be empty in REFRESH statements. Use / to match everything",
-      ctx)
+    if (unquotedPath == null || unquotedPath.isEmpty) {
+      throw QueryParsingErrors.emptyRefreshResourcePathError(ctx)
+    }
     val forbiddenSymbols = Seq(" ", "\n", "\r", "\t")
-    validate(
-      !forbiddenSymbols.exists(unquotedPath.contains(_)),
-      "REFRESH statements cannot contain ' ', '\\n', '\\r', '\\t' inside unquoted resource paths",
-      ctx)
+    if (forbiddenSymbols.exists(unquotedPath.contains(_))) {
+      throw QueryParsingErrors.invalidRefreshResourcePathError(ctx)
+    }
     unquotedPath
   }
 
@@ -302,13 +540,8 @@ class SparkSqlAstBuilder extends AstBuilder {
    * Create a [[SetCatalogCommand]] logical command.
    */
   override def visitSetCatalog(ctx: SetCatalogContext): LogicalPlan = withOrigin(ctx) {
-    withCatalogIdentClause(ctx.catalogIdentifierReference, identifiers => {
-      if (identifiers.size > 1) {
-        // can occur when user put multipart string in IDENTIFIER(...) clause
-        throw QueryParsingErrors.invalidNameForSetCatalog(identifiers, ctx)
-      }
-      SetCatalogCommand(identifiers.head)
-    })
+    val expr = expression(ctx.expression())
+    SetCatalogCommand(expr)
   }
 
   /**
@@ -316,6 +549,13 @@ class SparkSqlAstBuilder extends AstBuilder {
    */
   override def visitShowCatalogs(ctx: ShowCatalogsContext) : LogicalPlan = withOrigin(ctx) {
     ShowCatalogsCommand(Option(ctx.pattern).map(x => string(visitStringLit(x))))
+  }
+
+  /**
+   * Create a [[ShowCollationsCommand]] logical command.
+   */
+  override def visitShowCollations(ctx: ShowCollationsContext): LogicalPlan = withOrigin(ctx) {
+    ShowCollationsCommand(Option(ctx.pattern).map(x => string(visitStringLit(x))))
   }
 
   /**
@@ -377,7 +617,8 @@ class SparkSqlAstBuilder extends AstBuilder {
       }
 
       withIdentClause(identCtx, ident => {
-        val table = tableIdentifier(ident, "CREATE TEMPORARY VIEW", ctx)
+        val viewName = normalizeTempViewIdentifier(ident, ctx)
+        val table = TableIdentifier(viewName)
         val optionsList: Map[String, String] =
           options.options.map { case (key, value) =>
             val newValue: String =
@@ -402,8 +643,15 @@ class SparkSqlAstBuilder extends AstBuilder {
    */
   override def visitCreateTempViewUsing(
       ctx: CreateTempViewUsingContext): LogicalPlan = withOrigin(ctx) {
+    val ti = visitTableIdentifier(ctx.tableIdentifier())
+    val tableIdent = if (ctx.GLOBAL != null) {
+      ti
+    } else {
+      val parts = ti.database.toSeq :+ ti.table
+      TableIdentifier(normalizeTempViewIdentifier(parts, ctx))
+    }
     CreateTempViewUsing(
-      tableIdent = visitTableIdentifier(ctx.tableIdentifier()),
+      tableIdent = tableIdent,
       userSpecifiedSchema = Option(ctx.colTypeList()).map(createSchema),
       replace = ctx.REPLACE != null,
       global = ctx.GLOBAL != null,
@@ -438,7 +686,7 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   override def visitFailSetRole(ctx: FailSetRoleContext): LogicalPlan = withOrigin(ctx) {
-    invalidStatement("SET ROLE", ctx);
+    invalidStatement("SET ROLE", ctx)
   }
 
   /**
@@ -457,7 +705,7 @@ class SparkSqlAstBuilder extends AstBuilder {
    *  - '/path/to/fileOrJar'
    */
   override def visitManageResource(ctx: ManageResourceContext): LogicalPlan = withOrigin(ctx) {
-    val rawArg = remainder(ctx.identifier).trim
+    val rawArg = remainder(ctx.simpleIdentifier).trim
     val maybePaths = strLiteralDef.findAllIn(rawArg).toSeq.map {
       case p if p.startsWith("\"") || p.startsWith("'") => unescapeSQLString(p)
       case p => p
@@ -465,14 +713,14 @@ class SparkSqlAstBuilder extends AstBuilder {
 
     ctx.op.getType match {
       case SqlBaseParser.ADD =>
-        ctx.identifier.getText.toLowerCase(Locale.ROOT) match {
+        ctx.simpleIdentifier.getText.toLowerCase(Locale.ROOT) match {
           case "files" | "file" => AddFilesCommand(maybePaths)
           case "jars" | "jar" => AddJarsCommand(maybePaths)
           case "archives" | "archive" => AddArchivesCommand(maybePaths)
           case other => operationNotAllowed(s"ADD with resource type '$other'", ctx)
         }
       case SqlBaseParser.LIST =>
-        ctx.identifier.getText.toLowerCase(Locale.ROOT) match {
+        ctx.simpleIdentifier.getText.toLowerCase(Locale.ROOT) match {
           case "files" | "file" =>
             if (maybePaths.length > 0) {
               ListFilesCommand(maybePaths)
@@ -527,12 +775,14 @@ class SparkSqlAstBuilder extends AstBuilder {
 
     val userSpecifiedColumns = Option(ctx.identifierCommentList).toSeq.flatMap { icl =>
       icl.identifierComment.asScala.map { ic =>
-        ic.identifier.getText -> Option(ic.commentSpec()).map(visitCommentSpec)
+        // Use getIdentifierText to handle both regular identifiers and IDENTIFIER('literal')
+        getIdentifierText(ic.identifier) -> Option(ic.commentSpec()).map(visitCommentSpec)
       }
     }
 
     if (ctx.EXISTS != null && ctx.REPLACE != null) {
-      throw QueryParsingErrors.createViewWithBothIfNotExistsAndReplaceError(ctx)
+      throw QueryParsingErrors.createViewWithBothIfNotExistsAndReplaceError(
+        ctx.identifierReference().getText, ctx)
     }
 
     val properties = ctx.propertyList.asScala.headOption.map(visitPropertyKeyValues)
@@ -591,12 +841,8 @@ class SparkSqlAstBuilder extends AstBuilder {
       }
 
       withIdentClause(ctx.identifierReference(), Seq(qPlan), (ident, otherPlans) => {
-        val tableIdentifier = ident.asTableIdentifier
-        if (tableIdentifier.database.isDefined) {
-          // Temporary view names should NOT contain database prefix like "database.table"
-          throw QueryParsingErrors
-            .notAllowedToAddDBPrefixForTempViewError(tableIdentifier.nameParts, ctx)
-        }
+        val viewName = normalizeTempViewIdentifier(ident, ctx)
+        val tableIdentifier = TableIdentifier(viewName)
 
         CreateViewCommand(
           tableIdentifier,
@@ -613,6 +859,57 @@ class SparkSqlAstBuilder extends AstBuilder {
     }
   }
 
+  override def visitCreateMetricView(ctx: CreateMetricViewContext): LogicalPlan = withOrigin(ctx) {
+    checkDuplicateClauses(ctx.commentSpec(), "COMMENT", ctx)
+    checkDuplicateClauses(ctx.TBLPROPERTIES, "TBLPROPERTIES", ctx)
+    checkDuplicateClauses(ctx.routineLanguage(), "LANGUAGE", ctx)
+    checkDuplicateClauses(ctx.METRICS(), "WITH METRICS", ctx)
+    val userSpecifiedColumns = Option(ctx.identifierCommentList).toSeq.flatMap { icl =>
+      icl.identifierComment.asScala.map { ic =>
+        ic.identifier.getText -> Option(ic.commentSpec()).map(visitCommentSpec)
+      }
+    }
+
+    if (ctx.EXISTS != null && ctx.REPLACE != null) {
+      throw QueryParsingErrors.createViewWithBothIfNotExistsAndReplaceError(
+        ctx.identifierReference().getText, ctx)
+    }
+
+    if (ctx.METRICS(0) == null) {
+      throw QueryParsingErrors.missingClausesForOperation(
+        ctx, "WITH METRICS", "CREATE METRIC VIEW")
+    }
+
+    if (ctx.routineLanguage(0) == null) {
+      throw QueryParsingErrors.missingClausesForOperation(
+        ctx, "LANGUAGE", "CREATE METRIC VIEW")
+    }
+
+    val languageCtx = ctx.routineLanguage(0)
+    if (languageCtx.SQL() != null) {
+      operationNotAllowed("Unsupported language for metric view: SQL", languageCtx)
+    }
+    val name: String = languageCtx.IDENTIFIER().getText
+    if (!name.equalsIgnoreCase("YAML")) {
+      operationNotAllowed(s"Unsupported language for metric view: $name", languageCtx)
+    }
+
+    val properties = ctx.propertyList.asScala.headOption
+      .map(visitPropertyKeyValues)
+      .getOrElse(Map.empty)
+    val codeLiteral = visitCodeLiteral(ctx.codeLiteral())
+
+    CreateMetricView(
+      withIdentClause(ctx.identifierReference(), UnresolvedIdentifier(_)),
+      userSpecifiedColumns,
+      visitCommentSpecList(ctx.commentSpec()),
+      properties,
+      codeLiteral,
+      allowExisting = ctx.EXISTS != null,
+      replace = ctx.REPLACE != null
+    )
+  }
+
   /**
    * Create a [[CreateFunctionCommand]].
    *
@@ -624,7 +921,7 @@ class SparkSqlAstBuilder extends AstBuilder {
    */
   override def visitCreateFunction(ctx: CreateFunctionContext): LogicalPlan = withOrigin(ctx) {
     val resources = ctx.resource.asScala.map { resource =>
-      val resourceType = resource.identifier.getText.toLowerCase(Locale.ROOT)
+      val resourceType = resource.simpleIdentifier.getText.toLowerCase(Locale.ROOT)
       resourceType match {
         case "jar" | "file" | "archive" =>
           FunctionResource(FunctionResourceType.fromString(resourceType),
@@ -652,14 +949,10 @@ class SparkSqlAstBuilder extends AstBuilder {
           throw QueryParsingErrors.defineTempFuncWithIfNotExistsError(ctx)
         }
 
-        if (functionIdentifier.length > 2) {
-          throw QueryParsingErrors.unsupportedFunctionNameError(functionIdentifier, ctx)
-        } else if (functionIdentifier.length == 2) {
-          // Temporary function names should not contain database prefix like "database.function"
-          throw QueryParsingErrors.specifyingDBInCreateTempFuncError(functionIdentifier.head, ctx)
-        }
+        // Extract the actual function name, handling session qualification
+        val funcName = extractTempFunctionName(functionIdentifier, ctx)
         CreateFunctionCommand(
-          FunctionIdentifier(functionIdentifier.last),
+          FunctionIdentifier(funcName),
           string(visitStringLit(ctx.className)),
           resources.toSeq,
           true,
@@ -695,21 +988,42 @@ class SparkSqlAstBuilder extends AstBuilder {
         throw QueryParsingErrors.createFuncWithBothIfNotExistsAndReplaceError(ctx)
       }
 
-      // Reject invalid options
+      // Reject invalid options and validate parameter data types eagerly so that errors
+      // are reported with correct line numbers relative to the full SQL statement.
       for {
         parameters <- Option(ctx.parameters)
         colDefinition <- parameters.colDefinition().asScala
-        option <- colDefinition.colDefinitionOption().asScala
       } {
-        if (option.generationExpression() != null) {
-          throw QueryParsingErrors.createFuncWithGeneratedColumnsError(ctx.parameters)
-        }
-        if (option.columnConstraintDefinition() != null) {
-          throw QueryParsingErrors.createFuncWithConstraintError(ctx.parameters)
+        // Trigger data type validation now (while the original parse tree positions are
+        // available) so that any type errors (e.g. STRUCT without <>) report the correct
+        // line/position. The result is unused; this call is purely for its side effect of
+        // throwing a parse exception with accurate location information.
+        typedVisit[DataType](colDefinition.dataType())
+        for (option <- colDefinition.colDefinitionOption().asScala) {
+          if (option.generationExpression() != null) {
+            throw QueryParsingErrors.createFuncWithGeneratedColumnsError(ctx.parameters)
+          }
+          if (option.columnConstraintDefinition() != null) {
+            throw QueryParsingErrors.createFuncWithConstraintError(ctx.parameters)
+          }
         }
       }
 
       val inputParamText = Option(ctx.parameters).map(source)
+      // Validate return type eagerly for the same reason as parameter data types above:
+      // trigger type errors now so they report correct positions.
+      // Skip validation when the return type is TABLE (for table-valued functions):
+      // "RETURNS TABLE" or "RETURNS TABLE(...)" is not a real data type to validate.
+      Option(ctx.dataType).foreach { dt =>
+        if (!source(dt).equalsIgnoreCase("table")) {
+          typedVisit[DataType](dt)
+        }
+      }
+      Option(ctx.returnParams).foreach { params =>
+        params.colType().asScala.foreach { colType =>
+          typedVisit[DataType](colType.dataType())
+        }
+      }
       val returnTypeText: String =
         if (ctx.RETURNS != null &&
           (Option(ctx.dataType).nonEmpty || Option(ctx.returnParams).nonEmpty)) {
@@ -720,7 +1034,7 @@ class SparkSqlAstBuilder extends AstBuilder {
       val exprText = Option(ctx.expression()).map(source)
       val queryText = Option(ctx.query()).map(source)
 
-      val (containsSQL, deterministic, comment, optionalLanguage) =
+      val (containsSQL, deterministic, comment, collation, optionalLanguage) =
         visitRoutineCharacteristics(ctx.routineCharacteristics())
       val language: RoutineLanguage = optionalLanguage.getOrElse(LanguageSQL)
       val isTableFunc = ctx.TABLE() != null || returnTypeText.equalsIgnoreCase("table")
@@ -734,6 +1048,7 @@ class SparkSqlAstBuilder extends AstBuilder {
             exprText,
             queryText,
             comment,
+            collation,
             deterministic,
             containsSQL,
             language,
@@ -746,20 +1061,16 @@ class SparkSqlAstBuilder extends AstBuilder {
             throw QueryParsingErrors.defineTempFuncWithIfNotExistsError(ctx)
           }
 
-          if (functionIdentifier.length > 2) {
-            throw QueryParsingErrors.unsupportedFunctionNameError(functionIdentifier, ctx)
-          } else if (functionIdentifier.length == 2) {
-            // Temporary function names should not contain database prefix like "database.function"
-            throw QueryParsingErrors.specifyingDBInCreateTempFuncError(functionIdentifier.head, ctx)
-          }
-
+          // Extract the actual function name, handling session qualification
+          val funcName = extractTempFunctionName(functionIdentifier, ctx)
           CreateUserDefinedFunctionCommand(
-            functionIdentifier.asFunctionIdentifier,
+            FunctionIdentifier(funcName),
             inputParamText,
             returnTypeText,
             exprText,
             queryText,
             comment,
+            collation,
             deterministic,
             containsSQL,
             language,
@@ -785,7 +1096,7 @@ class SparkSqlAstBuilder extends AstBuilder {
    * rights: [SQL SECURITY INVOKER | SQL SECURITY DEFINER]
    */
   override def visitRoutineCharacteristics(ctx: RoutineCharacteristicsContext)
-  : (Option[Boolean], Option[Boolean], Option[String], Option[RoutineLanguage]) =
+  : (Option[Boolean], Option[Boolean], Option[String], Option[String], Option[RoutineLanguage]) =
     withOrigin(ctx) {
       checkDuplicateClauses(ctx.routineLanguage(), "LANGUAGE", ctx)
       checkDuplicateClauses(ctx.specificName(), "SPECIFIC", ctx)
@@ -793,6 +1104,7 @@ class SparkSqlAstBuilder extends AstBuilder {
       checkDuplicateClauses(ctx.nullCall(), "NULL CALL", ctx)
       checkDuplicateClauses(ctx.deterministic(), "DETERMINISTIC", ctx)
       checkDuplicateClauses(ctx.commentSpec(), "COMMENT", ctx)
+      checkDuplicateClauses(ctx.collationSpec(), "DEFAULT COLLATION", ctx)
       checkDuplicateClauses(ctx.rightsClause(), "SQL SECURITY RIGHTS", ctx)
 
       val language: Option[RoutineLanguage] = ctx
@@ -810,13 +1122,14 @@ class SparkSqlAstBuilder extends AstBuilder {
 
       val deterministic = ctx.deterministic().asScala.headOption.map(visitDeterminism)
       val comment = visitCommentSpecList(ctx.commentSpec())
+      val collation = ctx.collationSpec().asScala.headOption.map(visitCollationSpec)
 
       ctx.specificName().asScala.headOption.foreach(checkSpecificName)
       ctx.nullCall().asScala.headOption.foreach(checkNullCall)
       ctx.rightsClause().asScala.headOption.foreach(checkRightsClause)
       val containsSQL: Option[Boolean] =
         ctx.sqlDataAccess().asScala.headOption.map(visitDataAccess)
-      (containsSQL, deterministic, comment, language)
+      (containsSQL, deterministic, comment, collation, language)
     }
 
   /**
@@ -870,62 +1183,37 @@ class SparkSqlAstBuilder extends AstBuilder {
    * }}}
    */
   override def visitDropFunction(ctx: DropFunctionContext): LogicalPlan = withOrigin(ctx) {
-    withIdentClause(ctx.identifierReference(), functionName => {
-      val isTemp = ctx.TEMPORARY != null
-      if (isTemp) {
-        if (functionName.length > 1) {
-          throw QueryParsingErrors.invalidNameForDropTempFunc(functionName, ctx)
-        }
+    val isTemp = ctx.TEMPORARY != null
+    val identCtx = ctx.identifierReference()
+    if (isTemp) {
+      withIdentClause(identCtx, functionName => {
+        // Extract the actual function name, handling session qualification
+        val funcName = extractTempFunctionName(functionName, ctx, forDrop = true)
         DropFunctionCommand(
-          identifier = FunctionIdentifier(functionName.head),
+          identifier = FunctionIdentifier(funcName),
           ifExists = ctx.EXISTS != null,
           isTemp = true)
-      } else {
-        val hintStr = "Please use fully qualified identifier to drop the persistent function."
-        DropFunction(
-          UnresolvedFunctionName(
-            functionName,
-            "DROP FUNCTION",
-            requirePersistent = true,
-            funcTypeMismatchHint = Some(hintStr)),
-          ctx.EXISTS != null)
-      }
-    })
+      })
+    } else {
+      DropFunction(
+        withIdentClause(identCtx, createUnresolvedIdentifier(identCtx, _)),
+        ctx.EXISTS != null)
+    }
   }
 
   private def toStorageFormat(
       location: Option[String],
       maybeSerdeInfo: Option[SerdeInfo],
       ctx: ParserRuleContext): CatalogStorageFormat = {
-    if (maybeSerdeInfo.isEmpty) {
-      CatalogStorageFormat.empty.copy(locationUri = location.map(CatalogUtils.stringToURI))
-    } else {
-      val serdeInfo = maybeSerdeInfo.get
-      if (serdeInfo.storedAs.isEmpty) {
-        CatalogStorageFormat.empty.copy(
-          locationUri = location.map(CatalogUtils.stringToURI),
-          inputFormat = serdeInfo.formatClasses.map(_.input),
-          outputFormat = serdeInfo.formatClasses.map(_.output),
-          serde = serdeInfo.serde,
-          properties = serdeInfo.serdeProperties)
-      } else {
-        HiveSerDe.sourceToSerDe(serdeInfo.storedAs.get) match {
-          case Some(hiveSerde) =>
-            CatalogStorageFormat.empty.copy(
-              locationUri = location.map(CatalogUtils.stringToURI),
-              inputFormat = hiveSerde.inputFormat,
-              outputFormat = hiveSerde.outputFormat,
-              serde = serdeInfo.serde.orElse(hiveSerde.serde),
-              properties = serdeInfo.serdeProperties)
-          case _ =>
-            operationNotAllowed(s"STORED AS with file format '${serdeInfo.storedAs.get}'", ctx)
-        }
-      }
-    }
+    HiveSerDe.buildStorageFormat(
+      location,
+      maybeSerdeInfo,
+      si => QueryParsingErrors.operationNotAllowedError(
+        s"STORED AS with file format '${si.storedAs.get}'", ctx))
   }
 
   /**
-   * Create a [[CreateTableLikeCommand]] command.
+   * Create a [[CreateTableLike]] logical plan.
    *
    * For example:
    * {{{
@@ -942,8 +1230,6 @@ class SparkSqlAstBuilder extends AstBuilder {
    * }}}
    */
   override def visitCreateTableLike(ctx: CreateTableLikeContext): LogicalPlan = withOrigin(ctx) {
-    val targetTable = visitTableIdentifier(ctx.target)
-    val sourceTable = visitTableIdentifier(ctx.source)
     checkDuplicateClauses(ctx.tableProvider, "PROVIDER", ctx)
     checkDuplicateClauses(ctx.createFileFormat, "STORED AS/BY", ctx)
     checkDuplicateClauses(ctx.rowFormat, "ROW FORMAT", ctx)
@@ -969,11 +1255,16 @@ class SparkSqlAstBuilder extends AstBuilder {
       case _ =>
     }
 
-    val storage = toStorageFormat(location, serdeInfo, ctx)
     val properties = Option(ctx.tableProps).map(visitPropertyKeyValues).getOrElse(Map.empty)
     val cleanedProperties = cleanTableProperties(ctx, properties)
-    CreateTableLikeCommand(
-      targetTable, sourceTable, storage, provider, cleanedProperties, ctx.EXISTS != null)
+    CreateTableLike(
+      name = withIdentClause(ctx.target, UnresolvedIdentifier(_)),
+      source = createUnresolvedTableOrView(ctx.source, "CREATE TABLE LIKE", allowTempView = true),
+      location = location,
+      provider = provider,
+      serdeInfo = serdeInfo,
+      properties = cleanedProperties,
+      ifNotExists = ctx.EXISTS != null)
   }
 
   /**
@@ -982,9 +1273,9 @@ class SparkSqlAstBuilder extends AstBuilder {
   override protected def withScriptIOSchema(
       ctx: ParserRuleContext,
       inRowFormat: RowFormatContext,
-      recordWriter: Token,
+      recordWriter: StringLitContext,
       outRowFormat: RowFormatContext,
-      recordReader: Token,
+      recordReader: StringLitContext,
       schemaLess: Boolean): ScriptInputOutputSchema = {
     if (recordWriter != null || recordReader != null) {
       // TODO: what does this message mean?
@@ -1178,8 +1469,8 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   /**
-   * Create a [[DescribeColumn]] or [[DescribeRelation]] or [[DescribeRelationAsJsonCommand]]
-   * command.
+   * Create a [[DescribeColumn]], [[DescribeRelation]], [[DescribeTablePartition]], or
+   * [[DescribeRelationJsonCommand]] command.
    */
   override def visitDescribeRelation(ctx: DescribeRelationContext): LogicalPlan = withOrigin(ctx) {
     val isExtended = ctx.EXTENDED != null || ctx.FORMATTED != null
@@ -1188,7 +1479,11 @@ class SparkSqlAstBuilder extends AstBuilder {
       val tableName = ctx.identifierReference.getText.split("\\.").lastOption.getOrElse("table")
       throw QueryCompilationErrors.describeJsonNotExtendedError(tableName)
     }
-    val relation = createUnresolvedTableOrView(ctx.identifierReference, "DESCRIBE TABLE")
+    val relation = createUnresolvedTableOrView(
+      ctx.identifierReference,
+      "DESCRIBE TABLE",
+      allowTempView = true,
+      UnresolvedTableOrViewSearchPathMode.QueryLike)
     if (ctx.describeColName != null) {
       if (ctx.partitionSpec != null) {
         throw QueryParsingErrors.descColumnForPartitionUnsupportedError(ctx)
@@ -1197,11 +1492,11 @@ class SparkSqlAstBuilder extends AstBuilder {
       } else {
         DescribeColumn(
           relation,
-          UnresolvedAttribute(ctx.describeColName.nameParts.asScala.map(_.getText).toSeq),
+          UnresolvedAttribute(ctx.describeColName.nameParts.asScala.map(getIdentifierText).toSeq),
           isExtended)
       }
     } else {
-      val partitionSpec = if (ctx.partitionSpec != null) {
+      val rawSpec = if (ctx.partitionSpec != null) {
         // According to the syntax, visitPartitionSpec returns `Map[String, Option[String]]`.
         visitPartitionSpec(ctx.partitionSpec).map {
           case (key, Some(value)) => key -> value
@@ -1212,11 +1507,37 @@ class SparkSqlAstBuilder extends AstBuilder {
         Map.empty[String, String]
       }
       if (asJson) {
-        DescribeRelationJsonCommand(relation, partitionSpec, isExtended)
+        // DescribeRelationJsonCommand uses the raw Map directly (V1 path only).
+        DescribeRelationJsonCommand(relation, rawSpec, isExtended)
+      } else if (rawSpec.nonEmpty) {
+        DescribeTablePartition(relation, UnresolvedPartitionSpec(rawSpec), isExtended)
       } else {
-        DescribeRelation(relation, partitionSpec, isExtended)
+        DescribeRelation(relation, isExtended)
       }
     }
+  }
+
+  /**
+   * Overrides `SHOW PARTITIONS` parsing to intercept the `AS JSON` variant.
+   *
+   * When `AS JSON` is absent, parsing is delegated to the superclass
+   * ([[AstBuilder#visitShowPartitions]]), which produces a [[ShowPartitions]] logical plan.
+   *
+   * When `AS JSON` is present, this method produces a [[ShowPartitionsJsonCommand]] directly -
+   * a runnable command that returns partition metadata as a single-row JSON document.
+   *
+   * The syntax of using this command in SQL is:
+   * {{{
+   *   SHOW PARTITIONS multi_part_name [partition_spec] [AS JSON];
+   * }}}
+   */
+  override def visitShowPartitions(ctx: ShowPartitionsContext): LogicalPlan = withOrigin(ctx) {
+    if (ctx.JSON == null) return super.visitShowPartitions(ctx)
+    val relation = createUnresolvedTable(ctx.identifierReference, "SHOW PARTITIONS AS JSON")
+    val partitionKeys = Option(ctx.partitionSpec).map { specCtx =>
+      UnresolvedPartitionSpec(visitNonOptionalPartitionSpec(specCtx), None)
+    }
+    ShowPartitionsJsonCommand(relation, partitionKeys.map(_.spec))
   }
 
   override def visitShowProcedures(ctx: ShowProceduresContext): LogicalPlan = withOrigin(ctx) {
@@ -1235,10 +1556,42 @@ class SparkSqlAstBuilder extends AstBuilder {
       Option(ctx.pattern).map(x => string(visitStringLit(x))))
   }
 
+  /**
+   * Create a [[ShowTablesJsonCommand]] or [[ShowTables]] command.
+   */
+  override def visitShowTables(ctx: ShowTablesContext): LogicalPlan = withOrigin(ctx) {
+    if (ctx.JSON == null) return super.visitShowTables(ctx)
+    val ns = if (ctx.identifierReference() != null) {
+      withIdentClause(ctx.identifierReference, UnresolvedNamespace(_))
+    } else {
+      CurrentNamespace
+    }
+    val pattern = Option(ctx.pattern).map(x => string(visitStringLit(x)))
+    ShowTablesJsonCommand(ns, pattern, isExtended = false)
+  }
+
+  /**
+   * Create a [[ShowTablesJsonCommand]], [[ShowTablesExtended]], or [[ShowTablePartition]] command.
+   */
+  override def visitShowTableExtended(
+      ctx: ShowTableExtendedContext): LogicalPlan = withOrigin(ctx) {
+    val asJson = ctx.JSON != null
+    if (asJson && ctx.partitionSpec != null) {
+      throw QueryCompilationErrors.showTableExtendedJsonWithPartitionError()
+    }
+    if (!asJson || ctx.partitionSpec != null) return super.visitShowTableExtended(ctx)
+    val ns = if (ctx.identifierReference() != null) {
+      withIdentClause(ctx.identifierReference, UnresolvedNamespace(_))
+    } else {
+      CurrentNamespace
+    }
+    ShowTablesJsonCommand(ns, Some(string(visitStringLit(ctx.pattern))), isExtended = true)
+  }
+
   override def visitDescribeProcedure(
       ctx: DescribeProcedureContext): LogicalPlan = withOrigin(ctx) {
     withIdentClause(ctx.identifierReference(), procIdentifier =>
-      DescribeProcedureCommand(UnresolvedIdentifier(procIdentifier)))
+      DescribeProcedureCommand(UnresolvedProcedure(procIdentifier)))
   }
 
   override def visitCreatePipelineInsertIntoFlow(
@@ -1246,10 +1599,24 @@ class SparkSqlAstBuilder extends AstBuilder {
     val createPipelineFlowHeaderCtx = ctx.createPipelineFlowHeader()
     val ident = withIdentClause(createPipelineFlowHeaderCtx.flowName, UnresolvedIdentifier(_))
     val commentOpt = Option(createPipelineFlowHeaderCtx.commentSpec()).map(visitCommentSpec)
-    val flowOperation = withInsertInto(ctx.insertInto(), visitQuery(ctx.query()))
+    val flowOperation = withInsertInto(ctx.insertInto(), visitQuery(ctx.query()),
+      queryAliasCtx = null)
     CreateFlowCommand(
       name = ident,
       flowOperation = flowOperation,
+      comment = commentOpt
+    )
+  }
+
+  override def visitCreateFlowAutoCdc(
+      ctx: CreateFlowAutoCdcContext): LogicalPlan = withOrigin(ctx) {
+    val flowHeaderCtx = ctx.createPipelineFlowHeader()
+    val ident = withIdentClause(flowHeaderCtx.flowName, UnresolvedIdentifier(_))
+    val commentOpt = Option(flowHeaderCtx.commentSpec()).map(visitCommentSpec)
+    val autoCdcInto = buildAutoCdcInto(ctx.autoCdcCommand())
+    CreateFlowCommand(
+      name = ident,
+      flowOperation = autoCdcInto,
       comment = commentOpt
     )
   }
@@ -1274,7 +1641,7 @@ class SparkSqlAstBuilder extends AstBuilder {
 
     if (colConstraints.nonEmpty) {
       throw operationNotAllowed("Pipeline datasets do not currently support column constraints. " +
-        "Please remove and CHECK, UNIQUE, PK, and FK constraints specified on the pipeline " +
+        "Please remove any CHECK, UNIQUE, PK, and FK constraints specified on the pipeline " +
         "dataset.", ctx)
     }
 
@@ -1286,7 +1653,7 @@ class SparkSqlAstBuilder extends AstBuilder {
       partitionExpressions(partTransforms, partCols, ctx) ++
         clusterBySpec.map(_.asTransform)
 
-    // Because the createTableClauses grammar is reused for createPipelineDataset but pipeline
+    // Because the createTableClauses grammar is reused for pipeline datasets but pipeline
     // datasets don't support bucketing, options, storage location, or Hive SerDe, validate they
     // are not set.
     if (bucketSpec.isDefined) {
@@ -1329,6 +1696,10 @@ class SparkSqlAstBuilder extends AstBuilder {
     )
 
     if (createPipelineDatasetHeaderCtx.materializedView() != null) {
+      if (ctx.autoCdcBody() != null) {
+        throw operationNotAllowed(
+          "AUTO CDC is only supported for STREAMING TABLE, not MATERIALIZED VIEW.", ctx)
+      }
       val query: ParserRuleContext = Option(ctx.query).getOrElse(
         throw operationNotAllowed(
           s"Unable to find query for CREATE $syntaxTypeErrorStr statement.", ctx)
@@ -1343,25 +1714,45 @@ class SparkSqlAstBuilder extends AstBuilder {
         ifNotExists = ifNotExists
       )
     } else if (createPipelineDatasetHeaderCtx.streamingTable() != null) {
-      Option(ctx.query) match {
-        case Some(query) =>
-          CreateStreamingTableAsSelect(
-            name = datasetIdentifier,
-            columns = colDefs,
-            partitioning = partitioning,
-            tableSpec = spec,
-            query = plan(query),
-            originalText = source(query),
-            ifNotExists = ifNotExists
-          )
-        case None =>
-          CreateStreamingTable(
-            name = datasetIdentifier,
-            columns = colDefs,
-            partitioning = partitioning,
-            tableSpec = spec,
-            ifNotExists = ifNotExists
-          )
+      if (ctx.autoCdcBody() != null) {
+        val params = parseAutoCdcParams(ctx.autoCdcBody().autoCdcParameters())
+        CreateStreamingTableAutoCdc(
+          name = datasetIdentifier,
+          columns = colDefs,
+          partitioning = partitioning,
+          tableSpec = spec,
+          ifNotExists = ifNotExists,
+          source = params.source,
+          keys = params.keys,
+          deleteCondition = params.deleteCondition,
+          sequenceByExpr = params.sequencing,
+          includeColumns = params.includeColumns,
+          excludeColumns = params.excludeColumns,
+          storedAsScdType = params.storedAsScdType,
+          trackHistoryColumns = params.trackHistoryColumns,
+          trackHistoryExceptColumns = params.trackHistoryExceptColumns
+        )
+      } else {
+        Option(ctx.query) match {
+          case Some(query) =>
+            CreateStreamingTableAsSelect(
+              name = datasetIdentifier,
+              columns = colDefs,
+              partitioning = partitioning,
+              tableSpec = spec,
+              query = plan(query),
+              originalText = source(query),
+              ifNotExists = ifNotExists
+            )
+          case None =>
+            CreateStreamingTable(
+              name = datasetIdentifier,
+              columns = colDefs,
+              partitioning = partitioning,
+              tableSpec = spec,
+              ifNotExists = ifNotExists
+            )
+        }
       }
     } else {
       // Should never be possible based on grammar definition.

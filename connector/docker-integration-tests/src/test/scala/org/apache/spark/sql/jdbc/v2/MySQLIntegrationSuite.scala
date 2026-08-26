@@ -20,16 +20,16 @@ package org.apache.spark.sql.jdbc.v2
 import java.sql.{Connection, SQLFeatureNotSupportedException}
 
 import org.apache.spark.{SparkConf, SparkSQLFeatureNotSupportedException}
-import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.{AnalysisException, Row}
 import org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
 import org.apache.spark.sql.jdbc.MySQLDatabaseOnDocker
 import org.apache.spark.sql.types._
 import org.apache.spark.tags.DockerTest
 
 /**
- * To run this test suite for a specific version (e.g., mysql:9.2.0):
+ * To run this test suite for a specific version (e.g., mysql:9.6.0):
  * {{{
- *   ENABLE_DOCKER_INTEGRATION_TESTS=1 MYSQL_DOCKER_IMAGE_NAME=mysql:9.2.0
+ *   ENABLE_DOCKER_INTEGRATION_TESTS=1 MYSQL_DOCKER_IMAGE_NAME=mysql:9.6.0
  *     ./build/sbt -Pdocker-integration-tests "testOnly *v2*MySQLIntegrationSuite"
  * }}}
  */
@@ -89,6 +89,7 @@ class MySQLIntegrationSuite extends DockerJDBCIntegrationV2Suite with V2JDBCTest
     new MetadataBuilder()
       .putLong("scale", 0)
       .putBoolean("isTimestampNTZ", false)
+      .putBoolean("preferTimestampNanos", false)
       .putBoolean("isSigned", dataType.isInstanceOf[NumericType])
       .putString("jdbcClientType", jdbcClientType)
       .build()
@@ -313,12 +314,21 @@ class MySQLIntegrationSuite extends DockerJDBCIntegrationV2Suite with V2JDBCTest
     assert(rows10(0).getString(0) === "amy")
     assert(rows10(1).getString(0) === "alex")
   }
+
+  test("do not push down casts to double") {
+    val df = sql(
+      s"SELECT name FROM $catalogName.employee " +
+        "WHERE CAST(salary AS DOUBLE) > 10000.5")
+
+    checkFilterPushed(df, pushed = false)
+    checkAnswer(df, Seq(Row("alex"), Row("jen")))
+  }
 }
 
 /**
- * To run this test suite for a specific version (e.g., mysql:9.2.0):
+ * To run this test suite for a specific version (e.g., mysql:9.6.0):
  * {{{
- *   ENABLE_DOCKER_INTEGRATION_TESTS=1 MYSQL_DOCKER_IMAGE_NAME=mysql:9.2.0
+ *   ENABLE_DOCKER_INTEGRATION_TESTS=1 MYSQL_DOCKER_IMAGE_NAME=mysql:9.6.0
  *     ./build/sbt -Pdocker-integration-tests
  *     "docker-integration-tests/testOnly *MySQLOverMariaConnectorIntegrationSuite"
  * }}}
@@ -334,6 +344,7 @@ class MySQLOverMariaConnectorIntegrationSuite extends MySQLIntegrationSuite {
     new MetadataBuilder()
       .putLong("scale", 0)
       .putBoolean("isTimestampNTZ", false)
+      .putBoolean("preferTimestampNanos", false)
       .putBoolean("isSigned", true)
       .putString("jdbcClientType", jdbcClientType)
       .build()
@@ -341,6 +352,6 @@ class MySQLOverMariaConnectorIntegrationSuite extends MySQLIntegrationSuite {
   override val db = new MySQLDatabaseOnDocker {
     override def getJdbcUrl(ip: String, port: Int): String =
       s"jdbc:mysql://$ip:$port/mysql?user=root&password=rootpass&allowPublicKeyRetrieval=true" +
-        s"&useSSL=false"
+        s"&useSSL=false&permitMysqlScheme"
   }
 }

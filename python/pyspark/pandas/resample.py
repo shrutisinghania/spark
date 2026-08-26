@@ -18,12 +18,14 @@
 """
 A wrapper for ResampledData to behave like pandas Resampler.
 """
+
 from abc import ABCMeta, abstractmethod
 from functools import partial
 from typing import (
     Any,
     Generic,
     List,
+    Literal,
     Optional,
 )
 
@@ -31,21 +33,13 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.frequencies import to_offset
 
-from pyspark.sql import Column, functions as F
-from pyspark.sql.internal import InternalFunction as SF
-from pyspark.sql.types import (
-    NumericType,
-    StructField,
-    TimestampNTZType,
-    DataType,
-)
 from pyspark import pandas as ps  # For running doctests and reference resolution in PyCharm.
 from pyspark.pandas._typing import FrameLike
 from pyspark.pandas.frame import DataFrame
 from pyspark.pandas.internal import (
+    SPARK_DEFAULT_INDEX_NAME,
     InternalField,
     InternalFrame,
-    SPARK_DEFAULT_INDEX_NAME,
 )
 from pyspark.pandas.missing.resample import (
     MissingPandasLikeDataFrameResampler,
@@ -55,6 +49,15 @@ from pyspark.pandas.series import Series, first_series
 from pyspark.pandas.utils import (
     scol_for,
     verify_temp_column_name,
+)
+from pyspark.sql import Column
+from pyspark.sql import functions as F
+from pyspark.sql.internal import InternalFunction as SF
+from pyspark.sql.types import (
+    DataType,
+    NumericType,
+    StructField,
+    TimestampNTZType,
 )
 
 
@@ -82,8 +85,8 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         psdf: DataFrame,
         resamplekey: Optional[Series],
         rule: str,
-        closed: Optional[str] = None,
-        label: Optional[str] = None,
+        closed: Optional[Literal["left", "right"]] = None,
+        label: Optional[Literal["left", "right"]] = None,
         agg_columns: List[Series] = [],
     ):
         self._psdf = psdf
@@ -96,6 +99,7 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         if not getattr(self._offset, "n") > 0:
             raise ValueError("rule offset must be positive")
 
+        self._closed: Literal["left", "right"]
         if closed is None:
             self._closed = "right" if self._offset.rule_code in ["A-DEC", "M", "ME"] else "left"
         elif closed in ["left", "right"]:
@@ -103,6 +107,7 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         else:
             raise ValueError("invalid closed: '{}'".format(closed))
 
+        self._label: Literal["left", "right"]
         if label is None:
             self._label = "right" if self._offset.rule_code in ["A-DEC", "M", "ME"] else "left"
         elif label in ["left", "right"]:
@@ -133,7 +138,7 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
     def _bin_timestamp(self, origin: pd.Timestamp, ts_scol: Column) -> Column:
         key_type = self._resamplekey_type
         origin_scol = F.lit(origin)
-        (rule_code, n) = (self._offset.rule_code, getattr(self._offset, "n"))
+        rule_code, n = (self._offset.rule_code, getattr(self._offset, "n"))
         left_closed, right_closed = (self._closed == "left", self._closed == "right")
         left_labeled, right_labeled = (self._label == "left", self._label == "right")
 
@@ -321,7 +326,7 @@ class Resampler(Generic[FrameLike], metaclass=ABCMeta):
         #   ]
         #   index = pd.DatetimeIndex(dates)
         #   pdf = pd.DataFrame(np.array([1,2,3]), index=index, columns=['A'])
-        #   pdf.resample('3Y').max()
+        #   pdf.resample('3YE').max()
         #                 A
         #   2012-12-31  2.0
         #   2015-12-31  NaN
@@ -704,8 +709,8 @@ class DataFrameResampler(Resampler[DataFrame]):
         psdf: DataFrame,
         resamplekey: Optional[Series],
         rule: str,
-        closed: Optional[str] = None,
-        label: Optional[str] = None,
+        closed: Optional[Literal["left", "right"]] = None,
+        label: Optional[Literal["left", "right"]] = None,
         agg_columns: List[Series] = [],
     ):
         super().__init__(
@@ -735,8 +740,8 @@ class SeriesResampler(Resampler[Series]):
         psser: Series,
         resamplekey: Optional[Series],
         rule: str,
-        closed: Optional[str] = None,
-        label: Optional[str] = None,
+        closed: Optional[Literal["left", "right"]] = None,
+        label: Optional[Literal["left", "right"]] = None,
         agg_columns: List[Series] = [],
     ):
         super().__init__(
@@ -762,11 +767,12 @@ class SeriesResampler(Resampler[Series]):
 
 
 def _test() -> None:
-    import os
     import doctest
+    import os
     import sys
-    from pyspark.sql import SparkSession
+
     import pyspark.pandas.resample
+    from pyspark.sql import SparkSession
 
     os.chdir(os.environ["SPARK_HOME"])
 
@@ -777,7 +783,7 @@ def _test() -> None:
         .appName("pyspark.pandas.resample tests")
         .getOrCreate()
     )
-    (failure_count, test_count) = doctest.testmod(
+    failure_count, test_count = doctest.testmod(
         pyspark.pandas.resample,
         globs=globs,
         optionflags=doctest.ELLIPSIS | doctest.NORMALIZE_WHITESPACE,

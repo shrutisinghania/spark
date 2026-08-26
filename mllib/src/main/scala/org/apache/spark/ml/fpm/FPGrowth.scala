@@ -36,7 +36,7 @@ import org.apache.spark.sql.expressions.SparkUserDefinedFunction
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.StorageLevel
-import org.apache.spark.util.VersionUtils
+import org.apache.spark.util.{SizeEstimator, VersionUtils}
 
 /**
  * Common params for FPGrowth and FPGrowthModel
@@ -273,35 +273,30 @@ class FPGrowthModel private[ml] (
    * from all the applicable rules as prediction. The prediction column has the same data type as
    * the input column(Array[T]) and will not contain existing items in the input column. The null
    * values in the itemsCol columns are treated as empty sets.
-   * WARNING: internally it collects association rules to the driver and uses broadcast for
-   * efficiency. This may bring pressure to driver memory for large set of association rules.
+   * Internally, transform aggregates association rules into a single-row DataFrame and joins it
+   * with the input dataset.
    */
   @Since("2.2.0")
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    genericTransform(dataset)
-  }
-
-  private def genericTransform(dataset: Dataset[_]): DataFrame = {
-    val rules: Array[(Seq[Any], Seq[Any])] = associationRules.select("antecedent", "consequent")
-      .rdd.map(r => (r.getSeq(0), r.getSeq(1)))
-      .collect().asInstanceOf[Array[(Seq[Any], Seq[Any])]]
-    val brRules = dataset.sparkSession.sparkContext.broadcast(rules)
-
     val dt = dataset.schema($(itemsCol)).dataType
-    // For each rule, examine the input items and summarize the consequents
-    val predictUDF = SparkUserDefinedFunction((items: Seq[Any]) => {
+    val rulesCol = Identifiable.randomUID("rules")
+    // For each rule, examine the input items and summarize the consequents.
+    val predictFunc = (items: Seq[Any], rules: Seq[Row]) => {
       if (items != null) {
         val itemset = items.toSet
-        brRules.value.filter(_._1.forall(itemset.contains))
-          .flatMap(_._2.filter(!itemset.contains(_))).distinct
+        rules.filter(_.getSeq[Any](0).forall(itemset.contains))
+          .flatMap(_.getSeq[Any](1).filter(!itemset.contains(_))).distinct
       } else {
         Seq.empty
-      }},
-      dt,
-      Nil
-    )
-    dataset.withColumn($(predictionCol), predictUDF(col($(itemsCol))))
+      }
+    }
+    val predictUDF = SparkUserDefinedFunction(predictFunc, dt, Nil)
+    dataset.join(
+      associationRules.select("antecedent", "consequent")
+        .agg(collect_set(struct("antecedent", "consequent")).as(rulesCol)))
+      .withColumn($(predictionCol), predictUDF(col($(itemsCol)), col(rulesCol)))
+      .drop(rulesCol)
   }
 
   @Since("2.2.0")
@@ -323,9 +318,18 @@ class FPGrowthModel private[ml] (
     s"FPGrowthModel: uid=$uid, numTrainingRecords=$numTrainingRecords"
   }
 
-  override def estimatedSize: Long = {
-    // TODO: Implement this method.
-    throw new UnsupportedOperationException
+  private[spark] override def estimatedSize: Long = {
+    var size = estimateMatadataSize
+    // freqItemsets: DataFrame("items": Array, "freq": Long)
+    freqItemsets match {
+      case df: org.apache.spark.sql.classic.DataFrame =>
+        size += df.toArrowBatchRdd.map(_.length.toLong).reduce(_ + _)
+      case o => throw new UnsupportedOperationException(
+        s"Unsupported dataframe type: ${o.getClass.getName}")
+    }
+    // itemSupport: scala.collection.Map[Any, Double]
+    size += SizeEstimator.estimate(itemSupport)
+    size
   }
 }
 
@@ -343,16 +347,11 @@ object FPGrowthModel extends MLReadable[FPGrowthModel] {
   class FPGrowthModelWriter(instance: FPGrowthModel) extends MLWriter {
 
     override protected def saveImpl(path: String): Unit = {
-      if (ReadWriteUtils.localSavingModeState.get()) {
-        throw new UnsupportedOperationException(
-          "FPGrowthModel does not support saving to local filesystem path."
-        )
-      }
       val extraMetadata: JObject = Map("numTrainingRecords" -> instance.numTrainingRecords)
       DefaultParamsWriter.saveMetadata(instance, path, sparkSession,
         extraMetadata = Some(extraMetadata))
       val dataPath = new Path(path, "data").toString
-      instance.freqItemsets.write.parquet(dataPath)
+      ReadWriteUtils.saveDataFrame(dataPath, instance.freqItemsets)
     }
   }
 
@@ -362,11 +361,6 @@ object FPGrowthModel extends MLReadable[FPGrowthModel] {
     private val className = classOf[FPGrowthModel].getName
 
     override def load(path: String): FPGrowthModel = {
-      if (ReadWriteUtils.localSavingModeState.get()) {
-        throw new UnsupportedOperationException(
-          "FPGrowthModel does not support loading from local filesystem path."
-        )
-      }
       implicit val format = DefaultFormats
       val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       val (major, minor) = VersionUtils.majorMinorVersion(metadata.sparkVersion)
@@ -378,7 +372,7 @@ object FPGrowthModel extends MLReadable[FPGrowthModel] {
         (metadata.metadata \ "numTrainingRecords").extract[Long]
       }
       val dataPath = new Path(path, "data").toString
-      val frequentItems = sparkSession.read.parquet(dataPath)
+      val frequentItems = ReadWriteUtils.loadDataFrame(dataPath, sparkSession)
       val itemSupport = if (numTrainingRecords == 0L) {
         Map.empty[Any, Double]
       } else {

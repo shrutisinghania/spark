@@ -21,6 +21,7 @@ import java.io._
 import java.net._
 import java.nio.channels.{Channels, SocketChannel}
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.util.{ArrayList => JArrayList, List => JList, Map => JMap}
 
 import scala.collection.mutable
@@ -126,8 +127,34 @@ private[spark] case class SimplePythonFunction(
 private[spark] case class ChainedPythonFunctions(funcs: Seq[PythonFunction])
 
 /** Thrown for exceptions in user Python code. */
-private[spark] class PythonException(msg: String, cause: Throwable)
-  extends RuntimeException(msg, cause)
+private[spark] class PythonException(
+    msg: String,
+    cause: Throwable,
+    errorClass: Option[String],
+    messageParameters: Map[String, String],
+    context: Array[QueryContext])
+  extends RuntimeException(msg, cause) with SparkThrowable {
+
+  def this(
+      errorClass: String,
+      messageParameters: Map[String, String],
+      cause: Throwable = null,
+      context: Array[QueryContext] = Array.empty,
+      summary: String = "") = {
+    this(
+      SparkThrowableHelper.getMessage(errorClass, messageParameters, summary),
+      cause,
+      Option(errorClass),
+      messageParameters,
+      context
+    )
+  }
+
+  override def getMessageParameters: java.util.Map[String, String] = messageParameters.asJava
+
+  override def getCondition: String = errorClass.orNull
+  override def getQueryContext: Array[QueryContext] = context
+}
 
 /**
  * Form an RDD[(Array[Byte], Array[Byte])] from key-value pairs returned from Python.
@@ -826,7 +853,7 @@ private[spark] class PythonBroadcast(@transient var path: String) extends Serial
     if (!diskBlockManager.containsBlock(blockId)) {
       Utils.tryOrIOException {
         val dir = new File(Utils.getLocalDir(SparkEnv.get.conf))
-        val file = File.createTempFile("broadcast", "", dir)
+        val file = Files.createTempFile(dir.toPath, "broadcast", "").toFile
         val out = new FileOutputStream(file)
         Utils.tryWithSafeFinally {
           val size = Utils.copyStream(in, out)

@@ -31,13 +31,17 @@ Python Data Source
     DataSource.streamReader
     DataSource.writer
     DataSourceReader.partitions
+    DataSourceReader.pushFilters
+    DataSourceReader.pushLimit
     DataSourceReader.read
     DataSourceRegistration.register
     DataSourceStreamReader.commit
+    DataSourceStreamReader.getDefaultReadLimit
     DataSourceStreamReader.initialOffset
     DataSourceStreamReader.latestOffset
     DataSourceStreamReader.partitions
     DataSourceStreamReader.read
+    DataSourceStreamReader.reportLatestOffset
     DataSourceStreamReader.stop
     DataSourceWriter.abort
     DataSourceWriter.commit
